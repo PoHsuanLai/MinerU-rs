@@ -42,7 +42,7 @@ use std::path::Path;
 use image::RgbImage;
 use mineru_burn_common::backend::{Cpu, cpu_device};
 use mineru_burn_common::model::Model;
-use mineru_burn_common::weights::load_weights;
+use mineru_burn_common::weights::load_weights_ignoring;
 use burn::prelude::Backend;
 
 pub use detection::LayoutDet;
@@ -85,7 +85,17 @@ impl<B: Backend> LayoutModel<B> {
     pub fn load(path: impl AsRef<Path>, device: B::Device) -> Result<Self> {
         let mut model = PpDocLayoutV2::<B>::init(&device);
         let remap = weights::key_remap()?;
-        load_weights::<B, _>(&mut model, path, &remap, weights::COVERAGE)?;
+        // `model.denoising_class_embed.weight` is a training-only contrastive-
+        // denoising embedding (RT-DETR CDN). Inference never uses it and this crate
+        // has no field for it, so it is explicitly ignored rather than left to trip
+        // `Coverage::Strict`. No rule remaps it, so its post-remap key is unchanged.
+        load_weights_ignoring::<B, _>(
+            &mut model,
+            path,
+            &remap,
+            weights::COVERAGE,
+            weights::IGNORED_KEYS,
+        )?;
         Ok(Self::new(model, device))
     }
 

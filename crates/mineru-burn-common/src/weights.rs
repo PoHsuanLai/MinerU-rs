@@ -147,6 +147,39 @@ where
     B: Backend,
     M: ModuleSnapshot<B>,
 {
+    load_weights_ignoring::<B, M>(module, path, remap, coverage, &[])
+}
+
+/// Like [`load_weights`], but treats any *remapped* source key equal to one of
+/// `ignore` as intentionally consumed, so it never counts toward the
+/// [`Coverage::Strict`] unmapped-key check.
+///
+/// This is for checkpoint tensors that inference does not use — training-only
+/// buffers such as a denoising / contrastive embedding — which a module tree
+/// legitimately has no field for. Prefer routing every real weight through the
+/// [`KeyRemap`]; reach for `ignore` only when there is genuinely no field to load
+/// into, and document why at the call site.
+///
+/// The `ignore` entries are matched against keys *after* `remap` is applied (the
+/// same keys `burn-store` reports as unused), so pass the post-remap name.
+///
+/// # Errors
+///
+/// - [`Error::Config`] for an unrecognised extension or bad remap rule.
+/// - [`Error::WeightLoad`] if the file cannot be read or a tensor fails to apply.
+/// - [`Error::UnmappedKeys`] under [`Coverage::Strict`] when keys other than the
+///   ignored ones are left over.
+pub fn load_weights_ignoring<B, M>(
+    module: &mut M,
+    path: impl AsRef<Path>,
+    remap: &KeyRemap,
+    coverage: Coverage,
+    ignore: &[&str],
+) -> Result<()>
+where
+    B: Backend,
+    M: ModuleSnapshot<B>,
+{
     let path = path.as_ref();
     let ext = path
         .extension()
@@ -197,7 +230,15 @@ where
         )));
     }
 
-    assert_all_keys_consumed(&result.unused, coverage)
+    // Drop intentionally-ignored keys before the coverage check so training-only
+    // tensors with no inference field never trip `Coverage::Strict`.
+    let unused: Vec<String> = result
+        .unused
+        .into_iter()
+        .filter(|k| !ignore.contains(&k.as_str()))
+        .collect();
+
+    assert_all_keys_consumed(&unused, coverage)
 }
 
 /// Turns the `unused` list from a load into a [`Coverage`] verdict.

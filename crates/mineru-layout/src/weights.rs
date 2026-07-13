@@ -56,12 +56,25 @@ pub fn key_remap() -> Result<KeyRemap> {
         (r"^model\.enc_bbox_head\.", "decoder.enc_bbox_head."),
 
         // ---- Hybrid encoder (AIFI + FPN/PAN) --------------------------------
-        // aifi transformer layers: self_attn.* / mlp.* flattened onto fields.
-        (r"^model\.encoder\.aifi\.(\d+)\.layers\.(\d+)\.self_attn\.", "encoder.aifi.$1.layers.$2."),
-        (r"^model\.encoder\.aifi\.(\d+)\.layers\.(\d+)\.mlp\.", "encoder.aifi.$1.layers.$2."),
+        // The AIFI transformer lives at `model.encoder.encoder.0.layers.N.*` in the
+        // checkpoint (the outer `encoder` is the hybrid encoder, the inner
+        // `encoder.0` is its single AIFI stack). This crate stores it as the named
+        // `aifi` field, so `encoder.0` -> `aifi`. Within a layer, the attention
+        // projections sit under `self_attn.` (q/k/v/out) and the FFN leaves
+        // (`fc1`/`fc2`/`self_attn_layer_norm`/`final_layer_norm`) sit directly on
+        // the layer. Route `out_proj` -> `o_proj` (this crate's field name), keep
+        // q/k/v as-is, and strip the `self_attn.` prefix; the FFN/norm leaves are
+        // matched by the trailing `encoder.0` -> `aifi` rewrite.
+        (r"^model\.encoder\.encoder\.0\.layers\.(\d+)\.self_attn\.out_proj\.", "encoder.aifi.layers.$1.o_proj."),
+        (r"^model\.encoder\.encoder\.0\.layers\.(\d+)\.self_attn\.", "encoder.aifi.layers.$1."),
+        (r"^model\.encoder\.encoder\.0\.layers\.(\d+)\.", "encoder.aifi.layers.$1."),
         (r"^model\.encoder\.", "encoder."),
 
         // ---- Decoder proper -------------------------------------------------
+        // Self-attention output projection: checkpoint `self_attn.out_proj` -> this
+        // crate's `o_proj` field. Must precede the general `self_attn.` strip below
+        // (which keeps q/k/v as-is), or `out_proj` would land on a nonexistent field.
+        (r"^model\.decoder\.layers\.(\d+)\.self_attn\.out_proj\.", "decoder.layers.$1.o_proj."),
         (r"^model\.decoder\.layers\.(\d+)\.self_attn\.", "decoder.layers.$1."),
         (r"^model\.decoder\.layers\.(\d+)\.mlp\.", "decoder.layers.$1."),
         (r"^model\.decoder\.", "decoder."),
@@ -92,6 +105,16 @@ pub fn key_remap() -> Result<KeyRemap> {
 /// Coverage policy for loading. Strict once the port is complete: every source
 /// key must map to a field, or loading fails with the unmapped list.
 pub const COVERAGE: Coverage = Coverage::Strict;
+
+/// Checkpoint keys that inference intentionally does not load.
+///
+/// `model.denoising_class_embed.weight` is the RT-DETR contrastive-denoising (CDN)
+/// class embedding, used only to build noised query groups during training. At
+/// inference the denoising branch is disabled, so this crate has no field for it
+/// and it is skipped under [`Coverage::Strict`]. Entries are post-remap names; no
+/// remap rule touches this key, so it appears unchanged. See the load path in
+/// [`crate::LayoutModel::load`].
+pub const IGNORED_KEYS: &[&str] = &["model.denoising_class_embed.weight"];
 
 #[cfg(test)]
 mod tests {
@@ -161,13 +184,28 @@ mod tests {
 
     #[test]
     fn encoder_aifi_and_fpn() {
+        // AIFI lives at `model.encoder.encoder.0.layers.N.*`; `encoder.0` -> `aifi`.
         assert_eq!(
-            remap("model.encoder.aifi.0.layers.0.self_attn.q_proj.weight"),
-            "encoder.aifi.0.layers.0.q_proj.weight"
+            remap("model.encoder.encoder.0.layers.0.self_attn.q_proj.weight"),
+            "encoder.aifi.layers.0.q_proj.weight"
+        );
+        // out_proj -> o_proj (this crate's field name).
+        assert_eq!(
+            remap("model.encoder.encoder.0.layers.0.self_attn.out_proj.bias"),
+            "encoder.aifi.layers.0.o_proj.bias"
+        );
+        // FFN + norm leaves sit directly on the layer (no `mlp.` prefix).
+        assert_eq!(
+            remap("model.encoder.encoder.0.layers.0.fc1.weight"),
+            "encoder.aifi.layers.0.fc1.weight"
         );
         assert_eq!(
-            remap("model.encoder.aifi.0.layers.0.mlp.fc1.weight"),
-            "encoder.aifi.0.layers.0.fc1.weight"
+            remap("model.encoder.encoder.0.layers.0.self_attn_layer_norm.weight"),
+            "encoder.aifi.layers.0.self_attn_layer_norm.weight"
+        );
+        assert_eq!(
+            remap("model.encoder.encoder.0.layers.0.final_layer_norm.bias"),
+            "encoder.aifi.layers.0.final_layer_norm.bias"
         );
         assert_eq!(
             remap("model.encoder.fpn_blocks.0.conv1.conv.weight"),
@@ -184,6 +222,11 @@ mod tests {
         assert_eq!(
             remap("model.decoder.layers.3.self_attn.q_proj.weight"),
             "decoder.layers.3.q_proj.weight"
+        );
+        // Self-attn output projection: out_proj -> o_proj.
+        assert_eq!(
+            remap("model.decoder.layers.3.self_attn.out_proj.weight"),
+            "decoder.layers.3.o_proj.weight"
         );
         assert_eq!(
             remap("model.decoder.layers.0.encoder_attn.sampling_offsets.weight"),

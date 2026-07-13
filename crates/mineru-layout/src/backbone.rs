@@ -342,25 +342,24 @@ fn pad_right_bottom<B: Backend>(x: Tensor<B, 4>) -> Tensor<B, 4> {
 
 /// `MaxPool2d(kernel_size=2, stride=1, ceil_mode=True)` over an NCHW tensor.
 ///
-/// For a stride-1, kernel-2, ceil-mode pool the output keeps the input H×W: each
-/// position takes the max of its 2×2 window, and the last row/column (whose window
-/// runs off the edge) reduces to the border pixel itself. Implemented directly
-/// because Burn's pooling has no `ceil_mode`.
+/// For a kernel-2, stride-1 pool every 2×2 window fits fully inside an `H×W` input,
+/// so the output is `(H-1)×(W-1)` — `ceil_mode` adds no partial window because
+/// `(H-2)/1` is already an integer. Output position `(i, j)` is the max over the
+/// four input positions `(i..i+2, j..j+2)`. Implemented directly because Burn's
+/// pooling exposes no `ceil_mode`; the `(H-1)` shrink matches the reference and is
+/// what makes the pooled branch line up with the `stem2b` branch for concat.
+///
+/// Inputs must be at least 2×2 (they always are here: the stem runs on the padded
+/// `stem1` output). Smaller inputs are returned unchanged to avoid a zero-size dim.
 fn max_pool_2_ceil<B: Backend>(x: Tensor<B, 4>) -> Tensor<B, 4> {
-    let right = shift_toward_origin(x.clone(), 3);
-    let down = shift_toward_origin(x.clone(), 2);
-    let down_right = shift_toward_origin(shift_toward_origin(x.clone(), 2), 3);
-    x.max_pair(right).max_pair(down).max_pair(down_right)
-}
-
-/// Returns `x` shifted toward the origin along `dim` by one, duplicating the last
-/// index (clamp padding), preserving shape.
-fn shift_toward_origin<B: Backend>(x: Tensor<B, 4>, dim: usize) -> Tensor<B, 4> {
-    let len = x.dims()[dim];
-    if len <= 1 {
+    let [_, _, h, w] = x.dims();
+    if h < 2 || w < 2 {
         return x;
     }
-    let body = x.clone().narrow(dim, 1, len - 1);
-    let last = x.narrow(dim, len - 1, 1);
-    Tensor::cat(vec![body, last], dim)
+    // The four 2×2-window offsets, each an (H-1)×(W-1) crop.
+    let tl = x.clone().narrow(2, 0, h - 1).narrow(3, 0, w - 1);
+    let tr = x.clone().narrow(2, 0, h - 1).narrow(3, 1, w - 1);
+    let bl = x.clone().narrow(2, 1, h - 1).narrow(3, 0, w - 1);
+    let br = x.narrow(2, 1, h - 1).narrow(3, 1, w - 1);
+    tl.max_pair(tr).max_pair(bl).max_pair(br)
 }
