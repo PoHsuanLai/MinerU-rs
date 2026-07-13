@@ -16,10 +16,12 @@
 
 use std::path::Path;
 
+use burn::module::Module;
 use burn::prelude::Backend;
+use burn::tensor::Tensor;
 use image::RgbImage;
 use mineru_burn_common::preprocess::{Normalize, Preprocess, Size};
-use mineru_burn_common::weights::{Coverage, KeyRemap, load_weights};
+use mineru_burn_common::weights::load_weights;
 use mineru_types::BBox;
 
 use crate::backbone::{PpLcNetV4Det, STAGE_OUT_CHANNELS};
@@ -27,6 +29,7 @@ use crate::error::{Error, Result};
 use crate::head::DbHead;
 use crate::neck::RepLkFpn;
 use crate::postprocess::{boxes_from_bitmap, DbPostConfig, ProbMap, QuadBox};
+use crate::weights::{key_remap, COVERAGE};
 
 /// Configuration for the detector's resize/threshold behaviour.
 #[derive(Debug, Clone, Copy)]
@@ -54,11 +57,36 @@ impl Default for DetConfig {
     }
 }
 
-/// DBNet detector: PP-LCNetV4 backbone → RepLKFPN neck → DB head → post-process.
-pub struct TextDetector<B: Backend> {
+/// Backbone + neck, mirroring the checkpoint's `model.{backbone,neck}` subtree.
+///
+/// The DB head's checkpoint keys are top-level (`head.*`), so it is *not* nested
+/// here; see [`Net`]. Keeping this split lets the whole checkpoint load into one
+/// module tree under strict coverage with no prefix rewriting.
+#[derive(Module, Debug)]
+struct NetInner<B: Backend> {
     backbone: PpLcNetV4Det<B>,
     neck: RepLkFpn<B>,
+}
+
+/// The full detection network, laid out to match the checkpoint's module tree:
+/// backbone + neck under `model.*`, and the DB head under `head.*`.
+#[derive(Module, Debug)]
+struct Net<B: Backend> {
+    model: NetInner<B>,
     head: DbHead<B>,
+}
+
+impl<B: Backend> Net<B> {
+    fn forward(&self, input: Tensor<B, 4>) -> Tensor<B, 4> {
+        let feats = self.model.backbone.forward(input);
+        let fused = self.model.neck.forward(feats);
+        self.head.forward(fused)
+    }
+}
+
+/// DBNet detector: PP-LCNetV4 backbone → RepLKFPN neck → DB head → post-process.
+pub struct TextDetector<B: Backend> {
+    net: Net<B>,
     config: DetConfig,
     device: B::Device,
     preprocess_template: Preprocess,
@@ -77,56 +105,29 @@ impl<B: Backend> TextDetector<B> {
         // A template Preprocess; each image overrides the Size before applying.
         let preprocess_template = Preprocess::new(Size::square(32), Normalize::imagenet());
         Self {
-            backbone,
-            neck,
-            head,
+            net: Net {
+                model: NetInner { backbone, neck },
+                head,
+            },
             config,
             device,
             preprocess_template,
         }
     }
 
-    /// Loads PP-OCRv6 safetensors (or `.pth`) weights into all sub-modules.
+    /// Loads PP-OCRv6 safetensors (or `.pth`) weights into the whole network.
     ///
-    /// The HF-flat checkpoint keys are prefixed `backbone.` / `neck.` / `head.` and
-    /// otherwise line up with this crate's module tree, so only the SE-conv and
-    /// reparameterised depthwise-conv index renames are applied. Loads with
-    /// [`Coverage::Strict`] so any unmatched source key is surfaced as an error.
+    /// The whole checkpoint is applied to one module tree ([`Net`], whose layout
+    /// mirrors the checkpoint's `model.{backbone,neck}` / `head` prefixes), with the
+    /// [`key_remap`] bridging the two small structural differences (SE conv indices,
+    /// reparameterised depthwise conv). Loads with [`Coverage::Strict`] so any
+    /// unmatched source key is surfaced as an [`Error::UnmappedKeys`].
+    ///
+    /// [`Error::UnmappedKeys`]: mineru_burn_common::Error::UnmappedKeys
     pub fn load_weights(&mut self, path: impl AsRef<Path>) -> Result<()> {
-        let path = path.as_ref();
-        let remap = Self::build_remap()?;
-        // Load each sub-module from its prefixed slice. burn-store applies the whole
-        // file to each module and reports unused keys; because the three prefixes
-        // partition the file, we load leniently per module and rely on the model
-        // structure (not per-call coverage) for correctness.
-        load_weights::<B, _>(&mut self.backbone, path, &remap.0, Coverage::Lenient)?;
-        load_weights::<B, _>(&mut self.neck, path, &remap.1, Coverage::Lenient)?;
-        load_weights::<B, _>(&mut self.head, path, &remap.2, Coverage::Lenient)?;
+        let remap = key_remap()?;
+        load_weights::<B, _>(&mut self.net, path.as_ref(), &remap, COVERAGE)?;
         Ok(())
-    }
-
-    /// Builds the three per-module key remappers (backbone, neck, head).
-    ///
-    /// Each strips the module prefix and applies the small index renames needed for
-    /// the SE convs (`convolutions.0/2` → `reduce`/`expand`) and the reparameterised
-    /// depthwise conv (`token_conv` → `token_conv_rep` when it is a bare conv).
-    #[allow(clippy::type_complexity)]
-    fn build_remap() -> Result<(KeyRemap, KeyRemap, KeyRemap)> {
-        let map_err = |e: mineru_burn_common::Error| Error::Common(e);
-
-        let backbone = KeyRemap::new()
-            .rename(r"^backbone\.", "")
-            .map_err(map_err)?
-            .rename(r"\.convolutions\.0\.", ".reduce.")
-            .map_err(map_err)?
-            .rename(r"\.convolutions\.2\.", ".expand.")
-            .map_err(map_err)?;
-
-        let neck = KeyRemap::new().rename(r"^neck\.", "").map_err(map_err)?;
-
-        let head = KeyRemap::new().rename(r"^head\.", "").map_err(map_err)?;
-
-        Ok((backbone, neck, head))
     }
 
     /// Runs detection on `image`, returning axis-aligned bounding boxes.
@@ -156,9 +157,7 @@ impl<B: Backend> TextDetector<B> {
         let input = pre.apply::<B>(image, &self.device)?;
 
         // Forward pass -> probability map [1, 1, Hm, Wm].
-        let feats = self.backbone.forward(input);
-        let fused = self.neck.forward(feats);
-        let prob = self.head.forward(fused);
+        let prob = self.net.forward(input);
 
         let dims = prob.dims();
         if dims[0] != 1 || dims[1] != 1 {

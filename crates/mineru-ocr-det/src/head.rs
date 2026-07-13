@@ -10,16 +10,20 @@ use burn::module::Module;
 use burn::nn::conv::{
     Conv2d, Conv2dConfig, ConvTranspose2d, ConvTranspose2dConfig,
 };
-use burn::nn::{BatchNorm, BatchNormConfig, PaddingConfig2d, Relu};
+use burn::nn::{PaddingConfig2d, Relu};
 use burn::prelude::Backend;
 use burn::tensor::Tensor;
 use burn::tensor::activation::sigmoid;
+use mineru_burn_common::nn::FrozenBatchNorm2d;
+
+/// Epsilon for the frozen batch-norm affine (PyTorch `BatchNorm2d` default).
+const BN_EPS: f64 = 1e-5;
 
 /// Conv-BN-ReLU down-projection (`PPOCRV6DBConvBatchnormLayer`, non-transpose).
 #[derive(Module, Debug)]
 struct ConvDown<B: Backend> {
     convolution: Conv2d<B>,
-    norm: BatchNorm<B>,
+    norm: FrozenBatchNorm2d<B>,
     act: Relu,
 }
 
@@ -31,7 +35,7 @@ impl<B: Backend> ConvDown<B> {
                 .with_padding(PaddingConfig2d::Explicit(pad, pad, pad, pad))
                 .with_bias(false)
                 .init(device),
-            norm: BatchNormConfig::new(out_ch).init(device),
+            norm: FrozenBatchNorm2d::init(out_ch, BN_EPS, device),
             act: Relu::new(),
         }
     }
@@ -47,7 +51,7 @@ impl<B: Backend> ConvDown<B> {
 #[derive(Module, Debug)]
 struct ConvUp<B: Backend> {
     convolution: ConvTranspose2d<B>,
-    norm: BatchNorm<B>,
+    norm: FrozenBatchNorm2d<B>,
     act: Relu,
 }
 
@@ -57,7 +61,7 @@ impl<B: Backend> ConvUp<B> {
             convolution: ConvTranspose2dConfig::new([in_ch, out_ch], [kernel, kernel])
                 .with_stride([stride, stride])
                 .init(device),
-            norm: BatchNormConfig::new(out_ch).init(device),
+            norm: FrozenBatchNorm2d::init(out_ch, BN_EPS, device),
             act: Relu::new(),
         }
     }

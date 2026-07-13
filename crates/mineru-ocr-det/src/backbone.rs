@@ -12,9 +12,13 @@
 use burn::module::Module;
 use burn::nn::conv::{Conv2d, Conv2dConfig};
 use burn::nn::pool::{AdaptiveAvgPool2d, AdaptiveAvgPool2dConfig, MaxPool2d, MaxPool2dConfig};
-use burn::nn::{BatchNorm, BatchNormConfig, Gelu, PaddingConfig2d, Relu};
+use burn::nn::{Gelu, PaddingConfig2d, Relu};
 use burn::prelude::Backend;
 use burn::tensor::Tensor;
+use mineru_burn_common::nn::FrozenBatchNorm2d;
+
+/// Epsilon for the frozen batch-norm affine (PyTorch `BatchNorm2d` default).
+const BN_EPS: f64 = 1e-5;
 
 /// Detection stem channels for PP-OCRv6 *small* (`NET_CONFIG_DET["small"]`).
 const STEM_CHANNELS: [usize; 3] = [3, 24, 48];
@@ -62,7 +66,7 @@ enum Act {
 #[derive(Module, Debug)]
 struct ConvLayer<B: Backend> {
     convolution: Conv2d<B>,
-    normalization: BatchNorm<B>,
+    normalization: FrozenBatchNorm2d<B>,
     relu: Option<Relu>,
 }
 
@@ -85,7 +89,7 @@ impl<B: Backend> ConvLayer<B> {
             .init(device);
         Self {
             convolution,
-            normalization: BatchNormConfig::new(out_ch).init(device),
+            normalization: FrozenBatchNorm2d::init(out_ch, BN_EPS, device),
             relu: matches!(act, Act::Relu).then(Relu::new),
         }
     }

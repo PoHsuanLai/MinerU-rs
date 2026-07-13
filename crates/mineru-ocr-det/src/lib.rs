@@ -41,6 +41,7 @@ pub mod head;
 pub mod model;
 pub mod neck;
 pub mod postprocess;
+pub mod weights;
 
 pub use error::{Error, Result};
 pub use model::{DetConfig, TextDetector};
