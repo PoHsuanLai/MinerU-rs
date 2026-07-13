@@ -17,12 +17,15 @@ const ENV_DEVICE_MODE: &str = "MINERU_DEVICE_MODE";
 /// Environment variable overriding [`Config::model_source`].
 const ENV_MODEL_SOURCE: &str = "MINERU_MODEL_SOURCE";
 
-/// Default model cache directory.
+/// Default model directory: where the released model weights live on disk.
 ///
 /// The user's main disk is tight, so large model weights live on the Archive
-/// volume by default. Override with `models_dir` in the config file or the
-/// `MINERU_MODELS_DIR` environment variable.
-const DEFAULT_MODELS_DIR: &str = "/Volumes/Archive/mineru/models";
+/// volume by default. This points at the `models/` directory of the
+/// PDF-Extract-Kit-1.0 release (which directly contains `Layout/`, `OCR/`,
+/// `MFR/`, `TabRec/`, …), so the pipeline finds its weights out of the box.
+/// Override with `models_dir` in the config file or the `MINERU_MODELS_DIR`
+/// environment variable.
+const DEFAULT_MODELS_DIR: &str = "/Volumes/Archive/mineru/models/PDF-Extract-Kit-1.0/models";
 
 /// User configuration for the MinerU document parser.
 ///
@@ -135,7 +138,7 @@ mod tests {
     fn default_models_dir_is_archive_volume() {
         assert_eq!(
             Config::default().models_dir,
-            PathBuf::from("/Volumes/Archive/mineru/models")
+            PathBuf::from("/Volumes/Archive/mineru/models/PDF-Extract-Kit-1.0/models")
         );
     }
 
@@ -202,7 +205,10 @@ mod tests {
         let json = r#"{ "device": "mps" }"#;
         let c: Config = serde_json::from_str(json).unwrap();
         assert_eq!(c.device, Device::Mps);
-        assert_eq!(c.models_dir, PathBuf::from("/Volumes/Archive/mineru/models"));
+        assert_eq!(
+            c.models_dir,
+            PathBuf::from("/Volumes/Archive/mineru/models/PDF-Extract-Kit-1.0/models")
+        );
         assert_eq!(c.model_source, ModelSource::HuggingFace);
     }
 
