@@ -15,7 +15,7 @@ description = "Shared Burn harness for MinerU model crates: backends, weight loa
 burn = { workspace = true, features = ["ndarray"] }
 # burn-store carries the PyTorch / safetensors readers plus key remapping and the
 # ApplyResult report we build the "all keys consumed" assertion on top of.
-burn-store = { version = "0.21", default-features = false, features = ["std", "pytorch", "safetensors"] }
+burn-store = { workspace = true }
 image = { version = "0.25", default-features = false }
 regex = "1"
 thiserror.workspace = true

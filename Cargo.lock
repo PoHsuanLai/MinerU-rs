@@ -4048,6 +4048,7 @@ version = "0.1.0"
 dependencies = [
  "burn",
  "burn-onnx",
+ "burn-store",
  "image",
  "mineru-types",
  "thiserror 2.0.18",

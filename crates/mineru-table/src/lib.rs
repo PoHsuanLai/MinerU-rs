@@ -43,7 +43,12 @@ pub mod unet;
 mod model {
     #[cfg(lcnet_generated)]
     pub mod pp_lcnet_x1_0_table_cls {
-        include!(concat!(env!("OUT_DIR"), "/model/pp_lcnet_x1_0_table_cls.rs"));
+        // burn-onnx names the generated file after the ONNX file verbatim,
+        // preserving case and hyphens (`PP-LCNet_x1_0_table_cls.rs`).
+        include!(concat!(
+            env!("OUT_DIR"),
+            "/model/PP-LCNet_x1_0_table_cls.rs"
+        ));
     }
     #[cfg(unet_generated)]
     pub mod unet {

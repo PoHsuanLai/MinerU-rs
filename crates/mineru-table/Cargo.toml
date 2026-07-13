@@ -15,6 +15,11 @@ burn = { workspace = true, features = ["ndarray"] }
 image = { version = "0.25", default-features = false }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# The burn-onnx-generated modules `use burn_store::{BurnpackStore, ModuleSnapshot}`
+# to load their embedded `.bpk` weights, so burn-store (with the `burnpack`
+# reader) must be a direct dependency whenever the generated code is compiled.
+# Optional + gated to `onnx-import` so the default stub build stays lean.
+burn-store = { workspace = true, features = ["burnpack"], optional = true }
 
 # ONNX-imported model modules are generated at build time behind the
 # `onnx-import` feature (see build.rs). When the feature is off (the default),
@@ -30,7 +35,7 @@ default = []
 # segmentation models. Requires the `.onnx` files to be present (path set via
 # the MINERU_MODELS_DIR environment variable) and network access to fetch the
 # burn-onnx build-dependency the first time.
-onnx-import = ["dep:burn-onnx"]
+onnx-import = ["dep:burn-onnx", "dep:burn-store"]
 # Opt-in GPU backend, forwarded to burn.
 gpu = ["burn/wgpu"]
 

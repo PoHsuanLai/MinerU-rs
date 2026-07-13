@@ -30,6 +30,10 @@ serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
 burn = { version = "0.21", default-features = false }
+# burn-store: PyTorch/safetensors/burnpack readers + key remapping. Used directly
+# by mineru-burn-common (weight loading) and by mineru-table's burn-onnx-generated
+# code (which `use burn_store::BurnpackStore`).
+burn-store = { version = "0.21", default-features = false, features = ["std", "pytorch", "safetensors"] }
 
 [profile.release]
 lto = "thin"
