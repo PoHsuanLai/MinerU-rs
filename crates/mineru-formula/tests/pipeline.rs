@@ -125,9 +125,9 @@ fn real_weights_load_and_predict() {
     let dir = std::env::var("MINERU_FORMULA_MODEL_DIR")
         .expect("set MINERU_FORMULA_MODEL_DIR to the checkpoint directory");
 
-    // Lenient first: this will report unmapped keys rather than hard-failing, so
-    // the remap rules can be tightened. Flip to Strict once verified.
-    let recognizer = FormulaRecognizer::<Cpu>::from_pretrained(&dir, Coverage::Lenient)
+    // Strict: the remap is verified (see tests/real_weights.rs — every source key
+    // is consumed), so a real load must leave zero unmapped keys here too.
+    let recognizer = FormulaRecognizer::<Cpu>::from_pretrained(&dir, Coverage::Strict)
         .expect("load recognizer");
 
     // A blank white image is enough to prove the forward path runs end to end.
