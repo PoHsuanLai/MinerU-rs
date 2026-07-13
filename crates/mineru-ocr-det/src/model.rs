@@ -31,6 +31,16 @@ use crate::neck::RepLkFpn;
 use crate::postprocess::{boxes_from_bitmap, DbPostConfig, ProbMap, QuadBox};
 use crate::weights::{key_remap, COVERAGE};
 
+/// A single activation dump: flat row-major `f32` data plus its `[N, C, H, W]` shape.
+/// Used only by the parity test hook [`TextDetector::forward_stages`].
+#[doc(hidden)]
+pub type StageDump = (Vec<f32>, [usize; 4]);
+
+/// The per-stage activations returned by [`TextDetector::forward_stages`]:
+/// `(backbone_feats, neck_out, maps)`.
+#[doc(hidden)]
+pub type StageDumps = (Vec<StageDump>, StageDump, StageDump);
+
 /// Configuration for the detector's resize/threshold behaviour.
 #[derive(Debug, Clone, Copy)]
 pub struct DetConfig {
@@ -180,6 +190,44 @@ impl<B: Backend> TextDetector<B> {
             src_w as f32,
             src_h as f32,
         ))
+    }
+
+    /// Test/parity hook: runs the network on an already-preprocessed `[1, 3, H, W]`
+    /// tensor and returns every stage's activations as flat row-major `f32` data
+    /// paired with its `[N, C, H, W]` shape.
+    ///
+    /// Returns `(backbone_feats, neck_out, maps)` where `backbone_feats` is the four
+    /// backbone stage outputs in order. This bypasses resize/normalise so a caller
+    /// can feed the exact same tensor the Python reference used and diff each stage
+    /// to localise any divergence. Not part of the public detection API — it exists
+    /// so the numerical-parity test can reach intermediate activations.
+    #[doc(hidden)]
+    pub fn forward_stages(&self, input: Tensor<B, 4>) -> StageDumps {
+        let feats = self.net.model.backbone.forward(input);
+        let dump = |t: &Tensor<B, 4>| -> StageDump {
+            let d = t.dims();
+            let v = t.clone().into_data().into_vec::<f32>().expect("f32 tensor");
+            (v, [d[0], d[1], d[2], d[3]])
+        };
+        let backbone_dumps: Vec<_> = feats.iter().map(dump).collect();
+        let fused = self.net.model.neck.forward(feats);
+        let neck_dump = dump(&fused);
+        let maps = self.net.head.forward(fused);
+        let maps_dump = dump(&maps);
+        (backbone_dumps, neck_dump, maps_dump)
+    }
+
+    /// Test/parity hook: preprocesses `image` at an explicit target size (no resize
+    /// rounding) exactly as the detection path does, returning the `[1, 3, H, W]`
+    /// input tensor. Lets a parity test drive [`TextDetector::forward_stages`] with
+    /// the same tensor the Python reference consumed.
+    #[doc(hidden)]
+    pub fn preprocess_at(&self, image: &RgbImage, size: Size) -> Result<Tensor<B, 4>> {
+        let pre = Preprocess {
+            size,
+            ..self.preprocess_template.clone()
+        };
+        Ok(pre.apply::<B>(image, &self.device)?)
     }
 
     /// Computes the network input size from the source size, matching

@@ -259,8 +259,12 @@ impl<B: Backend> Stem<B> {
         let a = self.stem2a.forward(emb.clone());
         let a = pad_right_bottom(a);
         let a = self.stem2b.forward(a);
-        // MaxPool2d kernel 2 stride 1 ceil_mode=True == pad right/bottom then floor-pool.
-        let pooled = self.pool.forward(pad_right_bottom(emb));
+        // Python pools the already-padded `emb` directly (rec_lcnetv4 PPLCNetV4LargeStem):
+        //   pooled_emb = MaxPool2d(kernel=2, stride=1, ceil_mode=True)(embedding)
+        // With stride 1, (H - 2) is always divisible by the stride, so ceil_mode and
+        // Burn's floor-mode pooling yield the identical output size — no extra padding
+        // is needed (padding here previously grew `emb` a second time and broke the cat).
+        let pooled = self.pool.forward(emb.clone());
         let emb = Tensor::cat(vec![pooled, a], 1);
         let emb = self.stem3.forward(emb);
         self.stem4.forward(emb)
