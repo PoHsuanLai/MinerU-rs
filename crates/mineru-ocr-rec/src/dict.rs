@@ -68,6 +68,22 @@ impl CharDict {
         Self::from_str(&contents, use_space_char)
     }
 
+    /// The default PP-OCRv6 character dictionary, embedded in the binary.
+    ///
+    /// The v6 charset ships with the application rather than the model weight
+    /// release, so it is bundled as a crate asset (`assets/ppocrv6_dict.txt`) and
+    /// embedded with `include_str!`. Callers that need a different language's dict
+    /// still use [`CharDict::from_file`]; this is the batteries-included default
+    /// the pipeline falls back to so recognition works with no external dict file.
+    ///
+    /// `use_space_char` appends a space class, matching the recognizer config.
+    pub fn ppocrv6(use_space_char: bool) -> Result<Self> {
+        Self::from_str(
+            include_str!("../assets/ppocrv6_dict.txt"),
+            use_space_char,
+        )
+    }
+
     /// The number of CTC classes (including blank).
     pub fn num_classes(&self) -> usize {
         self.characters.len()

@@ -122,7 +122,15 @@ impl PipelineModels {
         });
 
         let ocr_rec = load_stage("ocr-rec", || {
-            let dict = CharDict::from_file(&paths.ocr_rec_dict, true)?;
+            // The v6 charset ships with the app, not the weight release. Use an
+            // external dict file if one is present at the configured path
+            // (e.g. a different language's dict), else fall back to the PP-OCRv6
+            // dict embedded in mineru-ocr-rec so recognition works out of the box.
+            let dict = if paths.ocr_rec_dict.exists() {
+                CharDict::from_file(&paths.ocr_rec_dict, true)?
+            } else {
+                CharDict::ppocrv6(true)?
+            };
             let mut rec = TextRecognizer::<Cpu>::new(dict, RecConfig::default(), device);
             rec.load_weights(&paths.ocr_rec)?;
             Ok(rec)
