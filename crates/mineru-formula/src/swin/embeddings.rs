@@ -20,24 +20,37 @@
 
 use burn::module::Module;
 use burn::nn::conv::{Conv2d, Conv2dConfig};
-use burn::nn::{BatchNorm, BatchNormConfig, LayerNorm, LayerNormConfig, PaddingConfig2d};
+use burn::nn::PaddingConfig2d;
 use burn::tensor::activation::gelu;
 use burn::tensor::backend::Backend;
 use burn::tensor::Tensor;
 
+use mineru_burn_common::nn::{FrozenBatchNorm2d, PtLayerNorm};
+
 use crate::config::SwinConfig;
+
+/// The stem's `norm1`, a `nn.Sequential(nn.BatchNorm2d(dim))`.
+///
+/// The extra wrapper exists only so the checkpoint's `norm1.0.*` `Sequential`
+/// index lines up with a named Burn field (`bn`); the remap rewrites `norm1.0.` →
+/// `norm1.bn.`. UniMerNet runs the Swin encoder in eval mode, so the BatchNorm is
+/// a frozen per-channel affine over the running stats.
+#[derive(Module, Debug)]
+pub struct Norm1Seq<B: Backend> {
+    bn: FrozenBatchNorm2d<B>,
+}
 
 /// The overlapping-conv stem that replaces Swin's single patch conv.
 #[derive(Module, Debug)]
 pub struct StemLayer<B: Backend> {
     conv1: Conv2d<B>,
-    norm1: BatchNorm<B>,
+    norm1: Norm1Seq<B>,
     conv2: Conv2d<B>,
 }
 
 impl<B: Backend> StemLayer<B> {
     /// Builds the stem for `in_chans -> out_chans` (out == `embed_dim`).
-    pub fn new(in_chans: usize, out_chans: usize, device: &B::Device) -> Self {
+    pub fn new(in_chans: usize, out_chans: usize, cfg: &SwinConfig, device: &B::Device) -> Self {
         let mid = out_chans / 2;
         let conv = |ci: usize, co: usize| {
             Conv2dConfig::new([ci, co], [3, 3])
@@ -47,7 +60,9 @@ impl<B: Backend> StemLayer<B> {
         };
         Self {
             conv1: conv(in_chans, mid),
-            norm1: BatchNormConfig::new(mid).init(device),
+            norm1: Norm1Seq {
+                bn: FrozenBatchNorm2d::init(mid, cfg.layer_norm_eps, device),
+            },
             conv2: conv(mid, out_chans),
         }
     }
@@ -55,7 +70,7 @@ impl<B: Backend> StemLayer<B> {
     /// `[B, C, H, W] -> [B, embed_dim, H/4, W/4]`.
     pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
         let x = self.conv1.forward(x);
-        let x = self.norm1.forward(x);
+        let x = self.norm1.bn.forward(x);
         let x = gelu(x);
         self.conv2.forward(x)
     }
@@ -65,17 +80,15 @@ impl<B: Backend> StemLayer<B> {
 #[derive(Module, Debug)]
 pub struct PatchEmbeddings<B: Backend> {
     projection: StemLayer<B>,
-    norm: LayerNorm<B>,
+    norm: PtLayerNorm<B>,
 }
 
 impl<B: Backend> PatchEmbeddings<B> {
     /// Builds the patch embedding for the given config.
     pub fn new(cfg: &SwinConfig, device: &B::Device) -> Self {
         Self {
-            projection: StemLayer::new(cfg.num_channels, cfg.embed_dim, device),
-            norm: LayerNormConfig::new(cfg.embed_dim)
-                .with_epsilon(cfg.layer_norm_eps)
-                .init(device),
+            projection: StemLayer::new(cfg.num_channels, cfg.embed_dim, cfg, device),
+            norm: PtLayerNorm::init(cfg.embed_dim, cfg.layer_norm_eps, device),
         }
     }
 

@@ -10,10 +10,11 @@
 //! ```
 
 use burn::module::Module;
-use burn::nn::{LayerNorm, LayerNormConfig, Linear, LinearConfig};
 use burn::tensor::activation::gelu;
 use burn::tensor::backend::Backend;
 use burn::tensor::Tensor;
+
+use mineru_burn_common::nn::{PtLayerNorm, PtLinear};
 
 use crate::config::MBartConfig;
 use crate::mbart::attention::MBartAttention;
@@ -22,29 +23,25 @@ use crate::mbart::attention::MBartAttention;
 #[derive(Module, Debug)]
 pub struct MBartDecoderLayer<B: Backend> {
     self_attn: MBartAttention<B>,
-    self_attn_layer_norm: LayerNorm<B>,
+    self_attn_layer_norm: PtLayerNorm<B>,
     encoder_attn: MBartAttention<B>,
-    encoder_attn_layer_norm: LayerNorm<B>,
-    fc1: Linear<B>,
-    fc2: Linear<B>,
-    final_layer_norm: LayerNorm<B>,
+    encoder_attn_layer_norm: PtLayerNorm<B>,
+    fc1: PtLinear<B>,
+    fc2: PtLinear<B>,
+    final_layer_norm: PtLayerNorm<B>,
 }
 
 impl<B: Backend> MBartDecoderLayer<B> {
     /// Builds a decoder layer from the config.
     pub fn new(cfg: &MBartConfig, device: &B::Device) -> Self {
-        let ln = || {
-            LayerNormConfig::new(cfg.d_model)
-                .with_epsilon(cfg.layer_norm_eps)
-                .init(device)
-        };
+        let ln = || PtLayerNorm::init(cfg.d_model, cfg.layer_norm_eps, device);
         Self {
             self_attn: MBartAttention::new(cfg, device),
             self_attn_layer_norm: ln(),
             encoder_attn: MBartAttention::new(cfg, device),
             encoder_attn_layer_norm: ln(),
-            fc1: LinearConfig::new(cfg.d_model, cfg.decoder_ffn_dim).init(device),
-            fc2: LinearConfig::new(cfg.decoder_ffn_dim, cfg.d_model).init(device),
+            fc1: PtLinear::init(cfg.d_model, cfg.decoder_ffn_dim, true, device),
+            fc2: PtLinear::init(cfg.decoder_ffn_dim, cfg.d_model, true, device),
             final_layer_norm: ln(),
         }
     }

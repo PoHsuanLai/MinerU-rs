@@ -11,10 +11,11 @@
 //! reproduced exactly so the checkpoint's `relative_position_bias_table` loads.
 
 use burn::module::{Module, Param};
-use burn::nn::{Linear, LinearConfig};
 use burn::tensor::activation::softmax;
 use burn::tensor::backend::Backend;
 use burn::tensor::{Int, Tensor, TensorData};
+
+use mineru_burn_common::nn::PtLinear;
 
 use crate::config::SwinConfig;
 
@@ -46,11 +47,11 @@ pub fn relative_position_index(window: usize) -> Vec<i64> {
 /// Windowed multi-head self-attention for one Swin stage.
 #[derive(Module, Debug)]
 pub struct WindowAttention<B: Backend> {
-    query: Linear<B>,
-    key: Linear<B>,
-    value: Linear<B>,
+    query: PtLinear<B>,
+    key: PtLinear<B>,
+    value: PtLinear<B>,
     /// The `UnimerSwinSelfOutput.dense` projection applied after attention.
-    output: Linear<B>,
+    output: PtLinear<B>,
     /// Learned bias table, `[(2W-1)^2, num_heads]`. Loaded from the checkpoint.
     relative_position_bias_table: Param<Tensor<B, 2>>,
     num_heads: usize,
@@ -64,7 +65,7 @@ impl<B: Backend> WindowAttention<B> {
         let window = cfg.window_size;
         let table_rows = (2 * window - 1) * (2 * window - 1);
         let linear = |d_in: usize, d_out: usize, bias: bool| {
-            LinearConfig::new(d_in, d_out).with_bias(bias).init(device)
+            PtLinear::init(d_in, d_out, bias, device)
         };
         Self {
             query: linear(dim, dim, cfg.qkv_bias),

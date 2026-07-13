@@ -18,10 +18,12 @@
 
 use burn::module::Module;
 use burn::nn::conv::{Conv2d, Conv2dConfig};
-use burn::nn::{LayerNorm, LayerNormConfig, Linear, LinearConfig, PaddingConfig2d};
+use burn::nn::PaddingConfig2d;
 use burn::tensor::activation::gelu;
 use burn::tensor::backend::Backend;
 use burn::tensor::Tensor;
+
+use mineru_burn_common::nn::{PtLayerNorm, PtLinear};
 
 use crate::config::SwinConfig;
 use crate::swin::attention::WindowAttention;
@@ -82,33 +84,29 @@ fn window_reverse<B: Backend>(
 /// A single Swin transformer block.
 #[derive(Module, Debug)]
 pub struct SwinLayer<B: Backend> {
-    layernorm_before: LayerNorm<B>,
-    ce0: ConvEnhance<B>,
-    ce1: ConvEnhance<B>,
+    layernorm_before: PtLayerNorm<B>,
+    /// The two `ConvEnhance` blocks, kept as a `Vec` so the checkpoint's
+    /// `ce.0.*` / `ce.1.*` `ModuleList` indices line up directly.
+    ce: Vec<ConvEnhance<B>>,
     attention: WindowAttention<B>,
-    layernorm_after: LayerNorm<B>,
-    intermediate: Linear<B>,
-    output: Linear<B>,
+    layernorm_after: PtLayerNorm<B>,
+    intermediate: PtLinear<B>,
+    output: PtLinear<B>,
     window_size: usize,
 }
 
 impl<B: Backend> SwinLayer<B> {
     /// Builds a block for a stage of dimension `dim` with `num_heads` heads.
     pub fn new(cfg: &SwinConfig, dim: usize, num_heads: usize, device: &B::Device) -> Self {
-        let ln = || {
-            LayerNormConfig::new(dim)
-                .with_epsilon(cfg.layer_norm_eps)
-                .init(device)
-        };
+        let ln = || PtLayerNorm::init(dim, cfg.layer_norm_eps, device);
         let ffn_hidden = (cfg.mlp_ratio * dim as f64) as usize;
         Self {
             layernorm_before: ln(),
-            ce0: ConvEnhance::new(dim, device),
-            ce1: ConvEnhance::new(dim, device),
+            ce: vec![ConvEnhance::new(dim, device), ConvEnhance::new(dim, device)],
             attention: WindowAttention::new(cfg, dim, num_heads, device),
             layernorm_after: ln(),
-            intermediate: LinearConfig::new(dim, ffn_hidden).init(device),
-            output: LinearConfig::new(ffn_hidden, dim).init(device),
+            intermediate: PtLinear::init(dim, ffn_hidden, true, device),
+            output: PtLinear::init(ffn_hidden, dim, true, device),
             window_size: cfg.window_size,
         }
     }
@@ -123,7 +121,7 @@ impl<B: Backend> SwinLayer<B> {
         let win = self.window_size.min(h).min(w);
 
         // First ConvEnhance, then the attention residual branch.
-        let hidden = self.ce0.forward(hidden, h, w);
+        let hidden = self.ce[0].forward(hidden, h, w);
         let shortcut = hidden.clone();
 
         let normed = self.layernorm_before.forward(hidden);
@@ -159,7 +157,7 @@ impl<B: Backend> SwinLayer<B> {
         let hidden = shortcut + attn;
 
         // Second ConvEnhance, then the FFN residual branch.
-        let hidden = self.ce1.forward(hidden, h, w);
+        let hidden = self.ce[1].forward(hidden, h, w);
         let ff = self.layernorm_after.forward(hidden.clone());
         let ff = gelu(self.intermediate.forward(ff));
         let ff = self.output.forward(ff);

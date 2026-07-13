@@ -23,9 +23,11 @@ pub mod attention;
 pub mod layer;
 
 use burn::module::Module;
-use burn::nn::{Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig, Linear, LinearConfig};
+use burn::nn::{Embedding, EmbeddingConfig};
 use burn::tensor::backend::Backend;
 use burn::tensor::{Int, Tensor, TensorData};
+
+use mineru_burn_common::nn::{PtLayerNorm, PtLinear};
 
 use crate::config::MBartConfig;
 use layer::MBartDecoderLayer;
@@ -35,10 +37,10 @@ use layer::MBartDecoderLayer;
 pub struct MBartDecoder<B: Backend> {
     embed_tokens: Embedding<B>,
     embed_positions: Embedding<B>,
-    layernorm_embedding: LayerNorm<B>,
+    layernorm_embedding: PtLayerNorm<B>,
     layers: Vec<MBartDecoderLayer<B>>,
-    layer_norm: LayerNorm<B>,
-    lm_head: Linear<B>,
+    layer_norm: PtLayerNorm<B>,
+    lm_head: PtLinear<B>,
     embed_scale: f64,
     position_offset: usize,
 }
@@ -46,11 +48,7 @@ pub struct MBartDecoder<B: Backend> {
 impl<B: Backend> MBartDecoder<B> {
     /// Builds the decoder from the config.
     pub fn new(cfg: &MBartConfig, device: &B::Device) -> Self {
-        let ln = || {
-            LayerNormConfig::new(cfg.d_model)
-                .with_epsilon(cfg.layer_norm_eps)
-                .init(device)
-        };
+        let ln = || PtLayerNorm::init(cfg.d_model, cfg.layer_norm_eps, device);
         let embed_scale = if cfg.scale_embedding {
             (cfg.d_model as f64).sqrt()
         } else {
@@ -68,9 +66,7 @@ impl<B: Backend> MBartDecoder<B> {
                 .map(|_| MBartDecoderLayer::new(cfg, device))
                 .collect(),
             layer_norm: ln(),
-            lm_head: LinearConfig::new(cfg.d_model, cfg.vocab_size)
-                .with_bias(false)
-                .init(device),
+            lm_head: PtLinear::init(cfg.d_model, cfg.vocab_size, false, device),
             embed_scale,
             position_offset: MBartConfig::POSITION_OFFSET,
         }

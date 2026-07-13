@@ -16,20 +16,21 @@
 //! prefix. A KV cache is the documented optimization (see [`crate::generate`]).
 
 use burn::module::Module;
-use burn::nn::{Linear, LinearConfig};
 use burn::tensor::activation::softmax;
 use burn::tensor::backend::Backend;
 use burn::tensor::Tensor;
+
+use mineru_burn_common::nn::PtLinear;
 
 use crate::config::MBartConfig;
 
 /// Squeeze multi-head attention.
 #[derive(Module, Debug)]
 pub struct MBartAttention<B: Backend> {
-    q_proj: Linear<B>,
-    k_proj: Linear<B>,
-    v_proj: Linear<B>,
-    out_proj: Linear<B>,
+    q_proj: PtLinear<B>,
+    k_proj: PtLinear<B>,
+    v_proj: PtLinear<B>,
+    out_proj: PtLinear<B>,
     num_heads: usize,
     squeeze_head_dim: usize,
     head_dim: usize,
@@ -42,10 +43,10 @@ impl<B: Backend> MBartAttention<B> {
         let d = cfg.d_model;
         let sq = cfg.squeeze_dim();
         Self {
-            q_proj: LinearConfig::new(d, sq).init(device),
-            k_proj: LinearConfig::new(d, sq).init(device),
-            v_proj: LinearConfig::new(d, d).init(device),
-            out_proj: LinearConfig::new(d, d).init(device),
+            q_proj: PtLinear::init(d, sq, true, device),
+            k_proj: PtLinear::init(d, sq, true, device),
+            v_proj: PtLinear::init(d, d, true, device),
+            out_proj: PtLinear::init(d, d, true, device),
             num_heads: cfg.decoder_attention_heads,
             squeeze_head_dim: cfg.squeeze_head_dim(),
             head_dim: cfg.head_dim(),

@@ -179,7 +179,7 @@ impl FormulaRecognizer<Cpu> {
         coverage: Coverage,
     ) -> Result<Self> {
         use mineru_burn_common::backend::cpu_device;
-        use mineru_burn_common::weights::load_weights;
+        use mineru_burn_common::weights::load_weights_ignoring;
 
         let dir = dir.as_ref();
         let device = cpu_device();
@@ -188,7 +188,15 @@ impl FormulaRecognizer<Cpu> {
         let mut model = UniMerNet::<Cpu>::new(&config, &device);
         let remap = crate::weights::build_remap()?;
         let weights_path = dir.join("model.safetensors");
-        load_weights(&mut model, &weights_path, &remap, coverage)?;
+        // `IGNORED_KEYS` are training-only / recomputed buffers with no inference
+        // field (relative_position_index, num_batches_tracked); see `weights`.
+        load_weights_ignoring(
+            &mut model,
+            &weights_path,
+            &remap,
+            coverage,
+            crate::weights::IGNORED_KEYS,
+        )?;
 
         let tokenizer = LatexTokenizer::from_file(dir.join("tokenizer.json"))?;
         if tokenizer.vocab_size() != config.decoder.vocab_size {

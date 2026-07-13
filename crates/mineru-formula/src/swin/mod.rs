@@ -24,9 +24,10 @@ pub mod embeddings;
 pub mod layer;
 
 use burn::module::Module;
-use burn::nn::{LayerNorm, LayerNormConfig, Linear, LinearConfig};
 use burn::tensor::backend::Backend;
 use burn::tensor::Tensor;
+
+use mineru_burn_common::nn::{PtLayerNorm, PtLinear};
 
 use crate::config::SwinConfig;
 use embeddings::PatchEmbeddings;
@@ -39,20 +40,16 @@ use layer::SwinLayer;
 /// then a bias-free `Linear(4C -> 2C)`.
 #[derive(Module, Debug)]
 pub struct PatchMerging<B: Backend> {
-    norm: LayerNorm<B>,
-    reduction: Linear<B>,
+    norm: PtLayerNorm<B>,
+    reduction: PtLinear<B>,
 }
 
 impl<B: Backend> PatchMerging<B> {
     /// Builds a patch merging for input channel dim `dim`.
     pub fn new(cfg: &SwinConfig, dim: usize, device: &B::Device) -> Self {
         Self {
-            norm: LayerNormConfig::new(4 * dim)
-                .with_epsilon(cfg.layer_norm_eps)
-                .init(device),
-            reduction: LinearConfig::new(4 * dim, 2 * dim)
-                .with_bias(false)
-                .init(device),
+            norm: PtLayerNorm::init(4 * dim, cfg.layer_norm_eps, device),
+            reduction: PtLinear::init(4 * dim, 2 * dim, false, device),
         }
     }
 
