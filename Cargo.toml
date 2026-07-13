@@ -13,6 +13,7 @@ repository = "https://github.com/opendatalab/MinerU"
 # Internal crates
 mineru-types = { path = "crates/mineru-types" }
 mineru-config = { path = "crates/mineru-config" }
+mineru-vlm-client = { path = "crates/mineru-vlm-client" }
 mineru-io = { path = "crates/mineru-io" }
 mineru-pdf = { path = "crates/mineru-pdf" }
 mineru-render = { path = "crates/mineru-render" }
@@ -23,12 +24,18 @@ mineru-burn-common = { path = "crates/mineru-burn-common" }
 mineru-formula = { path = "crates/mineru-formula" }
 mineru-layout = { path = "crates/mineru-layout" }
 mineru-backend-pipeline = { path = "crates/mineru-backend-pipeline" }
+mineru-backend-vlm = { path = "crates/mineru-backend-vlm" }
 
 # Shared external deps (pin versions once, reuse everywhere — DRY)
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+anyhow = "1"
+axum = "0.7"
 burn = { version = "0.21", default-features = false }
 # burn-store: PyTorch/safetensors/burnpack readers + key remapping. Used directly
 # by mineru-burn-common (weight loading) and by mineru-table's burn-onnx-generated

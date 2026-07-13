@@ -1,0 +1,29 @@
+[package]
+name = "mineru"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The MinerU command-line tool: parses a PDF with a selectable backend (local pipeline or external VLM server) and writes Markdown + content_list.json, with an optional minimal HTTP server."
+
+[[bin]]
+name = "mineru"
+path = "src/main.rs"
+
+[dependencies]
+mineru-types = { workspace = true }
+mineru-config = { workspace = true }
+mineru-vlm-client = { workspace = true }
+mineru-backend-vlm = { workspace = true }
+mineru-backend-pipeline = { workspace = true }
+mineru-pdf = { workspace = true }
+mineru-render = { workspace = true }
+
+clap = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }
+axum = { workspace = true }

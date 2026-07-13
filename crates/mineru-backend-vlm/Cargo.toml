@@ -1,0 +1,21 @@
+[package]
+name = "mineru-backend-vlm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "VLM backend for MinerU: wraps the OpenAI-compatible VLM client behind the Backend trait, rasterizing PDF pages and assembling the model's per-page output into a Document."
+
+[dependencies]
+mineru-types = { workspace = true }
+mineru-vlm-client = { workspace = true }
+mineru-pdf = { workspace = true }
+
+image = { version = "0.25", default-features = false }
+async-trait = "0.1"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
