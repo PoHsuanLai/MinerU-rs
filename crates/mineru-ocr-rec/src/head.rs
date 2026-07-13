@@ -16,9 +16,9 @@
 //! [`crate::model`] via [`mineru_burn_common::ctc`].
 
 use burn::module::Module;
-use burn::nn::{Linear, LinearConfig};
 use burn::prelude::Backend;
 use burn::tensor::Tensor;
+use mineru_burn_common::nn::PtLinear;
 
 use crate::neck::EncoderWithLightSvtr;
 
@@ -26,7 +26,7 @@ use crate::neck::EncoderWithLightSvtr;
 #[derive(Module, Debug)]
 pub struct CtcMultiHead<B: Backend> {
     encoder: EncoderWithLightSvtr<B>,
-    head: Linear<B>,
+    head: PtLinear<B>,
     #[module(skip)]
     num_classes: usize,
 }
@@ -48,7 +48,7 @@ impl<B: Backend> CtcMultiHead<B> {
     ) -> Self {
         let encoder =
             EncoderWithLightSvtr::new(in_channels, dims, depth, num_heads, mlp_ratio, local_kernel, device);
-        let head = LinearConfig::new(encoder.out_channels(), num_classes).init(device);
+        let head = PtLinear::init(encoder.out_channels(), num_classes, true, device);
         Self {
             encoder,
             head,

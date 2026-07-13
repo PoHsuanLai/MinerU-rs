@@ -17,6 +17,7 @@
 
 use std::path::Path;
 
+use burn::module::Module;
 use burn::prelude::Backend;
 use burn::tensor::{Tensor, TensorData};
 use image::{imageops::FilterType, RgbImage};
@@ -27,6 +28,18 @@ use crate::backbone::{PpLcNetV4Rec, REC_OUT_CHANNELS};
 use crate::dict::CharDict;
 use crate::error::{Error, Result};
 use crate::head::CtcMultiHead;
+
+/// The loadable network: PP-LCNetV4 backbone + LightSVTR/CTC head.
+///
+/// Grouped as one [`Module`] so the whole PP-OCRv6 checkpoint loads in a single
+/// strict pass — every source key (both `model.backbone.*` and `head.*`) must land
+/// in a real field. The field names (`backbone`, `head`) are chosen so the remap
+/// only bridges structural prefix differences (see [`TextRecognizer::build_remap`]).
+#[derive(Module, Debug)]
+pub struct RecNet<B: Backend> {
+    backbone: PpLcNetV4Rec<B>,
+    head: CtcMultiHead<B>,
+}
 
 /// Fixed recognition input geometry and normalization.
 #[derive(Debug, Clone, Copy)]
@@ -55,8 +68,7 @@ impl Default for RecConfig {
 
 /// LightSVTR CTC recognizer: PP-LCNetV4 backbone → CTC head → CTC decode.
 pub struct TextRecognizer<B: Backend> {
-    backbone: PpLcNetV4Rec<B>,
-    head: CtcMultiHead<B>,
+    net: RecNet<B>,
     dict: CharDict,
     config: RecConfig,
     device: B::Device,
@@ -82,38 +94,51 @@ impl<B: Backend> TextRecognizer<B> {
             &device,
         );
         Self {
-            backbone,
-            head,
+            net: RecNet { backbone, head },
             dict,
             config,
             device,
         }
     }
 
-    /// Loads PP-OCRv6 safetensors (or `.pth`) weights into backbone and head.
+    /// Loads PP-OCRv6 safetensors (or `.pth`) weights into the network.
     ///
-    /// Keys are prefixed `backbone.` / `head.` and otherwise line up with the module
-    /// tree, so only the SE-conv index renames are applied under the backbone.
+    /// Loads the whole checkpoint in a single [`Coverage::Strict`] pass into the
+    /// combined [`RecNet`]: every source key (`model.backbone.*` and `head.*`) must
+    /// land in a real field or the load fails with the unmapped list. The remap only
+    /// bridges structural prefix differences (see [`Self::build_remap`]).
     pub fn load_weights(&mut self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
-        let (backbone_remap, head_remap) = self.build_remap()?;
-        load_weights::<B, _>(&mut self.backbone, path, &backbone_remap, Coverage::Lenient)?;
-        load_weights::<B, _>(&mut self.head, path, &head_remap, Coverage::Lenient)?;
+        let remap = self.build_remap()?;
+        load_weights::<B, _>(&mut self.net, path, &remap, Coverage::Strict)?;
         Ok(())
     }
 
-    /// Builds the per-module key remappers (backbone, head).
-    fn build_remap(&self) -> Result<(KeyRemap, KeyRemap)> {
+    /// Builds the checkpoint-key → field-path remap for [`RecNet`].
+    ///
+    /// The module field names already match the checkpoint leaf names, so the remap
+    /// only bridges *structural* prefix differences:
+    /// - the doubly-nested backbone prefix `model.backbone.` → `backbone.` (the
+    ///   `RecNet` field). Head keys are already `head.*` = the `head` field name;
+    /// - the SE module's `convolutions.0`/`.2` `ModuleList` indices → the named
+    ///   `reduce`/`expand` fields;
+    /// - the depthwise `token_conv` that is a *raw* `nn.Conv2d` (rep case: unit
+    ///   stride, `in == out`) stores `token_conv.{weight,bias}` directly, which this
+    ///   crate holds in a separate typed field `token_conv_rep` (Burn cannot store
+    ///   two different module types under one field name). This routes those two
+    ///   leaves to `token_conv_rep`; the strided `token_conv` (a ConvLayer with
+    ///   `token_conv.convolution.*`/`.normalization.*`) is left untouched.
+    fn build_remap(&self) -> Result<KeyRemap> {
         let map_err = |e: mineru_burn_common::Error| Error::Common(e);
-        let backbone = KeyRemap::new()
-            .rename(r"^backbone\.", "")
+        KeyRemap::new()
+            .rename(r"^model\.backbone\.", "backbone.")
+            .map_err(map_err)?
+            .rename(r"\.token_conv\.(weight|bias)$", ".token_conv_rep.$1")
             .map_err(map_err)?
             .rename(r"\.convolutions\.0\.", ".reduce.")
             .map_err(map_err)?
             .rename(r"\.convolutions\.2\.", ".expand.")
-            .map_err(map_err)?;
-        let head = KeyRemap::new().rename(r"^head\.", "").map_err(map_err)?;
-        Ok((backbone, head))
+            .map_err(map_err)
     }
 
     /// Recognizes the text in a single crop, returning `(text, mean_confidence)`.
@@ -141,10 +166,11 @@ impl<B: Backend> TextRecognizer<B> {
     /// Runs backbone + head, returning raw logits `[1, T, num_classes]`.
     fn forward(&self, input: Tensor<B, 4>) -> Result<Tensor<B, 3>> {
         let feat = self
+            .net
             .backbone
             .forward(input)
             .ok_or_else(|| Error::LogitsShape("backbone feature height < 3".into()))?;
-        Ok(self.head.forward(feat))
+        Ok(self.net.head.forward(feat))
     }
 
     /// Resizes/normalizes a crop into a `[1, 3, H, W]` BGR tensor with right padding.

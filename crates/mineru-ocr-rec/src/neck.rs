@@ -12,18 +12,22 @@
 
 use burn::module::Module;
 use burn::nn::conv::{Conv2d, Conv2dConfig};
-use burn::nn::{
-    BatchNorm, BatchNormConfig, LayerNorm, LayerNormConfig, Linear, LinearConfig, PaddingConfig2d,
-};
+use burn::nn::PaddingConfig2d;
 use burn::prelude::Backend;
 use burn::tensor::Tensor;
 use burn::tensor::activation::{sigmoid, softmax};
+use mineru_burn_common::nn::{FrozenBatchNorm2d, PtLayerNorm, PtLinear};
+
+/// BatchNorm epsilon used by the checkpoint's `nn.BatchNorm2d`.
+const BN_EPS: f64 = 1e-5;
+/// LayerNorm epsilon used by LightSVTR (`nn.LayerNorm(eps=1e-6)`).
+const LN_EPS: f64 = 1e-6;
 
 /// Conv → BN → SiLU (`LightSVTRConvLayer`).
 #[derive(Module, Debug)]
 struct ConvLayer<B: Backend> {
     convolution: Conv2d<B>,
-    normalization: BatchNorm<B>,
+    normalization: FrozenBatchNorm2d<B>,
     #[module(skip)]
     use_silu: bool,
 }
@@ -44,7 +48,7 @@ impl<B: Backend> ConvLayer<B> {
                 .with_padding(PaddingConfig2d::Explicit(kernel.0 / 2, kernel.1 / 2, kernel.0 / 2, kernel.1 / 2))
                 .with_bias(false)
                 .init(device),
-            normalization: BatchNormConfig::new(out_ch).init(device),
+            normalization: FrozenBatchNorm2d::init(out_ch, BN_EPS, device),
             use_silu,
         }
     }
@@ -68,8 +72,11 @@ fn silu<B: Backend, const D: usize>(x: Tensor<B, D>) -> Tensor<B, D> {
 /// Multi-head self-attention (`LightSVTRAttention`).
 #[derive(Module, Debug)]
 struct Attention<B: Backend> {
-    qkv: Linear<B>,
-    projection: Linear<B>,
+    // Fused q/k/v projection — one `[3*hidden, hidden]` weight, matching the
+    // checkpoint's single `self_attn.qkv` tensor. Split into q/k/v after the
+    // linear, in the forward pass.
+    qkv: PtLinear<B>,
+    projection: PtLinear<B>,
     #[module(skip)]
     num_heads: usize,
     #[module(skip)]
@@ -80,10 +87,8 @@ impl<B: Backend> Attention<B> {
     fn new(hidden: usize, num_heads: usize, qkv_bias: bool, device: &B::Device) -> Self {
         let head_dim = hidden / num_heads;
         Self {
-            qkv: LinearConfig::new(hidden, 3 * hidden)
-                .with_bias(qkv_bias)
-                .init(device),
-            projection: LinearConfig::new(hidden, hidden).init(device),
+            qkv: PtLinear::init(hidden, 3 * hidden, qkv_bias, device),
+            projection: PtLinear::init(hidden, hidden, true, device),
             num_heads,
             scale: (head_dim as f64).powf(-0.5),
         }
@@ -116,16 +121,16 @@ impl<B: Backend> Attention<B> {
 /// Feed-forward MLP (`LightSVTRMLP`).
 #[derive(Module, Debug)]
 struct Mlp<B: Backend> {
-    fc1: Linear<B>,
-    fc2: Linear<B>,
+    fc1: PtLinear<B>,
+    fc2: PtLinear<B>,
 }
 
 impl<B: Backend> Mlp<B> {
     fn new(hidden: usize, mlp_ratio: f64, device: &B::Device) -> Self {
         let inner = (hidden as f64 * mlp_ratio) as usize;
         Self {
-            fc1: LinearConfig::new(hidden, inner).init(device),
-            fc2: LinearConfig::new(inner, hidden).init(device),
+            fc1: PtLinear::init(hidden, inner, true, device),
+            fc2: PtLinear::init(inner, hidden, true, device),
         }
     }
 
@@ -140,18 +145,18 @@ impl<B: Backend> Mlp<B> {
 #[derive(Module, Debug)]
 struct SvtrBlock<B: Backend> {
     self_attn: Attention<B>,
-    layer_norm1: LayerNorm<B>,
+    layer_norm1: PtLayerNorm<B>,
     mlp: Mlp<B>,
-    layer_norm2: LayerNorm<B>,
+    layer_norm2: PtLayerNorm<B>,
 }
 
 impl<B: Backend> SvtrBlock<B> {
     fn new(hidden: usize, num_heads: usize, qkv_bias: bool, mlp_ratio: f64, device: &B::Device) -> Self {
         Self {
             self_attn: Attention::new(hidden, num_heads, qkv_bias, device),
-            layer_norm1: LayerNormConfig::new(hidden).with_epsilon(1e-6).init(device),
+            layer_norm1: PtLayerNorm::init(hidden, LN_EPS, device),
             mlp: Mlp::new(hidden, mlp_ratio, device),
-            layer_norm2: LayerNormConfig::new(hidden).with_epsilon(1e-6).init(device),
+            layer_norm2: PtLayerNorm::init(hidden, LN_EPS, device),
         }
     }
 
@@ -170,7 +175,7 @@ impl<B: Backend> SvtrBlock<B> {
 pub struct EncoderWithLightSvtr<B: Backend> {
     conv_block: Vec<ConvLayer<B>>,
     svtr_block: Vec<SvtrBlock<B>>,
-    norm: LayerNorm<B>,
+    norm: PtLayerNorm<B>,
     #[module(skip)]
     out_channels: usize,
 }
@@ -199,7 +204,7 @@ impl<B: Backend> EncoderWithLightSvtr<B> {
         Self {
             conv_block,
             svtr_block,
-            norm: LayerNormConfig::new(dims).with_epsilon(1e-6).init(device),
+            norm: PtLayerNorm::init(dims, LN_EPS, device),
             out_channels: dims,
         }
     }
