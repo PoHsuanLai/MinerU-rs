@@ -3920,6 +3920,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "mineru-backend-pipeline"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "image",
+ "mineru-burn-common",
+ "mineru-formula",
+ "mineru-layout",
+ "mineru-ocr-det",
+ "mineru-ocr-rec",
+ "mineru-pdf",
+ "mineru-table",
+ "mineru-types",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "mineru-burn-common"
 version = "0.1.0"
 dependencies = [

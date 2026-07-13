@@ -22,6 +22,7 @@ mineru-table = { path = "crates/mineru-table" }
 mineru-burn-common = { path = "crates/mineru-burn-common" }
 mineru-formula = { path = "crates/mineru-formula" }
 mineru-layout = { path = "crates/mineru-layout" }
+mineru-backend-pipeline = { path = "crates/mineru-backend-pipeline" }
 
 # Shared external deps (pin versions once, reuse everywhere — DRY)
 serde = { version = "1", features = ["derive"] }

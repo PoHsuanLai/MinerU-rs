@@ -1,0 +1,23 @@
+[package]
+name = "mineru-backend-pipeline"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Local Burn-model pipeline backend for MinerU: orchestrates layout, OCR, formula, and table crates into a Document (the Rust analogue of pipeline_analyze.py + pipeline_magic_model.py + para_split.py)."
+
+[dependencies]
+mineru-types = { workspace = true }
+mineru-pdf = { workspace = true }
+mineru-layout = { workspace = true }
+mineru-ocr-det = { workspace = true }
+mineru-ocr-rec = { workspace = true }
+mineru-formula = { workspace = true }
+mineru-table = { workspace = true }
+mineru-burn-common = { workspace = true }
+
+image = { version = "0.25", default-features = false }
+async-trait = "0.1"
+thiserror = { workspace = true }
+tracing = { workspace = true }

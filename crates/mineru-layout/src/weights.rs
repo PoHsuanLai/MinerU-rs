@@ -32,20 +32,13 @@ pub fn key_remap() -> Result<KeyRemap> {
     // Each rule is (regex, replacement). Applied in order.
     let rules: &[(&str, &str)] = &[
         // ---- Backbone -------------------------------------------------------
-        // Block layers are an enum in the module tree, so Burn's derive inserts the
-        // variant name (`Plain`/`Light`). Insert the matching segment into source
-        // keys, keyed on the (unambiguous) leaf: light layers use conv1/conv2,
-        // plain layers use convolution/normalization directly.
-        (
-            r"^model\.backbone\.model\.encoder\.stages\.(\d+)\.blocks\.(\d+)\.layers\.(\d+)\.(conv1|conv2)\.",
-            "backbone.encoder.stage$1.blocks.$2.layers.$3.Light.$4.",
-        ),
-        (
-            r"^model\.backbone\.model\.encoder\.stages\.(\d+)\.blocks\.(\d+)\.layers\.(\d+)\.(convolution|normalization)\.",
-            "backbone.encoder.stage$1.blocks.$2.layers.$3.Plain.$4.",
-        ),
-        // Named stage fields: encoder.stages.N -> encoder.stageN (aggregation,
-        // downsample, and anything else in the stage keep their names).
+        // The block layers are a generic type parameter (not an enum), so their
+        // parameter paths already match the checkpoint leaf-for-leaf (a plain
+        // stage's layers are `layers.N.convolution.…`, a light stage's are
+        // `layers.N.conv1.…` / `layers.N.conv2.…`). The only structural change is
+        // the stage rename and the doubly-nested prefix strip.
+        //
+        // Named stage fields: encoder.stages.N -> encoder.stageN.
         (r"^model\.backbone\.model\.encoder\.stages\.(\d+)\.", "backbone.encoder.stage$1."),
         // Rest of the backbone: drop the doubly-nested prefix.
         (r"^model\.backbone\.model\.", "backbone."),
@@ -113,15 +106,16 @@ mod tests {
 
     #[test]
     fn backbone_stage_and_prefix() {
-        // Light block layers get the `Light` enum-variant segment inserted.
+        // Light block layers (conv1/conv2) keep their leaf names; only the stage
+        // is renamed. No enum-variant segment is inserted.
         assert_eq!(
             remap("model.backbone.model.encoder.stages.2.blocks.0.layers.0.conv1.convolution.weight"),
-            "backbone.encoder.stage2.blocks.0.layers.0.Light.conv1.convolution.weight"
+            "backbone.encoder.stage2.blocks.0.layers.0.conv1.convolution.weight"
         );
-        // Plain block layers get the `Plain` segment.
+        // Plain block layers (convolution/normalization) likewise.
         assert_eq!(
             remap("model.backbone.model.encoder.stages.0.blocks.0.layers.0.convolution.weight"),
-            "backbone.encoder.stage0.blocks.0.layers.0.Plain.convolution.weight"
+            "backbone.encoder.stage0.blocks.0.layers.0.convolution.weight"
         );
         // Aggregation / downsample keep their names, just the stage rename.
         assert_eq!(

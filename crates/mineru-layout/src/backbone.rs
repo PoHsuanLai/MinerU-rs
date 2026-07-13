@@ -16,6 +16,16 @@
 //! are named fields (`stage0`..`stage3`) rather than a `Vec`. The [`crate::weights`]
 //! remap rewrites the checkpoint's `stages.N.` to `stageN.` so keys line up.
 //!
+//! ## Generic block parameter
+//! [`BasicLayer`] and [`Stage`] are generic over the block-conv type `L`, but they
+//! bound `L` with the plain [`Module`] bound only — not the [`BlockConv`] trait.
+//! Burn's `#[derive(Module)]` reads the *struct's* generic bounds to synthesise the
+//! `AutodiffModule` impl, and a custom supertrait bound such as `L: BlockConv<B>`
+//! forces the derive to demand `L::InnerModule: BlockConv<B::InnerBackend>`, a bound
+//! the macro cannot express and which never gets satisfied. Keeping the struct bound
+//! at `Module<B>` lets the derive succeed; the build/run behaviour is required only
+//! where it is used, via `where L: BlockConv<B>` on the relevant `impl` blocks.
+//!
 //! # Fidelity notes
 //! - `use_learnable_affine_block = false` for arch "L": there are no LAB params.
 //! - Backbone BatchNorm is frozen (RT-DETR `RTDetrFrozenBatchNorm2d`, eps 1e-5).
@@ -93,67 +103,78 @@ impl<B: Backend> ConvLayerLight<B> {
     }
 }
 
-/// A block layer, either plain (single conv) or light (1×1 + depthwise).
+/// A block layer, either plain or light, without an enum in the module tree.
 ///
-/// Modelled as an enum so a stage's blocks are homogeneous in type. Burn's Module
-/// derive injects the variant name (`Plain`/`Light`) into parameter paths; the
-/// [`crate::weights`] remap inserts the matching segment into the source keys
-/// (keyed on the leaf name, which is unambiguous: light layers use `conv1`/`conv2`,
-/// plain layers use `convolution`/`normalization`).
-#[derive(Module, Debug)]
-#[allow(clippy::large_enum_variant)]
-pub enum BlockLayer<B: Backend> {
-    /// A single conv-bn-relu.
-    Plain(ConvLayer<B>),
-    /// A 1×1 pointwise then depthwise conv.
-    Light(ConvLayerLight<B>),
+/// Implemented for [`ConvLayer`] and [`ConvLayerLight`] so [`BasicLayer`] can be
+/// generic over which one a stage uses. Modelling the choice as a generic type
+/// parameter (rather than an enum) keeps the parameter paths identical to the
+/// checkpoint: a plain stage's layers serialise as `layers.N.convolution.…` and a
+/// light stage's as `layers.N.conv1.…` / `layers.N.conv2.…`, with no `Plain`/`Light`
+/// variant segment for the [`crate::weights`] remap to reconcile.
+///
+/// This is deliberately declared as a supertrait of [`Module`] so that any
+/// implementor is a module, yet [`BasicLayer`] / [`Stage`] never name this trait in
+/// their own struct bounds — see the module-level "Generic block parameter" note for
+/// why that matters to Burn's `#[derive(Module)]`.
+pub trait BlockConv<B: Backend>: Module<B> {
+    /// Builds one layer with the given input/mid channels and kernel size.
+    fn build(in_c: usize, mid_c: usize, kernel: usize, device: &B::Device) -> Self;
+    /// Runs the layer.
+    fn run(&self, x: Tensor<B, 4>) -> Tensor<B, 4>;
 }
 
-impl<B: Backend> BlockLayer<B> {
-    fn build(light: bool, in_c: usize, mid_c: usize, kernel: usize, device: &B::Device) -> Self {
-        if light {
-            let conv1 = ConvLayer::init(in_c, mid_c, 1, 1, 0, 1, false, device);
-            let conv2 =
-                ConvLayer::init(mid_c, mid_c, kernel, 1, (kernel - 1) / 2, mid_c, true, device);
-            BlockLayer::Light(ConvLayerLight { conv1, conv2 })
-        } else {
-            BlockLayer::Plain(ConvLayer::plain(in_c, mid_c, kernel, 1, true, device))
-        }
+impl<B: Backend> BlockConv<B> for ConvLayer<B> {
+    fn build(in_c: usize, mid_c: usize, kernel: usize, device: &B::Device) -> Self {
+        ConvLayer::plain(in_c, mid_c, kernel, 1, true, device)
     }
+    fn run(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
+        self.forward(x)
+    }
+}
 
-    fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
-        match self {
-            BlockLayer::Plain(c) => c.forward(x),
-            BlockLayer::Light(c) => c.forward(x),
-        }
+impl<B: Backend> BlockConv<B> for ConvLayerLight<B> {
+    fn build(in_c: usize, mid_c: usize, kernel: usize, device: &B::Device) -> Self {
+        // conv1: 1x1 no-act; conv2: depthwise k×k relu.
+        let conv1 = ConvLayer::init(in_c, mid_c, 1, 1, 0, 1, false, device);
+        let conv2 = ConvLayer::init(mid_c, mid_c, kernel, 1, (kernel - 1) / 2, mid_c, true, device);
+        ConvLayerLight { conv1, conv2 }
+    }
+    fn run(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
+        self.forward(x)
     }
 }
 
 /// A `HGNetV2BasicLayer`: N conv layers, concat, squeeze/excite, optional residual.
+///
+/// Generic over the block-conv type `L`. The struct bounds `L` only with `Module<B>`
+/// (so the derived `AutodiffModule` impl is satisfiable); construction and execution
+/// live on the `impl … where L: BlockConv<B>` block below.
 #[derive(Module, Debug)]
-pub struct BasicLayer<B: Backend> {
-    layers: Vec<BlockLayer<B>>,
+pub struct BasicLayer<B: Backend, L: Module<B>> {
+    layers: Vec<L>,
     // Sequential(squeeze, excite) → checkpoint keys aggregation.0 / aggregation.1.
+    // A Vec of two ConvLayers reproduces the numeric indices exactly.
     aggregation: Vec<ConvLayer<B>>,
     #[module(skip)]
     residual: bool,
+    #[module(skip)]
+    _marker: core::marker::PhantomData<B>,
 }
 
-impl<B: Backend> BasicLayer<B> {
+impl<B: Backend, L: BlockConv<B>> BasicLayer<B, L> {
     #[allow(clippy::too_many_arguments)]
     fn init(
         in_c: usize,
         mid_c: usize,
         out_c: usize,
         kernel: usize,
-        light: bool,
         residual: bool,
         device: &B::Device,
     ) -> Self {
         let mut layers = Vec::with_capacity(LAYERS_PER_BLOCK);
         for i in 0..LAYERS_PER_BLOCK {
             let layer_in = if i == 0 { in_c } else { mid_c };
-            layers.push(BlockLayer::build(light, layer_in, mid_c, kernel, device));
+            layers.push(L::build(layer_in, mid_c, kernel, device));
         }
         let total = in_c + LAYERS_PER_BLOCK * mid_c;
         let aggregation = vec![
@@ -164,6 +185,7 @@ impl<B: Backend> BasicLayer<B> {
             layers,
             aggregation,
             residual,
+            _marker: core::marker::PhantomData,
         }
     }
 
@@ -173,7 +195,7 @@ impl<B: Backend> BasicLayer<B> {
         outs.push(x.clone());
         let mut cur = x;
         for layer in &self.layers {
-            cur = layer.forward(cur);
+            cur = layer.run(cur);
             outs.push(cur.clone());
         }
         let concat = Tensor::cat(outs, 1);
@@ -188,13 +210,17 @@ impl<B: Backend> BasicLayer<B> {
 }
 
 /// A `HGNetV2Stage`: an optional depthwise downsample followed by N basic blocks.
+///
+/// Generic over the block-conv type `L`, bounded by `Module<B>` at the struct level
+/// for the same derive reason as [`BasicLayer`]; the `BlockConv` bound is required
+/// only on the `impl` block.
 #[derive(Module, Debug)]
-pub struct Stage<B: Backend> {
+pub struct Stage<B: Backend, L: Module<B>> {
     downsample: Option<ConvLayer<B>>,
-    blocks: Vec<BasicLayer<B>>,
+    blocks: Vec<BasicLayer<B, L>>,
 }
 
-impl<B: Backend> Stage<B> {
+impl<B: Backend, L: BlockConv<B>> Stage<B, L> {
     #[allow(clippy::too_many_arguments)]
     fn init(
         in_c: usize,
@@ -203,7 +229,6 @@ impl<B: Backend> Stage<B> {
         num_blocks: usize,
         kernel: usize,
         downsample: bool,
-        light: bool,
         device: &B::Device,
     ) -> Self {
         let downsample =
@@ -211,7 +236,7 @@ impl<B: Backend> Stage<B> {
         let mut blocks = Vec::with_capacity(num_blocks);
         for b in 0..num_blocks {
             let (block_in, residual) = if b == 0 { (in_c, false) } else { (out_c, true) };
-            blocks.push(BasicLayer::init(block_in, mid_c, out_c, kernel, light, residual, device));
+            blocks.push(BasicLayer::init(block_in, mid_c, out_c, kernel, residual, device));
         }
         Self { downsample, blocks }
     }
@@ -266,10 +291,10 @@ impl<B: Backend> Embedder<B> {
 /// no enum leaks into the parameter paths. Stages 0/1 are plain, 2/3 are light.
 #[derive(Module, Debug)]
 pub struct HgEncoder<B: Backend> {
-    stage0: Stage<B>,
-    stage1: Stage<B>,
-    stage2: Stage<B>,
-    stage3: Stage<B>,
+    stage0: Stage<B, ConvLayer<B>>,
+    stage1: Stage<B, ConvLayer<B>>,
+    stage2: Stage<B, ConvLayerLight<B>>,
+    stage3: Stage<B, ConvLayerLight<B>>,
 }
 
 /// The full backbone: `embedder` + `encoder`.
@@ -284,11 +309,10 @@ impl<B: Backend> Backbone<B> {
     pub fn init(device: &B::Device) -> Self {
         // arch "L": in/mid/out channels, block counts, downsample, kernel per stage.
         let encoder = HgEncoder {
-            // (in, mid, out, num_blocks, kernel, downsample, light).
-            stage0: Stage::init(48, 48, 128, 1, 3, false, false, device),
-            stage1: Stage::init(128, 96, 512, 1, 3, true, false, device),
-            stage2: Stage::init(512, 192, 1024, 3, 5, true, true, device),
-            stage3: Stage::init(1024, 384, 2048, 1, 5, true, true, device),
+            stage0: Stage::init(48, 48, 128, 1, 3, false, device),
+            stage1: Stage::init(128, 96, 512, 1, 3, true, device),
+            stage2: Stage::init(512, 192, 1024, 3, 5, true, device),
+            stage3: Stage::init(1024, 384, 2048, 1, 5, true, device),
         };
         Self {
             embedder: Embedder::init(device),
