@@ -144,18 +144,55 @@ pub fn head(logits: &[f32]) -> Result<Classification> {
 /// returns [`Error::ModelUnavailable`]. Pre-processing and the argmax head are
 /// still unit-tested independently.
 pub fn classify(img: &RgbImage) -> Result<Classification> {
-    let _input = preprocess(img)?;
+    let input = preprocess(img)?;
     #[cfg(lcnet_generated)]
     {
-        // The generated module lives in `crate::model::pp_lcnet_x1_0_table_cls`.
-        // Feeding `_input` through it and calling `head` on the result is wired
-        // once the generated symbol name is confirmed at build time.
-        return Err(Error::ModelUnavailable("PP-LCNet (generated wiring pending)"));
+        run_lcnet(input)
     }
     #[cfg(not(lcnet_generated))]
     {
+        let _ = input;
         Err(Error::ModelUnavailable("PP-LCNet"))
     }
+}
+
+/// Runs the generated LCNet classifier over a preprocessed CHW buffer.
+///
+/// The whole CNN + its weights are expensive to build, so the loaded model is
+/// cached for the process lifetime; repeated calls only pay for the forward
+/// pass. The weights are embedded from the build-time `.bpk` next to the
+/// generated source, so no runtime path is needed.
+#[cfg(lcnet_generated)]
+fn run_lcnet(input: Vec<f32>) -> Result<Classification> {
+    use burn::tensor::{Tensor, TensorData};
+
+    // The crate depends on `burn` with the `ndarray` feature, so the CPU NdArray
+    // backend is the one every generated module compiles against here.
+    type B = burn::backend::NdArray<f32>;
+
+    use crate::model::pp_lcnet_x1_0_table_cls::Model;
+    use std::sync::OnceLock;
+    static MODEL: OnceLock<Model<B>> = OnceLock::new();
+
+    let device = burn::backend::ndarray::NdArrayDevice::default();
+    let model = MODEL.get_or_init(|| {
+        let bytes = burn::tensor::Bytes::from_bytes_vec(
+            include_bytes!(concat!(env!("OUT_DIR"), "/model/PP-LCNet_x1_0_table_cls.bpk")).to_vec(),
+        );
+        Model::from_bytes(bytes, &device)
+    });
+
+    // CHW `Vec<f32>` -> `[1, 3, 224, 224]` NCHW tensor.
+    let side = CROP as usize;
+    let data = TensorData::new(input, [1, 3, side, side]);
+    let x = Tensor::<B, 4>::from_data(data, &device);
+
+    let logits = model.forward(x);
+    let out: Vec<f32> = logits
+        .into_data()
+        .into_vec::<f32>()
+        .map_err(|e| Error::Decode(format!("classifier output decode: {e:?}")))?;
+    head(&out)
 }
 
 #[cfg(test)]
@@ -210,6 +247,10 @@ mod tests {
         ));
     }
 
+    // Only meaningful without the generated model: with `lcnet_generated`,
+    // `classify` runs the real forward and returns `Ok` (see the `real_models`
+    // integration test).
+    #[cfg(not(lcnet_generated))]
     #[test]
     fn classify_reports_unavailable_without_model() {
         let img = RgbImage::new(300, 300);
