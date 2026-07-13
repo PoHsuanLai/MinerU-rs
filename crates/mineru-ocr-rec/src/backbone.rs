@@ -248,12 +248,18 @@ impl<B: Backend> Stem<B> {
     }
 
     fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
+        // Mirrors `PPLCNetV4LargeStem.forward`: pad once after stem1, then run the
+        // conv branch and the pool branch off that SAME padded tensor.
         let emb = self.stem1.forward(x);
-        let emb = pad_right_bottom(emb);
+        let emb = pad_right_bottom(emb); // F.pad(embedding, (0,1,0,1))
+        // Conv branch: stem2a -> pad -> stem2b (k=2, stride 1, padding 0).
         let a = self.stem2a.forward(emb.clone());
         let a = pad_right_bottom(a);
         let a = self.stem2b.forward(a);
-        let pooled = self.pool.forward(pad_right_bottom(emb));
+        // Pool branch: pool the padded `emb` directly (NO extra pad — Python does
+        // `self.pool(embedding)`). k=2, stride 1 pooling divides evenly, so ceil vs
+        // floor mode is immaterial here; both give the conv branch's spatial size.
+        let pooled = self.pool.forward(emb);
         let emb = Tensor::cat(vec![pooled, a], 1);
         let emb = self.stem3.forward(emb);
         self.stem4.forward(emb)
