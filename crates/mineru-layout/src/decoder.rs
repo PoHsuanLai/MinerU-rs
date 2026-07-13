@@ -162,18 +162,13 @@ impl<B: Backend> DeformableAttention<B> {
             sampled_per_level.push(sampled);
         }
 
-        // Stack levels: [B*H, head_dim, Q, L, P]
-        let stacked = Tensor::stack::<5>(
-            sampled_per_level
-                .into_iter()
-                .map(|t| {
-                    let [bh, hd, q, pp] = t.dims();
-                    t.reshape([bh, hd, q, 1, pp])
-                })
-                .collect::<Vec<_>>(),
-            3,
-        )
-        .reshape([bsz * h, head_dim, num_q, l * p]);
+        // Stack levels along a new dim 3: each `sampled` is rank-4
+        // [B*H, head_dim, Q, P]; `stack` inserts the L axis to give
+        // [B*H, head_dim, Q, L, P]. (Do NOT pre-`reshape` to insert the axis —
+        // `stack` already `unsqueeze`s each tensor, so pre-inserting would make
+        // them rank-6 and fail the rank-5 stack check.)
+        let stacked = Tensor::stack::<5>(sampled_per_level, 3)
+            .reshape([bsz * h, head_dim, num_q, l * p]);
 
         // weights: [B, Q, H, L, P] -> [B*H, 1, Q, L*P]
         let w = weights
