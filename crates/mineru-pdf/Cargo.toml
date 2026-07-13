@@ -1,0 +1,14 @@
+[package]
+name = "mineru-pdf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PDF input for MinerU: rasterize pages, page metadata, and (later) native-text extraction."
+
+[dependencies]
+mineru-types.workspace = true
+thiserror.workspace = true
+image = { version = "0.25", default-features = false }
+pdfium-render = { version = "0.9", default-features = false, features = ["image_025", "thread_safe", "pdfium_latest"] }

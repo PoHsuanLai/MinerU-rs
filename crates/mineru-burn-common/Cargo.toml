@@ -1,0 +1,31 @@
+[package]
+name = "mineru-burn-common"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared Burn harness for MinerU model crates: backends, weight loading, preprocessing, and decode helpers."
+
+[dependencies]
+# Burn core, with the ndarray CPU backend enabled by default so every model
+# crate works out of the box with no GPU toolchain. The `autodiff` machinery is
+# not needed for inference, so we stay on default-features = false + explicit
+# feature selection to keep the dependency surface small.
+burn = { workspace = true, features = ["ndarray"] }
+# burn-store carries the PyTorch / safetensors readers plus key remapping and the
+# ApplyResult report we build the "all keys consumed" assertion on top of.
+burn-store = { version = "0.21", default-features = false, features = ["std", "pytorch", "safetensors"] }
+image = { version = "0.25", default-features = false }
+regex = "1"
+thiserror.workspace = true
+tracing.workspace = true
+
+[features]
+default = []
+# Opt-in GPU backend. Enabling this pulls in the wgpu backend and exposes the
+# `gpu` backend alias; it is never required for CPU inference or the test suite.
+gpu = ["burn/wgpu"]
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false }

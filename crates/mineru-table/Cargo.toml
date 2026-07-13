@@ -1,0 +1,38 @@
+[package]
+name = "mineru-table"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Table recognition for MinerU: wired/wireless classification (PP-LCNet), wireless structure recognition (SLANet-plus), and wired line recovery (UNet), ported to Burn with no onnxruntime dependency."
+
+[dependencies]
+mineru-types = { workspace = true }
+# Burn core with the ndarray CPU backend, mirroring mineru-burn-common so both
+# crates agree on the backend and no GPU toolchain is required.
+burn = { workspace = true, features = ["ndarray"] }
+image = { version = "0.25", default-features = false }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# ONNX-imported model modules are generated at build time behind the
+# `onnx-import` feature (see build.rs). When the feature is off (the default),
+# the generated code is absent and the crate compiles model-free stubs instead,
+# so the crate builds with no `.onnx` files and no network access. burn-onnx is
+# therefore an *optional* build-dependency, pulled in only for that feature.
+[build-dependencies]
+burn-onnx = { version = "0.21", optional = true }
+
+[features]
+default = []
+# Enable build-time ONNX -> Burn codegen for the LCNet classifier and UNet
+# segmentation models. Requires the `.onnx` files to be present (path set via
+# the MINERU_MODELS_DIR environment variable) and network access to fetch the
+# burn-onnx build-dependency the first time.
+onnx-import = ["dep:burn-onnx"]
+# Opt-in GPU backend, forwarded to burn.
+gpu = ["burn/wgpu"]
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false }

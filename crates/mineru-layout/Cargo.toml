@@ -1,0 +1,32 @@
+[package]
+name = "mineru-layout"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Document layout detection (PP-DocLayoutV2: RT-DETR-L with an HGNetV2 backbone, hybrid encoder, DETR decoder, and a reading-order pointer network) ported to Rust/Burn."
+
+[dependencies]
+mineru-types = { workspace = true }
+mineru-burn-common = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# Burn deep-learning framework. The concrete backend (CPU ndarray) and the
+# weight-loading / preprocessing harness come from `mineru-burn-common`; this
+# crate defines the `burn::module::Module` graph. `ndarray` is enabled so the
+# crate is usable and testable standalone with no GPU toolchain.
+burn = { workspace = true, features = ["ndarray"] }
+
+# Image preprocessing (decode + bicubic resize of the page image). Kept in step
+# with `mineru-burn-common` so the `FilterType` used for the resize matches.
+image = { version = "0.25", default-features = false }
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[features]
+default = []
+# Opt-in GPU backend, forwarded to burn and burn-common.
+gpu = ["burn/wgpu", "mineru-burn-common/gpu"]

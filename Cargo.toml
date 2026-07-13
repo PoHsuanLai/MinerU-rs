@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "LicenseRef-MinerU-Open-Source-License"
+repository = "https://github.com/opendatalab/MinerU"
+
+[workspace.dependencies]
+# Internal crates
+mineru-types = { path = "crates/mineru-types" }
+mineru-config = { path = "crates/mineru-config" }
+mineru-io = { path = "crates/mineru-io" }
+mineru-pdf = { path = "crates/mineru-pdf" }
+mineru-render = { path = "crates/mineru-render" }
+mineru-ocr-det = { path = "crates/mineru-ocr-det" }
+mineru-ocr-rec = { path = "crates/mineru-ocr-rec" }
+mineru-table = { path = "crates/mineru-table" }
+mineru-burn-common = { path = "crates/mineru-burn-common" }
+mineru-formula = { path = "crates/mineru-formula" }
+mineru-layout = { path = "crates/mineru-layout" }
+
+# Shared external deps (pin versions once, reuse everywhere — DRY)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+burn = { version = "0.21", default-features = false }
+
+[profile.release]
+lto = "thin"

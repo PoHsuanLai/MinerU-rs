@@ -1,0 +1,16 @@
+[package]
+name = "mineru-types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core domain types for MinerU: the document tree, geometry, and the Backend trait."
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+async-trait = "0.1"
+
+[dev-dependencies]
+serde_json.workspace = true

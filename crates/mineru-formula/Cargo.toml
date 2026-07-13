@@ -1,0 +1,32 @@
+[package]
+name = "mineru-formula"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Formula recognition (UniMerNet: Swin encoder + MBart decoder) ported to Rust/Burn, producing LaTeX from a cropped formula image."
+
+[dependencies]
+mineru-types = { workspace = true }
+mineru-burn-common = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# Burn deep-learning framework. The concrete backend (CPU ndarray) and the
+# weight-loading harness come from `mineru-burn-common`; this crate defines the
+# `burn::module::Module` graph. `ndarray` is enabled so the crate is usable and
+# testable standalone with no GPU toolchain.
+burn = { workspace = true, features = ["ndarray"] }
+
+# Tokenizer: the checkpoint ships an HF `tokenizer.json`, loaded via this crate.
+tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
+
+# Image preprocessing (decode + resize the cropped formula image).
+image = { version = "0.25", default-features = false }
+
+# LaTeX-cleanup regex pass.
+regex = "1"
+
+[features]
+default = []

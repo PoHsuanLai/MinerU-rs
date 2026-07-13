@@ -1,0 +1,218 @@
+//! Top-level model: the Swin encoder + MBart decoder pair, and the public
+//! [`FormulaRecognizer`] entry point.
+//!
+//! [`UniMerNet`] is the Burn [`Module`] graph (what weights load into).
+//! [`FormulaRecognizer`] owns a `UniMerNet`, the tokenizer, and the config, and
+//! exposes [`FormulaRecognizer::predict`]: image → LaTeX.
+//!
+//! The generation strategy is the non-cached greedy loop in [`crate::generate`].
+//! We bridge to it by encoding the image **once** and then, for each decode step,
+//! running the decoder over the current prefix and returning the last position's
+//! logits (a [`DecodeStep`] impl).
+
+use burn::module::Module;
+use burn::tensor::backend::Backend;
+use burn::tensor::{Int, Tensor, TensorData};
+
+use mineru_burn_common::backend::Cpu;
+use mineru_burn_common::weights::Coverage;
+use mineru_types::Latex;
+
+use crate::config::UniMerNetConfig;
+use crate::error::{Error, Result};
+use crate::generate::{greedy_decode, DecodeStep};
+use crate::latex_cleanup::latex_rm_whitespace;
+use crate::mbart::MBartDecoder;
+use crate::preprocess::{self, PreprocessedImage};
+use crate::swin::SwinEncoder;
+use crate::tokenizer::LatexTokenizer;
+
+/// The UniMerNet vision-encoder-decoder Burn module.
+///
+/// Field names (`encoder`, `decoder`) are the anchors the weight remap in
+/// [`crate::weights`] targets — do not rename without updating the rules.
+#[derive(Module, Debug)]
+pub struct UniMerNet<B: Backend> {
+    /// Swin vision encoder.
+    pub encoder: SwinEncoder<B>,
+    /// MBart text decoder (+ LM head).
+    pub decoder: MBartDecoder<B>,
+}
+
+impl<B: Backend> UniMerNet<B> {
+    /// Builds the model with freshly-initialised weights from the config.
+    pub fn new(cfg: &UniMerNetConfig, device: &B::Device) -> Self {
+        Self {
+            encoder: SwinEncoder::new(&cfg.encoder, device),
+            decoder: MBartDecoder::new(&cfg.decoder, device),
+        }
+    }
+
+    /// Encodes an image tensor `[B, 3, H, W]` into visual tokens `[B, L, d]`.
+    pub fn encode(&self, pixel_values: Tensor<B, 4>) -> Tensor<B, 3> {
+        self.encoder.forward(pixel_values)
+    }
+
+    /// Runs the decoder over `input_ids` `[B, T]` given the encoder grid,
+    /// returning logits `[B, T, vocab]`.
+    pub fn decode(
+        &self,
+        input_ids: Tensor<B, 2, Int>,
+        encoder_hidden: Tensor<B, 3>,
+    ) -> Tensor<B, 3> {
+        self.decoder.forward(input_ids, encoder_hidden)
+    }
+}
+
+/// A [`DecodeStep`] that holds the encoded image and re-runs the decoder per step.
+///
+/// Non-cached: at step `t` it runs the decoder over the full length-`t` prefix and
+/// returns the logits at the last position. See [`crate::generate`] for the
+/// KV-cache TODO.
+struct ModelStep<'a, B: Backend> {
+    model: &'a UniMerNet<B>,
+    encoder_hidden: Tensor<B, 3>,
+    device: B::Device,
+    vocab_size: usize,
+}
+
+impl<B: Backend> DecodeStep for ModelStep<'_, B> {
+    fn step(&mut self, ids: &[u32]) -> Vec<f32> {
+        let t = ids.len();
+        let data: Vec<i64> = ids.iter().map(|&x| x as i64).collect();
+        let input_ids: Tensor<B, 2, Int> =
+            Tensor::from_data(TensorData::new(data, [1, t]), &self.device);
+        let logits = self.model.decode(input_ids, self.encoder_hidden.clone()); // [1, T, vocab]
+        // Take the last position's logits.
+        let last = logits.narrow(1, t - 1, 1).reshape([self.vocab_size]);
+        last.into_data()
+            .to_vec()
+            .unwrap_or_else(|_| vec![0.0; self.vocab_size])
+    }
+}
+
+/// The public formula-recognition entry point.
+///
+/// Owns the model, tokenizer, and config, and turns a cropped formula image into a
+/// [`Latex`] string. Parameterised over the Burn backend `B`; [`Cpu`] is the
+/// default via [`FormulaRecognizer::<Cpu>`].
+pub struct FormulaRecognizer<B: Backend> {
+    model: UniMerNet<B>,
+    tokenizer: LatexTokenizer,
+    config: UniMerNetConfig,
+    device: B::Device,
+}
+
+impl<B: Backend> FormulaRecognizer<B> {
+    /// Builds a recognizer from an in-memory model + tokenizer + config.
+    ///
+    /// Use this when you have already constructed and weight-loaded a [`UniMerNet`]
+    /// (e.g. in tests, or after a custom load). For the common on-disk case use
+    /// [`FormulaRecognizer::from_pretrained`].
+    pub fn new(
+        model: UniMerNet<B>,
+        tokenizer: LatexTokenizer,
+        config: UniMerNetConfig,
+        device: B::Device,
+    ) -> Self {
+        Self {
+            model,
+            tokenizer,
+            config,
+            device,
+        }
+    }
+
+    /// Recognizes the LaTeX of a single cropped formula image.
+    ///
+    /// Pipeline: [`preprocess`] → repeat gray channel to 3 → [`UniMerNet::encode`]
+    /// → greedy [`greedy_decode`] → tokenizer decode → [`latex_rm_whitespace`].
+    ///
+    /// # Errors
+    /// Returns [`Error::Image`] on an empty/undecodable image or
+    /// [`Error::Tokenizer`] on a decode failure.
+    pub fn predict(&self, image: &image::RgbImage) -> Result<Latex> {
+        let pre = preprocess::preprocess(image, preprocess::DEFAULT_TARGET)?;
+        let pixel_values = self.to_pixel_values(&pre);
+
+        let encoder_hidden = self.model.encode(pixel_values);
+
+        let start = self.config.decoder.bos_token_id as u32;
+        let eos = self.config.decoder.eos_token_id as u32;
+        let mut step = ModelStep {
+            model: &self.model,
+            encoder_hidden,
+            device: self.device.clone(),
+            vocab_size: self.config.decoder.vocab_size,
+        };
+        let decoded = greedy_decode(&mut step, start, eos, self.config.max_new_tokens);
+
+        let raw = self.tokenizer.decode(&decoded.tokens)?;
+        let cleaned = latex_rm_whitespace(&raw);
+        Ok(Latex(cleaned))
+    }
+
+    /// Turns the single normalised channel into a `[1, 3, H, W]` pixel tensor by
+    /// repeating the channel three times (mirroring `pixel_values.repeat(1,3,1,1)`).
+    fn to_pixel_values(&self, pre: &PreprocessedImage) -> Tensor<B, 4> {
+        let (h, w) = (pre.height, pre.width);
+        let plane: Tensor<B, 3> =
+            Tensor::from_data(TensorData::new(pre.data.clone(), [1, h, w]), &self.device);
+        // [1, 1, H, W] -> repeat to [1, 3, H, W]
+        plane.reshape([1, 1, h, w]).repeat_dim(1, 3)
+    }
+}
+
+impl FormulaRecognizer<Cpu> {
+    /// Loads a recognizer from a checkpoint directory on the CPU backend.
+    ///
+    /// Expects `dir` to contain `model.safetensors` and `tokenizer.json`. Weight
+    /// loading uses the shared harness with the [`crate::weights::build_remap`]
+    /// rules; `coverage` controls how unmapped keys are treated (start with
+    /// [`Coverage::Lenient`] until the remap is verified against the real file).
+    ///
+    /// # Errors
+    /// Returns an error if the tokenizer or weights fail to load. See
+    /// [`crate::weights`] for the key-mismatch caveats.
+    pub fn from_pretrained(
+        dir: impl AsRef<std::path::Path>,
+        coverage: Coverage,
+    ) -> Result<Self> {
+        use mineru_burn_common::backend::cpu_device;
+        use mineru_burn_common::weights::load_weights;
+
+        let dir = dir.as_ref();
+        let device = cpu_device();
+        let config = UniMerNetConfig::small_2503();
+
+        let mut model = UniMerNet::<Cpu>::new(&config, &device);
+        let remap = crate::weights::build_remap()?;
+        let weights_path = dir.join("model.safetensors");
+        load_weights(&mut model, &weights_path, &remap, coverage)?;
+
+        let tokenizer = LatexTokenizer::from_file(dir.join("tokenizer.json"))?;
+        if tokenizer.vocab_size() != config.decoder.vocab_size {
+            return Err(Error::Config(format!(
+                "tokenizer vocab {} != decoder vocab {}",
+                tokenizer.vocab_size(),
+                config.decoder.vocab_size
+            )));
+        }
+
+        Ok(Self::new(model, tokenizer, config, device))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_builds_on_cpu() {
+        // Constructing the full graph exercises every module's `new` and confirms
+        // the dims line up (dim doubling, head divisibility, etc.) without weights.
+        let device = Default::default();
+        let cfg = UniMerNetConfig::small_2503();
+        let _model = UniMerNet::<Cpu>::new(&cfg, &device);
+    }
+}

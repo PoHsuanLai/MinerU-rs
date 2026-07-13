@@ -1,0 +1,22 @@
+[package]
+name = "mineru-ocr-rec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SVTR/CRNN + CTC (PP-OCRv6) text recognition for MinerU, ported to Burn."
+
+[dependencies]
+mineru-types.workspace = true
+mineru-burn-common = { workspace = true }
+
+burn = { version = "0.21", default-features = false, features = ["ndarray", "std"] }
+
+image = { version = "0.25", default-features = false }
+
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+hf-hub = "0.3"
