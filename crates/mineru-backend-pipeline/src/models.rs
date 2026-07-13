@@ -44,17 +44,32 @@ pub struct ModelPaths {
 }
 
 impl ModelPaths {
-    /// Derives the default paths under `models_dir`, matching the released layout.
+    /// Derives the default paths under `models_dir`, matching the on-disk layout
+    /// of the PDF-Extract-Kit-1.0 release.
+    ///
+    /// `models_dir` is the `models/` directory of the release (e.g.
+    /// `/Volumes/Archive/mineru/models/PDF-Extract-Kit-1.0/models`). All model
+    /// weights are subpaths of it *except* the OCR character dictionary, which
+    /// ships with the application rather than the model download — see
+    /// [`ocr_rec_dict`](Self::ocr_rec_dict).
     pub fn under(models_dir: impl AsRef<Path>) -> Self {
         let root = models_dir.as_ref();
         Self {
             layout: root.join("Layout/PP-DocLayoutV2/model.safetensors"),
-            ocr_det: root.join("OCR/PP-OCRv6/det/ch_PP-OCRv6_small_det_infer.safetensors"),
-            ocr_rec: root.join("OCR/PP-OCRv6/rec/ch_PP-OCRv6_small_rec_infer.safetensors"),
-            ocr_rec_dict: root.join("OCR/PP-OCRv6/rec/ppocrv6_dict.txt"),
+            // The PP-OCRv6 torch checkpoints live flat under `OCR/paddleocr_torch/`.
+            ocr_det: root.join("OCR/paddleocr_torch/ch_PP-OCRv6_small_det_infer.safetensors"),
+            ocr_rec: root.join("OCR/paddleocr_torch/ch_PP-OCRv6_small_rec_infer.safetensors"),
+            // The v6 charset is NOT in the model release; it ships with the app
+            // (mirrors the Python repo's
+            // `model/utils/pytorchocr/utils/resources/dict/ppocrv6_dict.txt`).
+            // Placed alongside the recognizer here as the default; override via
+            // config when the app bundles it elsewhere.
+            ocr_rec_dict: root.join("OCR/paddleocr_torch/ppocrv6_dict.txt"),
             formula_dir: root.join("MFR/unimernet_hf_small_2503"),
-            table_wireless: root.join("Table/SLANet-plus/model.safetensors"),
-            table_wired: root.join("Table/unet/model.safetensors"),
+            // Table structure/segmentation ship as ONNX (loaded via burn-import
+            // codegen in mineru-table), under `TabRec/`.
+            table_wireless: root.join("TabRec/SlanetPlus/slanet-plus.onnx"),
+            table_wired: root.join("TabRec/UnetStructure/unet.onnx"),
         }
     }
 }
