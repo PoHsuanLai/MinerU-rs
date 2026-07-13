@@ -20,7 +20,7 @@ use burn::tensor::activation::{gelu, softmax};
 use burn::tensor::{Int, Tensor, TensorData};
 
 use crate::config::{READING_ORDER as RO, ReadingOrderConfig};
-use crate::nn::{PtLayerNorm, PtLinear};
+use mineru_burn_common::nn::{PtLayerNorm, PtLinear};
 
 /// The LayoutLMv3-derived text/spatial embeddings.
 #[derive(Module, Debug)]

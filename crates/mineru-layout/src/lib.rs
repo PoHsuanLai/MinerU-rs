@@ -31,7 +31,6 @@ pub mod encoder;
 pub mod error;
 pub mod label;
 pub mod model;
-pub mod nn;
 pub mod postprocess;
 pub mod preprocess;
 pub mod reading_order;

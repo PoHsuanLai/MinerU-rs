@@ -30,6 +30,7 @@ pub use backend::{Cpu, cpu_device};
 pub use ctc::{ctc_greedy_decode, ctc_greedy_decode_slice};
 pub use error::{Error, Result};
 pub use model::Model;
+pub use nn::{ConvBnRelu, ConvBnReluConfig, FrozenBatchNorm2d, PtLayerNorm, PtLinear, tensor_from_vec};
 pub use preprocess::{Normalize, Preprocess, Size};
 pub use weights::{Coverage, KeyRemap, LoadWeights, assert_all_keys_consumed, load_weights};
 
@@ -154,5 +155,59 @@ mod tests {
     #[test]
     fn coverage_ok_when_all_consumed() {
         assert!(assert_all_keys_consumed(&[], Coverage::Strict).is_ok());
+    }
+
+    #[test]
+    fn pt_linear_applies_pytorch_layout_weight() {
+        use crate::nn::PtLinear;
+        let device = cpu_device();
+        // A `[out=2, in=3]` weight in PyTorch layout. Row 0 sums the inputs,
+        // row 1 negates the first. Loading stores it untransposed; forward must
+        // still compute `x @ Wᵀ` so a state-dict loads byte-for-byte.
+        let mut lin = PtLinear::<Cpu>::init(3, 2, true, &device);
+        lin.weight = burn::module::Param::from_tensor(Tensor::<Cpu, 2>::from_data(
+            TensorData::new(vec![1.0_f32, 1.0, 1.0, -1.0, 0.0, 0.0], [2, 3]),
+            &device,
+        ));
+        lin.bias = Some(burn::module::Param::from_tensor(Tensor::<Cpu, 1>::from_data(
+            TensorData::new(vec![10.0_f32, 0.0], [2]),
+            &device,
+        )));
+        let x = Tensor::<Cpu, 2>::from_data(TensorData::new(vec![2.0_f32, 3.0, 4.0], [1, 3]), &device);
+        let y = lin.forward(x).into_data().into_vec::<f32>().expect("f32");
+        // row0: 2+3+4 + 10 = 19 ; row1: -2 + 0 = -2
+        assert!((y[0] - 19.0).abs() < 1e-5, "got {}", y[0]);
+        assert!((y[1] + 2.0).abs() < 1e-5, "got {}", y[1]);
+    }
+
+    #[test]
+    fn pt_layer_norm_zero_mean_unit_var() {
+        use crate::nn::PtLayerNorm;
+        let device = cpu_device();
+        // Identity affine (weight=1, bias=0): output should be the standardised input.
+        let ln = PtLayerNorm::<Cpu>::init(4, 1e-5, &device);
+        let x =
+            Tensor::<Cpu, 2>::from_data(TensorData::new(vec![1.0_f32, 2.0, 3.0, 4.0], [1, 4]), &device);
+        let y = ln.forward(x).into_data().into_vec::<f32>().expect("f32");
+        let mean: f32 = y.iter().sum::<f32>() / 4.0;
+        assert!(mean.abs() < 1e-5, "mean should be ~0, got {mean}");
+        // Symmetric input → outer values equal-and-opposite.
+        assert!((y[0] + y[3]).abs() < 1e-5);
+    }
+
+    #[test]
+    fn frozen_batch_norm_is_identity_for_default_buffers() {
+        use crate::nn::FrozenBatchNorm2d;
+        let device = cpu_device();
+        // weight=1, bias=0, mean=0, var=1 → the affine is (x-0)/sqrt(1+eps) ≈ x.
+        let bn = FrozenBatchNorm2d::<Cpu>::init(2, 1e-5, &device);
+        let x = Tensor::<Cpu, 4>::from_data(
+            TensorData::new(vec![1.0_f32, -2.0, 3.0, -4.0], [1, 2, 1, 2]),
+            &device,
+        );
+        let y = bn.forward(x).into_data().into_vec::<f32>().expect("f32");
+        for (got, want) in y.iter().zip([1.0_f32, -2.0, 3.0, -4.0]) {
+            assert!((got - want).abs() < 1e-3, "got {got}, want {want}");
+        }
     }
 }

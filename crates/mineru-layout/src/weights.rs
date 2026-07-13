@@ -7,7 +7,7 @@
 //!
 //! # Why the rules are shaped this way
 //! This crate's modules store parameters in the checkpoint's own tensor layout and
-//! naming (see [`crate::nn`]), so most leaf names already match. The remap only has
+//! naming (see [`mineru_burn_common::nn`]), so most leaf names already match. The remap only has
 //! to bridge *structural* differences:
 //! - the doubly-nested backbone prefix `model.backbone.model.` → `backbone.`;
 //! - `encoder.stages.N` → `encoder.stageN` (named stage fields, no enum/`Vec`);

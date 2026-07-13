@@ -16,7 +16,7 @@ use burn::tensor::ops::{InterpolateMode, InterpolateOptions};
 use burn::tensor::{Tensor, TensorData};
 
 use crate::config::DET;
-use crate::nn::{FrozenBatchNorm2d, PtLayerNorm, PtLinear};
+use mineru_burn_common::nn::{FrozenBatchNorm2d, PtLayerNorm, PtLinear};
 
 /// SiLU activation.
 fn silu<B: Backend, const D: usize>(x: Tensor<B, D>) -> Tensor<B, D> {

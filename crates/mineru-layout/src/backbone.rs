@@ -38,7 +38,7 @@ use burn::tensor::Tensor;
 use burn::tensor::activation::relu;
 
 use crate::config::DET;
-use crate::nn::FrozenBatchNorm2d;
+use mineru_burn_common::nn::FrozenBatchNorm2d;
 
 /// Number of conv layers inside each basic block (`stage_numb_of_layers = 6`).
 const LAYERS_PER_BLOCK: usize = 6;

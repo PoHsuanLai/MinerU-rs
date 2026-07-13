@@ -11,7 +11,7 @@ use burn::tensor::activation::{relu, sigmoid, softmax};
 use burn::tensor::{Int, Tensor, TensorData};
 
 use crate::config::DET;
-use crate::nn::{PtLayerNorm, PtLinear};
+use mineru_burn_common::nn::{PtLayerNorm, PtLinear};
 
 /// An `RTDetrMLPPredictionHead`: `num_layers` linears with ReLU between them.
 #[derive(Module, Debug)]
