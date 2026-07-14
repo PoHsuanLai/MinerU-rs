@@ -36,9 +36,9 @@ async fn main() -> anyhow::Result<()> {
     };
     // Default is auto (try GPU, fall back to CPU); `--cpu` forces CPU.
     let backend = build_backend(args.backend, !args.cpu, &config, &vlm)?;
-    let (md, json) = run::run_parse(backend.as_ref(), &input, &args.output, &opts, mode).await?;
-    println!("wrote {}", md.display());
-    println!("wrote {}", json.display());
+    let (_md, _json) = run::run_parse(backend.as_ref(), &input, &args.output, &opts, mode).await?;
+    // The written paths are reported by `run_parse`'s `tracing::info!("wrote
+    // outputs …")`; no separate stdout print, so all output goes through tracing.
     Ok(())
 }
 
