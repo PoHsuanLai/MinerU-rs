@@ -20,7 +20,7 @@ use async_trait::async_trait;
 
 use mineru_pdf::{PdfiumLibrary, RenderOptions};
 use mineru_types::{Backend, BackendError, DocInput, Document, ParseOptions};
-use mineru_vlm_client::{assemble_document, VlmClient, VlmClientConfig, VlmPage};
+use mineru_vlm_client::{assemble_document, CropSink, VlmClient, VlmClientConfig, VlmPage};
 
 pub use error::{Error, Result};
 
@@ -72,7 +72,14 @@ impl VlmBackend {
             // Render this page (serial: PDFium is not concurrency-safe), then
             // await its extraction before rendering the next.
             let image = doc.render_page(index, &render)?.into_inner();
-            let page = self.client.extract_page(&image, image_analysis).await?;
+            let crops = opts.image_sink.as_deref().map(|s| CropSink {
+                sink: s,
+                page_index: index,
+            });
+            let page = self
+                .client
+                .extract_page(&image, image_analysis, crops)
+                .await?;
             pages.push(page);
         }
 

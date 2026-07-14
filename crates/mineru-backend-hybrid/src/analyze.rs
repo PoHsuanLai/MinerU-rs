@@ -52,9 +52,9 @@ use mineru_backend_pipeline::PipelineModels;
 use mineru_layout::{LayoutDet, LayoutLabel};
 use mineru_pdf::{PdfiumLibrary, RenderOptions};
 use mineru_types::{
-    Backend, BackendError, BBox, DocInput, Document, Page, PageSize, ParseOptions,
+    Backend, BackendError, BBox, DocInput, Document, ImageWriter, Page, PageSize, ParseOptions,
 };
-use mineru_vlm_client::{VlmClient, VlmClientConfig, VlmPage};
+use mineru_vlm_client::{CropSink, VlmClient, VlmClientConfig, VlmPage};
 
 use crate::assemble::{DocTitleBoxes, ExtractedRegion, HybridAssembler};
 use crate::effort::Effort;
@@ -82,13 +82,32 @@ const OCR_MIN_CONFIDENCE: f32 = 0.6;
 trait VlmExtractor: Send + Sync {
     /// Runs the VLM's two-step layout+extraction over `image`, honoring
     /// `image_analysis` for image/chart bodies.
-    async fn extract_page(&self, image: &RgbImage, image_analysis: bool) -> Result<VlmPage>;
+    ///
+    /// When `sink` is `Some`, the extractor writes each visual block's crop through
+    /// it (naming with `page_index`) and stamps the resulting filename onto the
+    /// returned blocks' `image_ref` — this is how the `high` path (which delegates
+    /// the whole page to the client) captures crops. The `medium` path passes
+    /// `None` here and does its own cropping in the hybrid layer.
+    async fn extract_page(
+        &self,
+        image: &RgbImage,
+        image_analysis: bool,
+        sink: Option<&dyn ImageWriter>,
+        page_index: usize,
+    ) -> Result<VlmPage>;
 }
 
 #[async_trait]
 impl VlmExtractor for VlmClient {
-    async fn extract_page(&self, image: &RgbImage, image_analysis: bool) -> Result<VlmPage> {
-        Ok(VlmClient::extract_page(self, image, image_analysis).await?)
+    async fn extract_page(
+        &self,
+        image: &RgbImage,
+        image_analysis: bool,
+        sink: Option<&dyn ImageWriter>,
+        page_index: usize,
+    ) -> Result<VlmPage> {
+        let crops = sink.map(|sink| CropSink { sink, page_index });
+        Ok(VlmClient::extract_page(self, image, image_analysis, crops).await?)
     }
 }
 
@@ -160,13 +179,21 @@ impl HybridBackend {
 
         let (start, end) = page_bounds(doc.page_count(), opts);
         let effective_image_analysis = self.effort.effective_image_analysis(self.image_analysis);
+        let sink = opts.image_sink.as_deref();
 
         let mut pages = Vec::with_capacity(end.saturating_sub(start));
         for index in start..end {
             let point_size = doc.page_size(index)?;
             let image = doc.render_page(index, &render)?.into_inner();
             let page = self
-                .analyze_page(&self.client, index, point_size, &image, effective_image_analysis)
+                .analyze_page(
+                    &self.client,
+                    index,
+                    point_size,
+                    &image,
+                    effective_image_analysis,
+                    sink,
+                )
                 .await?;
             pages.push(page);
         }
@@ -187,6 +214,7 @@ impl HybridBackend {
         point_size: PageSize,
         image: &RgbImage,
         image_analysis: bool,
+        sink: Option<&dyn ImageWriter>,
     ) -> Result<Page> {
         let scale = self.scale();
 
@@ -213,9 +241,10 @@ impl HybridBackend {
         //    layout as the block list; `high` lets the VLM run its own full-page
         //    layout and maps the resulting blocks back to regions.
         let mut regions = if self.effort.vlm_runs_own_layout() {
-            self.extract_regions_high(client, image, image_analysis).await
+            self.extract_regions_high(client, index, image, image_analysis, sink)
+                .await
         } else {
-            self.extract_regions_medium(client, dets, image, image_analysis)
+            self.extract_regions_medium(client, index, dets, image, image_analysis, sink)
                 .await
         };
 
@@ -255,13 +284,18 @@ impl HybridBackend {
     async fn extract_regions_medium(
         &self,
         client: &impl VlmExtractor,
+        page_index: usize,
         dets: Vec<LayoutDet>,
         image: &RgbImage,
         image_analysis: bool,
+        sink: Option<&dyn ImageWriter>,
     ) -> Vec<ExtractedRegion> {
         let mut regions = Vec::with_capacity(dets.len());
         for det in dets {
-            if let Some(region) = self.extract_region(client, det, image, image_analysis).await {
+            if let Some(region) = self
+                .extract_region(client, page_index, det, image, image_analysis, sink)
+                .await
+            {
                 regions.push(region);
             }
         }
@@ -281,10 +315,15 @@ impl HybridBackend {
     async fn extract_regions_high(
         &self,
         client: &impl VlmExtractor,
+        page_index: usize,
         image: &RgbImage,
         image_analysis: bool,
+        sink: Option<&dyn ImageWriter>,
     ) -> Vec<ExtractedRegion> {
-        match client.extract_page(image, image_analysis).await {
+        match client
+            .extract_page(image, image_analysis, sink, page_index)
+            .await
+        {
             Ok(page) => vlm_page_to_regions(page),
             Err(e) => {
                 tracing::warn!(error = %e, "hybrid high-effort full-page VLM extraction failed");
@@ -302,15 +341,28 @@ impl HybridBackend {
     async fn extract_region(
         &self,
         client: &impl VlmExtractor,
+        page_index: usize,
         det: LayoutDet,
         image: &RgbImage,
         image_analysis: bool,
+        sink: Option<&dyn ImageWriter>,
     ) -> Option<ExtractedRegion> {
         let vlm_type = VlmType::for_layout_label(det.label);
         if !vlm_type.is_extracted() {
             return None;
         }
         let is_seal = VlmType::visual_sub_type(det.label).is_some();
+
+        // Visual regions (image/chart/table) get their crop written through the sink
+        // in the hybrid layer — the pipeline already knows the pixel bbox. The
+        // resulting filename is stamped onto the region so the assembler forwards it
+        // into the body's `ImageRef` (fixing the empty `![](images)` bug).
+        let image_ref = match sink {
+            Some(sink) if is_visual(vlm_type) => {
+                self.write_region_crop(sink, page_index, det.order, det.bbox, image)
+            }
+            _ => None,
+        };
 
         let content = if self.should_send_to_vlm(vlm_type, image_analysis) {
             self.vlm_extract(client, det.bbox, image, image_analysis).await
@@ -324,7 +376,30 @@ impl HybridBackend {
             content,
             order: det.order,
             is_seal,
+            image_ref,
         })
+    }
+
+    /// Crops a visual region from the page raster and writes it as a PNG through the
+    /// sink, returning the written filename. Best-effort: a crop that has no area or
+    /// a write that fails is logged and yields `None`, leaving the ref empty.
+    fn write_region_crop(
+        &self,
+        sink: &dyn ImageWriter,
+        page_index: usize,
+        order: usize,
+        bbox: BBox,
+        image: &RgbImage,
+    ) -> Option<String> {
+        let (crop, _, _) = crop_region(image, &bbox)?;
+        let name = format!("p{page_index}_o{order}.png");
+        match mineru_io::write_png(sink, &name, &crop) {
+            Ok(()) => Some(name),
+            Err(e) => {
+                tracing::warn!(error = %e, name, "hybrid region crop write failed");
+                None
+            }
+        }
     }
 
     /// Whether a region's content is requested from the VLM.
@@ -361,7 +436,9 @@ impl HybridBackend {
         image_analysis: bool,
     ) -> Option<String> {
         let crop = crop_region(image, &bbox)?.0;
-        match client.extract_page(&crop, image_analysis).await {
+        // No sink here: the medium path writes the region crop itself (in
+        // `extract_region`), so the per-region content call must not re-crop.
+        match client.extract_page(&crop, image_analysis, None, 0).await {
             Ok(page) => reduce_crop_content(page),
             Err(e) => {
                 tracing::warn!(error = %e, "hybrid VLM region extraction failed");
@@ -420,6 +497,12 @@ impl Backend for HybridBackend {
     ) -> std::result::Result<Document, BackendError> {
         self.run(&input, opts).await.map_err(Into::into)
     }
+}
+
+/// Whether a region routes to a visual body (image/chart/table) — the types whose
+/// crop is written to the sink and referenced from the assembled block.
+fn is_visual(vlm_type: VlmType) -> bool {
+    matches!(vlm_type, VlmType::Image | VlmType::Chart | VlmType::Table)
 }
 
 /// Whether a region should be considered for post-OCR fill: a text-like type whose
@@ -492,6 +575,7 @@ fn vlm_page_to_regions(page: VlmPage) -> Vec<ExtractedRegion> {
                 content: block.content,
                 order,
                 is_seal: block.sub_type.as_deref() == Some("seal"),
+                image_ref: block.image_ref,
             })
         })
         .collect()
@@ -593,7 +677,13 @@ mod tests {
 
     #[async_trait]
     impl VlmExtractor for FakeVlm {
-        async fn extract_page(&self, image: &RgbImage, _image_analysis: bool) -> Result<VlmPage> {
+        async fn extract_page(
+            &self,
+            image: &RgbImage,
+            _image_analysis: bool,
+            _sink: Option<&dyn ImageWriter>,
+            _page_index: usize,
+        ) -> Result<VlmPage> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             *self.last_size.lock().unwrap() = Some((image.width(), image.height()));
             Ok(self.page.clone())
@@ -607,6 +697,7 @@ mod tests {
             content: Some(content.to_owned()),
             angle: 0,
             sub_type: None,
+            image_ref: None,
         }
     }
 
@@ -626,7 +717,7 @@ mod tests {
         let img = RgbImage::new(200, 100);
 
         let regions = backend(Effort::High)
-            .extract_regions_high(&fake, &img, true)
+            .extract_regions_high(&fake, 0, &img, true, None)
             .await;
 
         assert_eq!(fake.calls(), 1, "high effort makes one full-page VLM call");
@@ -674,7 +765,13 @@ mod tests {
         struct FailVlm;
         #[async_trait]
         impl VlmExtractor for FailVlm {
-            async fn extract_page(&self, _: &RgbImage, _: bool) -> Result<VlmPage> {
+            async fn extract_page(
+                &self,
+                _: &RgbImage,
+                _: bool,
+                _: Option<&dyn ImageWriter>,
+                _: usize,
+            ) -> Result<VlmPage> {
                 Err(crate::error::Error::Vlm(mineru_vlm_client::Error::Parse(
                     "boom".to_owned(),
                 )))
@@ -682,7 +779,7 @@ mod tests {
         }
         let img = RgbImage::new(50, 50);
         let regions = backend(Effort::High)
-            .extract_regions_high(&FailVlm, &img, true)
+            .extract_regions_high(&FailVlm, 0, &img, true, None)
             .await;
         assert!(regions.is_empty());
     }
@@ -701,7 +798,7 @@ mod tests {
             LayoutDet { bbox: BBox::new(0.0, 50.0, 100.0, 90.0), label: LayoutLabel::Text, order: 1, score: 1.0 },
         ];
         let regions = backend(Effort::Medium)
-            .extract_regions_medium(&fake, dets, &img, false)
+            .extract_regions_medium(&fake, 0, dets, &img, false, None)
             .await;
 
         assert_eq!(fake.calls(), 2, "medium effort calls the VLM once per region");
@@ -711,18 +808,88 @@ mod tests {
         assert_eq!(regions.len(), 2);
     }
 
+    /// A recording image sink for tests: captures written names without touching disk.
+    #[derive(Debug, Default)]
+    struct RecordingSink {
+        names: std::sync::Mutex<Vec<String>>,
+    }
+    impl mineru_types::ImageWriter for RecordingSink {
+        fn write(&self, name: &str, _bytes: &[u8]) -> std::io::Result<()> {
+            self.names
+                .lock()
+                .map_err(|_| std::io::Error::other("poisoned"))?
+                .push(name.to_owned());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn medium_stamps_image_ref_from_written_crop() {
+        // Guards the `![](images)` bug on the hybrid medium path: when a sink is
+        // present, an image region's crop is written and its filename flows all the
+        // way into a non-empty `ImageRef` on the assembled block.
+        use mineru_types::{Block, ImageBody, ImageRef};
+
+        let fake = FakeVlm::new(full_page(vec![]));
+        let sink = RecordingSink::default();
+        let img = RgbImage::new(200, 100);
+
+        let dets = vec![LayoutDet {
+            bbox: BBox::new(10.0, 10.0, 90.0, 90.0),
+            label: LayoutLabel::Image,
+            order: 3,
+            score: 1.0,
+        }];
+        let regions = backend(Effort::Medium)
+            .extract_regions_medium(&fake, 7, dets, &img, true, Some(&sink))
+            .await;
+
+        // The crop was written under the `p{page}_o{order}.png` name.
+        assert_eq!(*sink.names.lock().unwrap(), vec!["p7_o3.png".to_owned()]);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].image_ref.as_deref(), Some("p7_o3.png"));
+
+        // And it survives assembly into a non-empty ImageRef (not the empty-string bug).
+        let assembled = HybridAssembler::default().assemble(regions);
+        match &assembled.blocks[0] {
+            Block::Image(c) => {
+                let ImageBody { image: ImageRef(r), .. } = &c.body;
+                assert_eq!(r, "p7_o3.png", "image_ref must reach the assembled body");
+            }
+            other => panic!("expected image block, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn medium_without_sink_leaves_image_ref_empty() {
+        // No sink → no crop written, ref stays empty (the acceptable degraded case).
+        let fake = FakeVlm::new(full_page(vec![]));
+        let img = RgbImage::new(200, 100);
+        let dets = vec![LayoutDet {
+            bbox: BBox::new(10.0, 10.0, 90.0, 90.0),
+            label: LayoutLabel::Image,
+            order: 0,
+            score: 1.0,
+        }];
+        let regions = backend(Effort::Medium)
+            .extract_regions_medium(&fake, 0, dets, &img, true, None)
+            .await;
+        assert_eq!(regions.len(), 1);
+        assert!(regions[0].image_ref.is_none());
+    }
+
     #[tokio::test]
     async fn effort_selects_distinct_paths() {
         // High makes exactly one full-page call; Medium makes none for zero regions
         // (proving Medium never issues the single full-page two-step call High does).
         let fake_high = FakeVlm::new(full_page(vec![vlm_block("text", "x", [0.0, 0.0, 1.0, 1.0])]));
         let img = RgbImage::new(120, 80);
-        backend(Effort::High).extract_regions_high(&fake_high, &img, true).await;
+        backend(Effort::High).extract_regions_high(&fake_high, 0, &img, true, None).await;
         assert_eq!(fake_high.calls(), 1);
 
         let fake_medium = FakeVlm::new(full_page(vec![]));
         let no_regions = backend(Effort::Medium)
-            .extract_regions_medium(&fake_medium, Vec::new(), &img, false)
+            .extract_regions_medium(&fake_medium, 0, Vec::new(), &img, false, None)
             .await;
         assert_eq!(fake_medium.calls(), 0, "medium with no regions makes no VLM call");
         assert!(no_regions.is_empty());
@@ -784,6 +951,7 @@ mod tests {
             content: Some("   ".to_owned()),
             order: 0,
             is_seal: false,
+            image_ref: None,
         };
         assert!(needs_post_ocr(&empty_text));
 
@@ -821,6 +989,7 @@ mod tests {
                     content: Some("hello".to_owned()),
                     angle: 0,
                     sub_type: None,
+                    image_ref: None,
                 },
                 VlmBlock {
                     bbox: [0.0, 0.5, 1.0, 1.0],
@@ -828,6 +997,7 @@ mod tests {
                     content: Some("  ".to_owned()),
                     angle: 0,
                     sub_type: None,
+                    image_ref: None,
                 },
             ],
         };

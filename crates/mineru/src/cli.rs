@@ -136,6 +136,9 @@ impl ParseArgs {
             formula: !self.no_formula,
             table: !self.no_table,
             page_range: parse_page_range(self.pages.as_deref())?,
+            // The image sink is injected by the run flow (it owns the output dir),
+            // not derived from CLI flags — see `crate::run`.
+            ..Default::default()
         })
     }
 }

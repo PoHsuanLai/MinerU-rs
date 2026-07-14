@@ -15,9 +15,11 @@ pub mod content;
 pub mod document;
 pub mod error;
 pub mod geom;
+pub mod image_sink;
 
 pub use backend::{Backend, BackendError, DocInput, ParseOptions};
 pub use content::{Html, ImageRef, Lang, Latex, Score};
+pub use image_sink::ImageWriter;
 pub use document::{
     Block, Captioned, CodeBody, Document, ImageBody, Page, PageSize, Span, TableBody, TextBlock,
     TextLine, TextRole, TitleLevel, MAX_TITLE_LEVEL,

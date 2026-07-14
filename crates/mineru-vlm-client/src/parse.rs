@@ -90,6 +90,7 @@ pub fn parse_layout(response: &str) -> Vec<VlmBlock> {
             content: None,
             angle,
             sub_type: None,
+            image_ref: None,
         });
     }
 

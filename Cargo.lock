@@ -3916,6 +3916,7 @@ dependencies = [
  "async-trait",
  "image",
  "mineru-backend-pipeline",
+ "mineru-io",
  "mineru-layout",
  "mineru-pdf",
  "mineru-types",
@@ -3934,6 +3935,7 @@ dependencies = [
  "image",
  "mineru-burn-common",
  "mineru-formula",
+ "mineru-io",
  "mineru-layout",
  "mineru-ocr-det",
  "mineru-ocr-rec",
@@ -4001,6 +4003,8 @@ name = "mineru-io"
 version = "0.1.0"
 dependencies = [
  "hf-hub",
+ "image",
+ "mineru-types",
  "tempfile",
  "thiserror 2.0.18",
 ]
@@ -4102,6 +4106,7 @@ dependencies = [
  "async-openai",
  "base64 0.22.1",
  "image",
+ "mineru-io",
  "mineru-types",
  "once_cell",
  "regex",

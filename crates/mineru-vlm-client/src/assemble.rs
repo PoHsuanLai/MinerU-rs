@@ -184,8 +184,8 @@ fn map_block(b: VlmBlock, w: f32, h: f32) -> Mapped {
             bbox,
             VisualBody::Image(ImageBody {
                 bbox,
-                // The extracted raster path is filled in by the caller after cropping.
-                image: mineru_types::ImageRef(String::new()),
+                // Filled by the client after cropping; empty when no sink was set.
+                image: mineru_types::ImageRef(b.image_ref.clone().unwrap_or_default()),
             }),
         ),
         "chart" => Mapped::Visual(
@@ -193,7 +193,7 @@ fn map_block(b: VlmBlock, w: f32, h: f32) -> Mapped {
             bbox,
             VisualBody::Image(ImageBody {
                 bbox,
-                image: mineru_types::ImageRef(String::new()),
+                image: mineru_types::ImageRef(b.image_ref.clone().unwrap_or_default()),
             }),
         ),
         "table" => Mapped::Visual(
@@ -202,7 +202,7 @@ fn map_block(b: VlmBlock, w: f32, h: f32) -> Mapped {
             VisualBody::Table(TableBody {
                 bbox,
                 html: Html(content),
-                image: None,
+                image: b.image_ref.clone().map(mineru_types::ImageRef),
             }),
         ),
         "code" | "algorithm" => Mapped::Visual(
@@ -217,7 +217,7 @@ fn map_block(b: VlmBlock, w: f32, h: f32) -> Mapped {
                 language: None,
             }),
         ),
-        "equation" => Mapped::Equation(bbox, Latex(content.trim().to_owned())),
+        "equation" => Mapped::Equation(bbox, Latex(clean_isolated_formula(&content))),
 
         _ => Mapped::Ignored,
     }
@@ -291,6 +291,22 @@ fn text_spans(content: &str, bbox: BBox) -> Vec<Span> {
     spans
 }
 
+/// Cleans an isolated (display) formula body for `$$…$$` wrapping.
+///
+/// MinerU2.5 returns display equations already wrapped in LaTeX `\[ … \]`
+/// delimiters (often with a trailing `\tag{n}`). The Markdown renderer wraps the
+/// body in `$$ … $$` itself, so leaving `\[`/`\]` in place produces
+/// `$$ \[ … \] $$`, which no Markdown/KaTeX viewer renders. Strip a single
+/// leading `\[` and trailing `\]` and surrounding whitespace, mirroring the
+/// reference `isolated_formula_clean` (`visual_magic_model_utils.py`). The
+/// `\tag{…}` is kept — KaTeX renders it inside display math.
+fn clean_isolated_formula(content: &str) -> String {
+    let latex = content.trim();
+    let latex = latex.strip_prefix("\\[").unwrap_or(latex);
+    let latex = latex.strip_suffix("\\]").unwrap_or(latex);
+    latex.trim().to_owned()
+}
+
 /// Titles collapse internal newlines to single spaces (matches the Python).
 fn normalize_title(content: &str) -> String {
     let mut out = String::with_capacity(content.len());
@@ -359,6 +375,7 @@ mod tests {
             content: Some(content.to_owned()),
             angle: 0,
             sub_type: None,
+            image_ref: None,
         }
     }
 
@@ -386,6 +403,42 @@ mod tests {
         let spans = text_spans("energy \\(E=mc^2\\) equation", BBox::new(0.0, 0.0, 1.0, 1.0));
         assert_eq!(spans.len(), 3);
         assert!(matches!(spans[1], Span::InlineEquation { .. }));
+    }
+
+    #[test]
+    fn strips_display_delimiters_from_isolated_formula() {
+        // The model returns display math wrapped in `\[ … \]`; the Markdown
+        // renderer adds its own `$$ … $$`, so the delimiters must be stripped or
+        // the output is the un-renderable `$$ \[ … \] $$`. The `\tag` is kept.
+        assert_eq!(
+            clean_isolated_formula("\\[E = mc^2 \\tag{1}\\]"),
+            "E = mc^2 \\tag{1}"
+        );
+        // Idempotent on already-clean input; only strips a single outer pair.
+        assert_eq!(clean_isolated_formula("x^2"), "x^2");
+        assert_eq!(clean_isolated_formula("  \\[a\\]  "), "a");
+    }
+
+    #[test]
+    fn equation_block_carries_clean_latex() {
+        let page = VlmPage {
+            width: 100.0,
+            height: 100.0,
+            blocks: vec![block(
+                "equation",
+                "\\[\\text{Attention}(Q,K,V) \\tag{1}\\]",
+                [0.0, 0.0, 1.0, 0.2],
+            )],
+        };
+        let doc = assemble_document(vec![page]);
+        match &doc.pages[0].blocks[0] {
+            Block::InterlineEquation { latex, .. } => {
+                assert!(!latex.as_str().starts_with("\\["), "leading \\[ survived");
+                assert!(!latex.as_str().ends_with("\\]"), "trailing \\] survived");
+                assert_eq!(latex.as_str(), "\\text{Attention}(Q,K,V) \\tag{1}");
+            }
+            _ => panic!("expected interline equation"),
+        }
     }
 
     #[test]
@@ -419,6 +472,35 @@ mod tests {
         assert_eq!(imgs.len(), 1);
         if let Block::Image(c) = imgs[0] {
             assert_eq!(c.captions.len(), 1, "caption should attach to the image");
+        }
+    }
+
+    #[test]
+    fn image_ref_carries_to_image_body() {
+        // A stamped image_ref must reach the ImageBody so markdown renders a real
+        // path instead of the broken `![](images)` empty-ref. Guards that regression.
+        let mut b = block("image", "", [0.1, 0.1, 0.9, 0.6]);
+        b.image_ref = Some("p0_o2.png".to_owned());
+        let page = VlmPage { width: 100.0, height: 100.0, blocks: vec![b] };
+        let doc = assemble_document(vec![page]);
+        match &doc.pages[0].blocks[0] {
+            Block::Image(c) => assert_eq!(c.body.image.0, "p0_o2.png"),
+            _ => panic!("expected image"),
+        }
+    }
+
+    #[test]
+    fn image_ref_none_yields_empty_ref() {
+        // Documents the no-sink path: without a crop written, the ref stays empty.
+        let page = VlmPage {
+            width: 100.0,
+            height: 100.0,
+            blocks: vec![block("image", "", [0.1, 0.1, 0.9, 0.6])],
+        };
+        let doc = assemble_document(vec![page]);
+        match &doc.pages[0].blocks[0] {
+            Block::Image(c) => assert_eq!(c.body.image.0, ""),
+            _ => panic!("expected image"),
         }
     }
 
