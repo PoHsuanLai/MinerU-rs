@@ -10,9 +10,13 @@
 //! the list with the `sos` / `eos` sentinels, yielding the index space the
 //! decoder argmaxes over.
 
-/// The raw SLANet-plus structure tokens, in model output order, exactly as the
-/// PP-Structure `table_structure_dict.txt` ships them (before the special-char
-/// and merge fix-ups applied by [`build_vocab`]).
+/// The raw SLANet-plus structure tokens, in model output order, exactly as they
+/// ship in the ONNX model's `character` metadata (the canonical PP-Structure
+/// SLANet-plus token set). This is the post-`merge_no_span_structure` list: it
+/// already carries `<td></td>` (not bare `<td>`) and runs col/rowspan up to 20.
+///
+/// `sos`/`eos` are added by [`build_vocab`], yielding the model's 50 output
+/// channels (`48` characters + the two sentinels).
 pub const RAW_TOKENS: &[&str] = &[
     "<thead>",
     "</thead>",
@@ -20,7 +24,6 @@ pub const RAW_TOKENS: &[&str] = &[
     "</tbody>",
     "<tr>",
     "</tr>",
-    "<td>",
     "<td",
     ">",
     "</td>",
@@ -42,6 +45,7 @@ pub const RAW_TOKENS: &[&str] = &[
     " colspan=\"17\"",
     " colspan=\"18\"",
     " colspan=\"19\"",
+    " colspan=\"20\"",
     " rowspan=\"2\"",
     " rowspan=\"3\"",
     " rowspan=\"4\"",
@@ -60,6 +64,8 @@ pub const RAW_TOKENS: &[&str] = &[
     " rowspan=\"17\"",
     " rowspan=\"18\"",
     " rowspan=\"19\"",
+    " rowspan=\"20\"",
+    "<td></td>",
 ];
 
 /// The begin sentinel token index name.

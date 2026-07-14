@@ -1,29 +1,30 @@
 //! Wireless-table structure recognition (SLANet-plus), hand-ported to Burn.
 //!
-//! The Python model is a PP-LCNet CNN backbone feeding a **SLAHead** attention
-//! decoder that autoregressively emits HTML structure tokens and, for every
-//! `<td>` token, regresses a normalized cell box. Its ONNX graph uses a dynamic
-//! sequence-length decoder, which is exactly the case `burn-onnx` codegen is
-//! fragile on — so per the crate plan this path is **hand-ported** rather than
-//! codegen'd.
+//! The Python model is a PP-LCNet CNN backbone + CSP-PAN neck feeding a
+//! **SLAHead** attention decoder that autoregressively emits HTML structure
+//! tokens and, for every `<td>` token, regresses a normalized cell box. Its ONNX
+//! graph exports the decoder as a dynamic-length `Loop`, which `burn-onnx` 0.21
+//! cannot import (its type inference fails on the pre-loop `ConstantOfShape`
+//! nodes — see [`model`]), so the whole network is **hand-ported** rather than
+//! codegen'd, and its weights load at runtime from a converted `.safetensors`.
 //!
-//! ## Status
-//!
-//! The surrounding pipeline is complete and tested end to end on synthetic
-//! decoder outputs:
+//! ## Pipeline
 //!
 //! 1. [`preprocess`](preprocess::preprocess) — resize/normalize/pad to 488².
-//! 2. the CNN + attention decoder forward pass — see [`model`].
+//! 2. the forward pass — [`backbone`] (PP-LCNet + CSP-PAN) → [`head`] (attention
+//!    GRU decoder) → structure probabilities + cell boxes; orchestrated by
+//!    [`model::SlaNet`].
 //! 3. [`decode`](decode::decode) — argmax token stream + per-`<td>` boxes.
 //! 4. [`adapt_slanet_plus`](preprocess::adapt_slanet_plus) — box rescale.
 //! 5. [`TableMatch`](crate::matching::TableMatch) — splice OCR text into HTML.
 //!
-//! Only step 2's exact layer wiring depends on inspecting the real weight tensor
-//! shapes; [`model::SlaNet`] carries the architecture skeleton and weight-loading
-//! entry point, and returns [`Error::ModelUnavailable`] until wired against real
-//! weights. Everything else runs today.
+//! [`model::SlaNet`] loads real weights and runs the full forward pass. When the
+//! weight file is absent it returns [`Error::ModelUnavailable`] so the pipeline
+//! degrades gracefully; all pure pre/post-processing runs unconditionally.
 
+pub mod backbone;
 pub mod decode;
+pub mod head;
 pub mod model;
 pub mod preprocess;
 pub mod vocab;

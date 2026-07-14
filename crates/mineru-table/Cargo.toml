@@ -9,6 +9,9 @@ description = "Table recognition for MinerU: wired/wireless classification (PP-L
 
 [dependencies]
 mineru-types = { workspace = true }
+# Shared Burn harness: weight loading (safetensors/pth via burn-store) and the
+# PyTorch-layout NN primitives the hand-ported SLANet-plus model reuses.
+mineru-burn-common = { workspace = true }
 # Burn core with the ndarray CPU backend, mirroring mineru-burn-common so both
 # crates agree on the backend and no GPU toolchain is required.
 burn = { workspace = true, features = ["ndarray"] }

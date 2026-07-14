@@ -40,6 +40,11 @@ pub enum Error {
     /// A structure-token stream could not be decoded (e.g. empty or malformed).
     #[error("failed to decode table structure: {0}")]
     Decode(String),
+
+    /// Loading model weights from a file failed (missing/corrupt file, or a
+    /// key/shape mismatch against the module under the strict coverage check).
+    #[error("failed to load model weights: {0}")]
+    WeightLoad(String),
 }
 
 /// Convenience alias used throughout the crate.
