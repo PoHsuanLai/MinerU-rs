@@ -3925,6 +3925,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "mineru-backend-hybrid",
  "mineru-backend-pipeline",
  "mineru-backend-vlm",
  "mineru-burn-common",
@@ -3943,6 +3944,22 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "mineru-backend-hybrid"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "image",
+ "mineru-backend-pipeline",
+ "mineru-layout",
+ "mineru-pdf",
+ "mineru-types",
+ "mineru-vlm-client",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

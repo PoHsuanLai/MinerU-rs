@@ -34,6 +34,8 @@ pipeline = [
 ]
 # External OpenAI-compatible VLM backend + its client.
 vlm = ["dep:mineru-vlm-client", "dep:mineru-backend-vlm"]
+# Hybrid backend: pipeline layout drives per-region VLM extraction (needs both).
+hybrid = ["pipeline", "vlm", "dep:mineru-backend-hybrid"]
 
 # Individual model crates, so a downstream user can pull just one.
 burn-common = ["dep:mineru-burn-common"]
@@ -61,6 +63,7 @@ mineru-formula = { workspace = true, optional = true }
 mineru-backend-pipeline = { workspace = true, optional = true }
 mineru-vlm-client = { workspace = true, optional = true }
 mineru-backend-vlm = { workspace = true, optional = true }
+mineru-backend-hybrid = { workspace = true, optional = true }
 
 # Binary-only deps — optional, pulled in by the `cli` feature.
 clap = { workspace = true, optional = true }

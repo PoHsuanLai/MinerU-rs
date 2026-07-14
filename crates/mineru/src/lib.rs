@@ -20,6 +20,8 @@
 //! - **`vlm`** — the OpenAI-compatible VLM backend ([`vlm_client`], [`backend::vlm`]).
 //! - **`pipeline`** — the fully-local Burn pipeline backend ([`backend::pipeline`])
 //!   and every model it composes (implies `ocr`, `layout`, `table`, `formula`).
+//! - **`hybrid`** — the hybrid backend ([`backend::hybrid`]): pipeline layout drives
+//!   per-region VLM extraction (implies `pipeline` + `vlm`).
 //! - **`ocr`**, **`layout`**, **`table`**, **`formula`**, **`burn_common`** — pull a
 //!   single model crate.
 //! - **`cli`** (default) — builds the `mineru` binary; implies `pipeline` + `vlm`.
@@ -81,4 +83,8 @@ pub mod backend {
     /// External VLM backend (re-export of `mineru-backend-vlm`; feature `vlm`).
     #[cfg(feature = "vlm")]
     pub use mineru_backend_vlm as vlm;
+    /// Hybrid backend: pipeline layout drives per-region VLM extraction
+    /// (re-export of `mineru-backend-hybrid`; feature `hybrid`).
+    #[cfg(feature = "hybrid")]
+    pub use mineru_backend_hybrid as hybrid;
 }

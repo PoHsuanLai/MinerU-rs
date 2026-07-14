@@ -1,0 +1,23 @@
+[package]
+name = "mineru-backend-hybrid"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Hybrid backend for MinerU: drives region detection with the local pipeline layout model, extracts each region's content with the VLM client, and post-fills text with the pipeline OCR models."
+
+[dependencies]
+mineru-types = { workspace = true }
+mineru-vlm-client = { workspace = true }
+mineru-backend-pipeline = { workspace = true }
+mineru-layout = { workspace = true }
+mineru-pdf = { workspace = true }
+
+image = { version = "0.25", default-features = false }
+async-trait = "0.1"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
