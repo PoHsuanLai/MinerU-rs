@@ -98,6 +98,27 @@ impl<B: Backend> LayoutModel<B> {
         Ok(Self::new(model, device))
     }
 
+    /// Preprocesses an image into the `[1, 3, 800, 800]` input tensor (parity hook).
+    ///
+    /// Exposes the resize + `/255` rescale path so a test can diff it against the
+    /// Python reference input. `#[doc(hidden)]` — not part of the inference API.
+    #[doc(hidden)]
+    pub fn preprocess_input(&self, image: &RgbImage) -> Result<burn::tensor::Tensor<B, 4>> {
+        let (pixel_values, _) = preprocess::preprocess::<B>(image, &self.device)?;
+        Ok(pixel_values)
+    }
+
+    /// Runs the forward pass, returning every intermediate stage (parity hook).
+    ///
+    /// `#[doc(hidden)]` — exposed only for the `#[ignore]`d numerical parity test.
+    #[doc(hidden)]
+    pub fn forward_stages(
+        &self,
+        pixel_values: burn::tensor::Tensor<B, 4>,
+    ) -> model::ForwardStages<B> {
+        self.model.forward_stages(pixel_values)
+    }
+
     /// Runs detection on one image, returning reading-order-sorted detections.
     ///
     /// # Errors

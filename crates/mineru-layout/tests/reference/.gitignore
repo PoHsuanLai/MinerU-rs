@@ -1,0 +1,3 @@
+# Regenerable Python reference dumps (see py_ref_layout.py). Not committed.
+*.bin
+*.shape

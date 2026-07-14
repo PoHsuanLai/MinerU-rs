@@ -42,6 +42,28 @@ pub struct RawOutputs<B: Backend> {
     pub order_logits: Tensor<B, 3>,
 }
 
+/// Per-stage activations captured for numerical parity testing.
+///
+/// Mirrors the tensors the Python reference dumper (`py_ref_layout.py`) writes: the
+/// three backbone feature maps, the three `encoder_input_proj` outputs, the three
+/// hybrid-encoder fused maps, and the final decoder/reading-order tensors. Exposed
+/// only for the `#[ignore]`d parity test — not part of the inference API.
+#[doc(hidden)]
+pub struct ForwardStages<B: Backend> {
+    /// HGNetV2 stage2/3/4 maps, channels `[512, 1024, 2048]` (low→high stride).
+    pub backbone: [Tensor<B, 4>; 3],
+    /// `encoder_input_proj` outputs (1×1 conv + BN → 256-ch), per level.
+    pub proj: [Tensor<B, 4>; 3],
+    /// Hybrid-encoder fused maps (AIFI + CCFM), all 256-ch, per level.
+    pub encoder: [Tensor<B, 4>; 3],
+    /// Final-layer decoder class logits `[B, Q, num_labels]`.
+    pub logits: Tensor<B, 3>,
+    /// Final-layer decoder boxes `[B, Q, 4]`, cxcywh in `[0, 1]`.
+    pub pred_boxes: Tensor<B, 3>,
+    /// Reading-order pairwise logits `[B, Q, Q]`.
+    pub order_logits: Tensor<B, 3>,
+}
+
 impl<B: Backend> PpDocLayoutV2<B> {
     /// Initialises the whole graph with zeroed parameters (overwritten by loading).
     pub fn init(device: &B::Device) -> Self {
@@ -76,8 +98,12 @@ impl<B: Backend> PpDocLayoutV2<B> {
             last_hidden: _,
         } = self.decoder.forward(encoder_maps);
 
-        // Reading-order pre-processing (mirrors the reference forward).
-        let order_logits = self.run_reading_order(&logits, &pred_boxes);
+        // Threshold-sort the queries and run the reading-order head. Returns the
+        // logits/boxes reordered onto the SAME query axis as `order_logits`, which
+        // is what the reference `PPDocLayoutV2ForObjectDetection.forward` returns
+        // and what the postprocessor's shared topk/gather over the three tensors
+        // requires (see `sort_and_read_order`).
+        let (logits, pred_boxes, order_logits) = self.sort_and_read_order(logits, pred_boxes);
 
         RawOutputs {
             logits,
@@ -86,20 +112,74 @@ impl<B: Backend> PpDocLayoutV2<B> {
         }
     }
 
-    /// Reproduces the box filtering/sorting the reference does before calling the
-    /// reading-order head, then runs it.
+    /// Runs the forward pass, capturing every intermediate stage for parity testing.
     ///
-    /// The reference: from the raw cxcywh boxes it computes xyxy×1000 clamped to
-    /// `[0,1000]`, takes the argmax class + its sigmoid prob, applies per-class
-    /// thresholds to build a keep mask, argsorts the mask descending (a stable
-    /// partition that floats kept queries to the front), reorders boxes/labels,
-    /// zeroes the dropped slots, remaps labels through `CLASS_ORDER`, and feeds
-    /// the head. The returned order logits are the `[:, :, :num_queries]` slice.
-    fn run_reading_order(&self, logits: &Tensor<B, 3>, pred_boxes: &Tensor<B, 3>) -> Tensor<B, 3> {
+    /// Same computation as [`Self::forward`] but returns the backbone maps, the
+    /// `encoder_input_proj` outputs, the hybrid-encoder maps, and the final tensors
+    /// so a test can diff each stage against the Python reference. `#[doc(hidden)]`
+    /// and not part of the inference API.
+    #[doc(hidden)]
+    pub fn forward_stages(&self, pixel_values: Tensor<B, 4>) -> ForwardStages<B> {
+        let [f0, f1, f2] = self.backbone.forward(pixel_values);
+        let backbone = [f0.clone(), f1.clone(), f2.clone()];
+
+        let proj = [
+            self.encoder_input_proj[0].forward(f0),
+            self.encoder_input_proj[1].forward(f1),
+            self.encoder_input_proj[2].forward(f2),
+        ];
+        let encoder_maps = self.encoder.forward(proj.clone());
+
+        let DecoderOutput {
+            logits,
+            pred_boxes,
+            last_hidden: _,
+        } = self.decoder.forward(encoder_maps.clone());
+
+        let (logits, pred_boxes, order_logits) = self.sort_and_read_order(logits, pred_boxes);
+
+        ForwardStages {
+            backbone,
+            proj,
+            encoder: encoder_maps,
+            logits,
+            pred_boxes,
+            order_logits,
+        }
+    }
+
+    /// Reproduces the threshold sort the reference does, reorders the decoder
+    /// `logits`/`pred_boxes` onto that query axis, and runs the reading-order head.
+    ///
+    /// The reference (`PPDocLayoutV2ForObjectDetection.forward`): from the raw
+    /// cxcywh boxes it takes the argmax class + its sigmoid prob, applies per-class
+    /// thresholds to build a keep mask, argsorts the mask descending so kept queries
+    /// float to the front, and reorders `logits`, `pred_boxes`, the xyxy boxes, and
+    /// the class ids by that SAME permutation. The xyxy boxes are zeroed on dropped
+    /// slots, labels remapped through `CLASS_ORDER`, and fed to the head; the order
+    /// logits are the `[:, :, :num_queries]` slice.
+    ///
+    /// All three returned tensors (`logits`, `pred_boxes`, `order_logits`) share one
+    /// query axis, which the postprocessor relies on: it runs a single topk over the
+    /// flattened logit scores and gathers boxes and order sequences by that index.
+    ///
+    /// The permutation is a *stable* descending partition (kept queries first in
+    /// original order, then dropped in original order). PyTorch's `argsort(
+    /// descending=True)` is non-stable and its exact tie-break is implementation
+    /// defined and not reproducible across backends; since the reorder is purely a
+    /// consistent relabelling of the query axis (the postprocessor is invariant to
+    /// it), the stable partition is the reproducible canonical form. The reference
+    /// dumper emits its `logits`/`pred_boxes` under the same stable sort so the
+    /// parity comparison is well defined.
+    fn sort_and_read_order(
+        &self,
+        logits: Tensor<B, 3>,
+        pred_boxes: Tensor<B, 3>,
+    ) -> (Tensor<B, 3>, Tensor<B, 3>, Tensor<B, 3>) {
         let device = logits.device();
         let [bsz, num_q, num_cls] = logits.dims();
 
-        // xyxy×1000 clamped.
+        // xyxy×1000 clamped (reading-order head input).
         let centers = pred_boxes.clone().narrow(2, 0, 2);
         let sizes = pred_boxes.clone().narrow(2, 2, 2);
         let x0y0 = centers.clone().sub(sizes.clone().mul_scalar(0.5));
@@ -118,12 +198,17 @@ impl<B: Backend> PpDocLayoutV2<B> {
         let keep = probs.greater_equal(thresholds); // bool [B,Q]
         let keep_f = keep.clone().float();
 
-        // argsort(keep descending) — kept slots first, stable within.
-        let order = keep.clone().int().argsort(1).flip([1]); // descending via reverse of ascending
-        // NOTE: argsort is ascending; flipping gives keep=1 first but reverses the
-        // stable order within each group. The reference uses descending stable
-        // sort; see fidelity note in weights/postprocess docs.
+        // Stable descending keep-first permutation, computed on CPU because Burn's
+        // `argsort` is unstable (it would scramble the dropped-query block, which
+        // matters once we reorder `logits`/`pred_boxes` whose dropped slots are not
+        // zeroed).
+        let order = stable_keep_first_order::<B>(&keep, &device); // [B,Q]
 
+        // Reorder the returned decoder outputs onto the sorted query axis.
+        let sorted_logits = gather_rows_f::<B>(logits, order.clone(), num_cls);
+        let sorted_pred_boxes = gather_rows_f::<B>(pred_boxes, order.clone(), 4);
+
+        // Reading-order head inputs, on the same axis.
         let sorted_boxes = gather_rows_f::<B>(boxes_xyxy, order.clone(), 4);
         let sorted_class = gather_scalar::<B>(class_ids, order.clone());
         let sorted_keep = gather_scalar_f::<B>(keep_f, order);
@@ -135,12 +220,35 @@ impl<B: Backend> PpDocLayoutV2<B> {
         let masked_class = sorted_class.mul(sorted_keep_i); // zero where dropped
         let ro_labels = remap_class_order::<B>(&masked_class, &device);
 
-        let _ = num_cls;
         // The head's keep mask is the *unsorted* mask in the reference; it only
         // uses its row-sum (per-batch count), which is order-invariant, so the
         // sorted mask is equivalent for counting.
-        self.reading_order.forward(pad_boxes, ro_labels, sorted_keep)
+        let order_logits = self.reading_order.forward(pad_boxes, ro_labels, sorted_keep);
+        (sorted_logits, sorted_pred_boxes, order_logits)
     }
+}
+
+/// Builds the stable descending keep-first permutation `[B, Q]`: for each batch
+/// row, kept queries (`keep == true`) first in ascending original-index order,
+/// then dropped queries in ascending original-index order.
+///
+/// Matches PyTorch `argsort(keep.int(), dim=1, descending=True, stable=True)`.
+/// Computed on the host because Burn's tensor `argsort` is unstable.
+fn stable_keep_first_order<B: Backend>(keep: &Tensor<B, 2, burn::tensor::Bool>, device: &B::Device) -> Tensor<B, 2, Int> {
+    let [bsz, num_q] = keep.dims();
+    let flags = keep
+        .clone()
+        .int()
+        .into_data()
+        .into_vec::<i64>()
+        .unwrap_or_else(|_| vec![0; bsz * num_q]);
+    let mut order: Vec<i64> = Vec::with_capacity(bsz * num_q);
+    for b in 0..bsz {
+        let row = &flags[b * num_q..(b + 1) * num_q];
+        order.extend((0..num_q).filter(|&q| row[q] != 0).map(|q| q as i64));
+        order.extend((0..num_q).filter(|&q| row[q] == 0).map(|q| q as i64));
+    }
+    Tensor::<B, 1, Int>::from_data(TensorData::new(order, [bsz * num_q]), device).reshape([bsz, num_q])
 }
 
 /// Gathers per-query thresholds `[B, Q]` from `CLASS_THRESHOLDS` via class ids.
