@@ -53,11 +53,16 @@
 //!   round-trip). The public client exposes no external-layout entry point, and
 //!   this crate may not modify `mineru-vlm-client`. Behavior is equivalent for
 //!   single-region crops; it is *not* batched and re-runs a tiny layout per crop.
-//! - **Effort `high`**: shares the same per-region extraction path as `medium`
-//!   rather than the Python `batch_two_step_extract`. The observable difference the
-//!   port preserves is the image-analysis branch; the internal two-step vs.
-//!   layout-driven distinction is collapsed because both go through the same public
-//!   `extract_page`.
+//! - **Effort `high`**: fully ported. The `high` path runs the VLM's own full-page
+//!   two-step layout+extraction over the whole page (the Python
+//!   `batch_two_step_extract`), then maps the resulting VLM blocks back onto regions
+//!   and applies the pipeline `doc_title` title split — distinct from `medium`, which
+//!   drives per-region extraction from the pipeline layout. See
+//!   [`analyze::HybridBackend`] for the two branches. The full-page call reuses the
+//!   public `extract_page` (the same seam the pure-VLM backend uses), so the *only*
+//!   piece not reproduced is the Python `high`-path OCR-det/formula sidecars
+//!   (`_apply_vlm_ocr_det_sidecars_for_window`, `_process_ocr_and_formulas`), which
+//!   are the same enrichment extras deferred for `medium` below.
 //! - **Formula pipeline extras**: inline-formula masking for OCR-det, MFR formula
 //!   recognition sidecars, table-orientation classification, and cross-page table
 //!   merging (`_process_ocr_and_formulas`, `_apply_medium_table_orientation_labels`,

@@ -26,6 +26,24 @@
 //! per-region VLM extraction reuses [`VlmClient::extract_page`] on each region crop
 //! (the only public extraction entry point), rather than the reference client's
 //! `batch_extract_with_layout` which accepts external layout blocks directly.
+//!
+//! # Effort branching (`medium` vs `high`)
+//!
+//! The two efforts diverge in **how the VLM is driven**, mirroring the Python
+//! `hybrid_analyze.py` `doc_analyze` effort branch:
+//!
+//! - [`Effort::Medium`] → [`HybridBackend::analyze_page_medium`]: the pipeline layout
+//!   detects regions and *drives* extraction — each region crop is sent to the VLM
+//!   (`batch_extract_with_layout`, where the pipeline layout is the external block
+//!   list). The VLM never runs its own layout.
+//! - [`Effort::High`] → [`HybridBackend::analyze_page_high`]: the VLM runs its **own**
+//!   full-page two-step layout+extraction over the whole page
+//!   (`batch_two_step_extract`); the pipeline layout is used *only* to collect
+//!   `doc_title` boxes for the title-split pass, not to drive extraction. This is the
+//!   defining behavioral difference the Python `high` effort adds.
+//!
+//! Both paths then feed the **same** [`HybridAssembler`], so the layout-`doc_title`
+//! title split (`_apply_layout_title_split`) applies identically to either.
 
 use async_trait::async_trait;
 use image::{imageops::crop_imm, RgbImage};
@@ -36,7 +54,7 @@ use mineru_pdf::{PdfiumLibrary, RenderOptions};
 use mineru_types::{
     Backend, BackendError, BBox, DocInput, Document, Page, PageSize, ParseOptions,
 };
-use mineru_vlm_client::{VlmClient, VlmClientConfig};
+use mineru_vlm_client::{VlmClient, VlmClientConfig, VlmPage};
 
 use crate::assemble::{DocTitleBoxes, ExtractedRegion, HybridAssembler};
 use crate::effort::Effort;
@@ -47,6 +65,32 @@ use crate::label_map::VlmType;
 ///
 /// Mirrors `OcrConfidence.min_confidence` in the Python `_apply_post_ocr`.
 const OCR_MIN_CONFIDENCE: f32 = 0.6;
+
+/// The VLM extraction seam the hybrid backend drives.
+///
+/// A one-method abstraction over the full-page two-step VLM call. The production
+/// implementation is [`VlmClient`]; tests substitute a fake so the two effort paths
+/// can be exercised without a live server (the same seam the sibling backends lack —
+/// introduced here because the `high` path's routing is what needs verifying).
+///
+/// Both efforts call [`extract_page`](VlmExtractor::extract_page); they differ only
+/// in *what image* they pass it — a single region crop (`medium`) versus the whole
+/// page (`high`) — which is exactly the Python `batch_extract_with_layout` vs
+/// `batch_two_step_extract` distinction expressed through the public client's only
+/// extraction entry point.
+#[async_trait]
+trait VlmExtractor: Send + Sync {
+    /// Runs the VLM's two-step layout+extraction over `image`, honoring
+    /// `image_analysis` for image/chart bodies.
+    async fn extract_page(&self, image: &RgbImage, image_analysis: bool) -> Result<VlmPage>;
+}
+
+#[async_trait]
+impl VlmExtractor for VlmClient {
+    async fn extract_page(&self, image: &RgbImage, image_analysis: bool) -> Result<VlmPage> {
+        Ok(VlmClient::extract_page(self, image, image_analysis).await?)
+    }
+}
 
 /// The hybrid parsing backend.
 ///
@@ -122,7 +166,7 @@ impl HybridBackend {
             let point_size = doc.page_size(index)?;
             let image = doc.render_page(index, &render)?.into_inner();
             let page = self
-                .analyze_page(index, point_size, &image, effective_image_analysis)
+                .analyze_page(&self.client, index, point_size, &image, effective_image_analysis)
                 .await?;
             pages.push(page);
         }
@@ -130,10 +174,15 @@ impl HybridBackend {
         Ok(Document { pages })
     }
 
-    /// Runs layout → per-region VLM extraction → post-OCR fill → assembly for one
-    /// already-rasterized page.
+    /// Runs one already-rasterized page through the effort-appropriate path.
+    ///
+    /// Both efforts detect the pipeline layout first — `medium` uses it to *drive*
+    /// extraction, `high` uses only its `doc_title` boxes for the title split — then
+    /// feed the shared [`HybridAssembler`]. This is the Rust analogue of the
+    /// `doc_analyze` effort branch (`hybrid_analyze.py:965-1035`).
     async fn analyze_page(
         &self,
+        client: &impl VlmExtractor,
         index: usize,
         point_size: PageSize,
         image: &RgbImage,
@@ -141,7 +190,8 @@ impl HybridBackend {
     ) -> Result<Page> {
         let scale = self.scale();
 
-        // 1. Layout drives everything; with no layout model the page is empty.
+        // 1. Layout: `medium` extracts per detected region; `high` uses it only for
+        //    the doc-title boxes that drive the title split.
         let dets = match &self.models.layout {
             Some(layout) => layout.detect(image)?,
             None => {
@@ -150,7 +200,8 @@ impl HybridBackend {
             }
         };
 
-        // Collect pipeline doc_title boxes (page pixels) for the title-split pass.
+        // Collect pipeline doc_title boxes (page pixels) for the title-split pass —
+        // used by *both* efforts (`_collect_layout_doc_title_bboxes`).
         let doc_titles = DocTitleBoxes(
             dets.iter()
                 .filter(|d| d.label == LayoutLabel::DocTitle)
@@ -158,15 +209,18 @@ impl HybridBackend {
                 .collect(),
         );
 
-        // 2 + 3. Route each region to a VLM type and extract its content.
-        let mut regions = Vec::with_capacity(dets.len());
-        for det in dets {
-            if let Some(region) = self.extract_region(det, image, image_analysis).await {
-                regions.push(region);
-            }
-        }
+        // 2 + 3. Extract regions, branching on effort. `medium` re-uses the pipeline
+        //    layout as the block list; `high` lets the VLM run its own full-page
+        //    layout and maps the resulting blocks back to regions.
+        let mut regions = if self.effort.vlm_runs_own_layout() {
+            self.extract_regions_high(client, image, image_analysis).await
+        } else {
+            self.extract_regions_medium(client, dets, image, image_analysis)
+                .await
+        };
 
-        // 4. Post-OCR fill for empty text regions.
+        // 4. Post-OCR fill for empty text regions (`_apply_post_ocr`). Applies to
+        //    either effort's regions.
         self.post_ocr_fill(&mut regions, image);
 
         // Rescale region boxes from page pixels to page points for the Document.
@@ -174,7 +228,7 @@ impl HybridBackend {
             region.bbox = scale_bbox(region.bbox, 1.0 / scale);
         }
 
-        // 5. Assemble.
+        // 5. Assemble, applying the layout-doc_title title split to both efforts.
         let doc_titles = DocTitleBoxes(
             doc_titles
                 .0
@@ -192,6 +246,53 @@ impl HybridBackend {
         })
     }
 
+    /// **Medium effort**: the pipeline layout drives per-region VLM extraction.
+    ///
+    /// Each detected region is routed to a [`VlmType`] and its content extracted from
+    /// its own crop — the Python `batch_extract_with_layout` shape, where the
+    /// pipeline layout is the external block list and the VLM never runs its own
+    /// layout pass.
+    async fn extract_regions_medium(
+        &self,
+        client: &impl VlmExtractor,
+        dets: Vec<LayoutDet>,
+        image: &RgbImage,
+        image_analysis: bool,
+    ) -> Vec<ExtractedRegion> {
+        let mut regions = Vec::with_capacity(dets.len());
+        for det in dets {
+            if let Some(region) = self.extract_region(client, det, image, image_analysis).await {
+                regions.push(region);
+            }
+        }
+        regions
+    }
+
+    /// **High effort**: the VLM runs its own full-page two-step layout+extraction.
+    ///
+    /// This is the Python `batch_two_step_extract` path (`hybrid_analyze.py:1005-1033`):
+    /// the *whole page* image is handed to the VLM, which detects its own layout and
+    /// extracts each block, and the pipeline layout is used only for the downstream
+    /// title split. The resulting VLM blocks are mapped back onto [`ExtractedRegion`]s
+    /// (via [`VlmType::from_prompt_label`]) so they flow through the same assembler as
+    /// the medium regions. A VLM failure yields no regions for the page (the assembler
+    /// then emits an empty page), matching the Python leaving `window_model_list`
+    /// empty on error.
+    async fn extract_regions_high(
+        &self,
+        client: &impl VlmExtractor,
+        image: &RgbImage,
+        image_analysis: bool,
+    ) -> Vec<ExtractedRegion> {
+        match client.extract_page(image, image_analysis).await {
+            Ok(page) => vlm_page_to_regions(page),
+            Err(e) => {
+                tracing::warn!(error = %e, "hybrid high-effort full-page VLM extraction failed");
+                Vec::new()
+            }
+        }
+    }
+
     /// Routes one layout detection to a [`VlmType`] and extracts its content.
     ///
     /// Returns `None` for regions the Python skips (`inline_formula`, the reference
@@ -200,6 +301,7 @@ impl HybridBackend {
     /// (matching the client's `skip_extraction`).
     async fn extract_region(
         &self,
+        client: &impl VlmExtractor,
         det: LayoutDet,
         image: &RgbImage,
         image_analysis: bool,
@@ -211,7 +313,7 @@ impl HybridBackend {
         let is_seal = VlmType::visual_sub_type(det.label).is_some();
 
         let content = if self.should_send_to_vlm(vlm_type, image_analysis) {
-            self.vlm_extract(det.bbox, image, image_analysis).await
+            self.vlm_extract(client, det.bbox, image, image_analysis).await
         } else {
             None
         };
@@ -251,9 +353,15 @@ impl HybridBackend {
     /// "pipeline decides *where*, VLM decides *what*" contract while staying within
     /// `mineru-vlm-client`'s public surface. A VLM error yields `None`, leaving the
     /// region to the post-OCR fill.
-    async fn vlm_extract(&self, bbox: BBox, image: &RgbImage, image_analysis: bool) -> Option<String> {
+    async fn vlm_extract(
+        &self,
+        client: &impl VlmExtractor,
+        bbox: BBox,
+        image: &RgbImage,
+        image_analysis: bool,
+    ) -> Option<String> {
         let crop = crop_region(image, &bbox)?.0;
-        match self.client.extract_page(&crop, image_analysis).await {
+        match client.extract_page(&crop, image_analysis).await {
             Ok(page) => reduce_crop_content(page),
             Err(e) => {
                 tracing::warn!(error = %e, "hybrid VLM region extraction failed");
@@ -356,6 +464,39 @@ fn reduce_crop_content(page: mineru_vlm_client::VlmPage) -> Option<String> {
     (!joined.trim().is_empty()).then_some(joined)
 }
 
+/// Maps a full-page VLM result (the `high`-effort `batch_two_step_extract` output)
+/// into the assembler's [`ExtractedRegion`]s.
+///
+/// The VLM emits blocks with **normalized** `0..1` boxes and label strings; this
+/// denormalizes each box to page pixels (the space the assembler and doc-title boxes
+/// share), routes the label back to a [`VlmType`] via [`VlmType::from_prompt_label`],
+/// and assigns reading order from the emitted block order (the VLM returns blocks in
+/// reading order, matching the pure-VLM assembler's assumption). Blocks whose label
+/// routes to [`VlmType::Skipped`] are dropped, mirroring the pure-VLM assembler's
+/// "unrecognized label is ignored" fallback. The `seal` sub_type the VLM may report
+/// is preserved on the region so it survives the assembler's discard decision.
+fn vlm_page_to_regions(page: VlmPage) -> Vec<ExtractedRegion> {
+    let (w, h) = (page.width, page.height);
+    page.blocks
+        .into_iter()
+        .enumerate()
+        .filter_map(|(order, block)| {
+            let vlm_type = VlmType::from_prompt_label(&block.label);
+            if !vlm_type.is_extracted() {
+                return None;
+            }
+            let [x0, y0, x1, y1] = block.bbox;
+            Some(ExtractedRegion {
+                bbox: BBox::new(x0 * w, y0 * h, x1 * w, y1 * h),
+                vlm_type,
+                content: block.content,
+                order,
+                is_seal: block.sub_type.as_deref() == Some("seal"),
+            })
+        })
+        .collect()
+}
+
 /// Resolves the `[start, end)` page range from options, clamped to the document.
 /// Mirrors the sibling backends' bounds logic.
 fn page_bounds(page_count: usize, opts: &ParseOptions) -> (usize, usize) {
@@ -400,6 +541,202 @@ fn scale_bbox(bbox: BBox, factor: f32) -> BBox {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mineru_backend_pipeline::PipelineModels;
+    use mineru_vlm_client::{VlmBlock, VlmPage};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A models bundle with no loaded models — enough to drive the effort-routing
+    /// helpers, which touch the VLM seam but not `self.models` on the tested paths.
+    fn empty_models() -> PipelineModels {
+        PipelineModels {
+            layout: None,
+            ocr_det: None,
+            ocr_rec: None,
+            formula: None,
+            table_wireless: None,
+            table_wired: None,
+        }
+    }
+
+    /// A hybrid backend wired to no models, at the given effort.
+    fn backend(effort: Effort) -> HybridBackend {
+        HybridBackend::new(VlmClientConfig::default(), empty_models(), effort)
+    }
+
+    /// A fake VLM that records how it was called and returns a canned full-page
+    /// result. Used to prove the two-step (full-page) path is taken by `high` and how
+    /// the per-region path is taken by `medium`, without any network.
+    struct FakeVlm {
+        /// The `VlmPage` returned from every `extract_page` call.
+        page: VlmPage,
+        /// Number of `extract_page` calls made.
+        calls: AtomicUsize,
+        /// The `(width, height)` of the last image passed to `extract_page`.
+        last_size: std::sync::Mutex<Option<(u32, u32)>>,
+    }
+
+    impl FakeVlm {
+        fn new(page: VlmPage) -> Self {
+            Self {
+                page,
+                calls: AtomicUsize::new(0),
+                last_size: std::sync::Mutex::new(None),
+            }
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+        fn last_size(&self) -> Option<(u32, u32)> {
+            *self.last_size.lock().unwrap()
+        }
+    }
+
+    #[async_trait]
+    impl VlmExtractor for FakeVlm {
+        async fn extract_page(&self, image: &RgbImage, _image_analysis: bool) -> Result<VlmPage> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_size.lock().unwrap() = Some((image.width(), image.height()));
+            Ok(self.page.clone())
+        }
+    }
+
+    fn vlm_block(label: &str, content: &str, bbox: [f32; 4]) -> VlmBlock {
+        VlmBlock {
+            bbox,
+            label: label.to_owned(),
+            content: Some(content.to_owned()),
+            angle: 0,
+            sub_type: None,
+        }
+    }
+
+    fn full_page(blocks: Vec<VlmBlock>) -> VlmPage {
+        VlmPage { width: 200.0, height: 100.0, blocks }
+    }
+
+    #[tokio::test]
+    async fn high_runs_full_page_two_step_over_whole_page() {
+        // The `high` path must call the VLM exactly once, on the *whole page* image
+        // (not a region crop), reproducing Python's `batch_two_step_extract`.
+        let page = full_page(vec![
+            vlm_block("title", "Doc Title", [0.0, 0.0, 1.0, 0.1]),
+            vlm_block("text", "Body.", [0.0, 0.2, 1.0, 0.4]),
+        ]);
+        let fake = FakeVlm::new(page);
+        let img = RgbImage::new(200, 100);
+
+        let regions = backend(Effort::High)
+            .extract_regions_high(&fake, &img, true)
+            .await;
+
+        assert_eq!(fake.calls(), 1, "high effort makes one full-page VLM call");
+        assert_eq!(
+            fake.last_size(),
+            Some((200, 100)),
+            "high effort sends the whole page, not a crop"
+        );
+        assert_eq!(regions.len(), 2);
+        // Boxes are denormalized to page pixels.
+        assert_eq!(regions[0].vlm_type, VlmType::Title);
+        assert_eq!(regions[0].bbox.x1, 200.0);
+        assert_eq!(regions[0].content.as_deref(), Some("Doc Title"));
+        assert_eq!(regions[1].vlm_type, VlmType::Text);
+    }
+
+    #[tokio::test]
+    async fn high_drops_unrecognized_and_preserves_reading_order() {
+        let page = full_page(vec![
+            vlm_block("text", "second", [0.0, 0.3, 1.0, 0.5]),
+            vlm_block("nonsense", "?", [0.0, 0.0, 1.0, 0.1]),
+            vlm_block("table", "<table></table>", [0.0, 0.6, 1.0, 0.9]),
+        ]);
+        let regions = vlm_page_to_regions(page);
+        // The unrecognized label is dropped; the two survivors keep their emit order.
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[0].vlm_type, VlmType::Text);
+        assert_eq!(regions[0].order, 0);
+        assert_eq!(regions[1].vlm_type, VlmType::Table);
+        assert_eq!(regions[1].order, 2, "order tracks the VLM's emitted index");
+    }
+
+    #[tokio::test]
+    async fn high_carries_seal_sub_type() {
+        let mut block = vlm_block("image", "", [0.0, 0.0, 0.5, 0.5]);
+        block.sub_type = Some("seal".to_owned());
+        let regions = vlm_page_to_regions(full_page(vec![block]));
+        assert_eq!(regions.len(), 1);
+        assert!(regions[0].is_seal);
+    }
+
+    #[tokio::test]
+    async fn high_on_vlm_error_yields_no_regions() {
+        // A failing VLM leaves the page empty rather than fabricating content.
+        struct FailVlm;
+        #[async_trait]
+        impl VlmExtractor for FailVlm {
+            async fn extract_page(&self, _: &RgbImage, _: bool) -> Result<VlmPage> {
+                Err(crate::error::Error::Vlm(mineru_vlm_client::Error::Parse(
+                    "boom".to_owned(),
+                )))
+            }
+        }
+        let img = RgbImage::new(50, 50);
+        let regions = backend(Effort::High)
+            .extract_regions_high(&FailVlm, &img, true)
+            .await;
+        assert!(regions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn medium_extracts_per_region_not_full_page() {
+        // The `medium` path calls the VLM once *per detected region*, each on a crop
+        // — never a single full-page two-step call. Two regions => two VLM calls,
+        // each smaller than the full page.
+        let crop_result = full_page(vec![vlm_block("text", "region text", [0.0, 0.0, 1.0, 1.0])]);
+        let fake = FakeVlm::new(crop_result);
+        let img = RgbImage::new(200, 100);
+
+        let dets = vec![
+            LayoutDet { bbox: BBox::new(0.0, 0.0, 100.0, 40.0), label: LayoutLabel::Text, order: 0, score: 1.0 },
+            LayoutDet { bbox: BBox::new(0.0, 50.0, 100.0, 90.0), label: LayoutLabel::Text, order: 1, score: 1.0 },
+        ];
+        let regions = backend(Effort::Medium)
+            .extract_regions_medium(&fake, dets, &img, false)
+            .await;
+
+        assert_eq!(fake.calls(), 2, "medium effort calls the VLM once per region");
+        // The last call was on a crop, strictly smaller than the 200x100 page.
+        let (w, h) = fake.last_size().expect("a crop was sent");
+        assert!(w < 200 && h < 100, "medium sends region crops, not the full page");
+        assert_eq!(regions.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn effort_selects_distinct_paths() {
+        // High makes exactly one full-page call; Medium makes none for zero regions
+        // (proving Medium never issues the single full-page two-step call High does).
+        let fake_high = FakeVlm::new(full_page(vec![vlm_block("text", "x", [0.0, 0.0, 1.0, 1.0])]));
+        let img = RgbImage::new(120, 80);
+        backend(Effort::High).extract_regions_high(&fake_high, &img, true).await;
+        assert_eq!(fake_high.calls(), 1);
+
+        let fake_medium = FakeVlm::new(full_page(vec![]));
+        let no_regions = backend(Effort::Medium)
+            .extract_regions_medium(&fake_medium, Vec::new(), &img, false)
+            .await;
+        assert_eq!(fake_medium.calls(), 0, "medium with no regions makes no VLM call");
+        assert!(no_regions.is_empty());
+    }
+
+    #[test]
+    fn vlm_page_to_regions_denormalizes_boxes() {
+        let page = full_page(vec![vlm_block("text", "t", [0.1, 0.2, 0.6, 0.8])]);
+        let regions = vlm_page_to_regions(page);
+        assert_eq!(regions.len(), 1);
+        let b = regions[0].bbox;
+        assert!((b.x0 - 20.0).abs() < 1e-3 && (b.y0 - 20.0).abs() < 1e-3);
+        assert!((b.x1 - 120.0).abs() < 1e-3 && (b.y1 - 80.0).abs() < 1e-3);
+    }
 
     #[test]
     fn page_bounds_none_is_all_pages() {

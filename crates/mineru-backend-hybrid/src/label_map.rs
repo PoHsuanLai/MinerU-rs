@@ -115,6 +115,39 @@ impl VlmType {
         !matches!(self, VlmType::Skipped)
     }
 
+    /// Maps a VLM block-label string back to a [`VlmType`].
+    ///
+    /// The inverse of [`prompt_label`](VlmType::prompt_label), used by the
+    /// `high`-effort path: the full-page VLM (`batch_two_step_extract`) returns
+    /// blocks tagged with `mineru-vl-utils` `BlockType.value` strings, which we route
+    /// back through the same assembler as the pipeline-driven `medium` regions. Any
+    /// label outside the recognized vocabulary — including `image_block`, which the
+    /// VLM emits as an alias for `image` — is folded to the nearest type;
+    /// truly unknown labels become [`VlmType::Skipped`] so they drop from the tree,
+    /// matching the pure-VLM assembler's "unrecognized label is ignored" fallback.
+    pub fn from_prompt_label(label: &str) -> Self {
+        match label {
+            "text" | "phonetic" => VlmType::Text,
+            "title" => VlmType::Title,
+            "index" => VlmType::Index,
+            "code" | "algorithm" => VlmType::Code,
+            "ref_text" => VlmType::RefText,
+            "aside_text" => VlmType::AsideText,
+            "header" => VlmType::Header,
+            "footer" => VlmType::Footer,
+            "page_number" => VlmType::PageNumber,
+            "page_footnote" => VlmType::PageFootnote,
+            "formula_number" => VlmType::FormulaNumber,
+            "image_caption" | "table_caption" | "code_caption" => VlmType::ImageCaption,
+            "image_footnote" | "table_footnote" => VlmType::ImageFootnote,
+            "image" | "image_block" => VlmType::Image,
+            "chart" => VlmType::Chart,
+            "table" => VlmType::Table,
+            "equation" => VlmType::Equation,
+            _ => VlmType::Skipped,
+        }
+    }
+
     /// The `sub_type` the Python `_apply_medium_visual_sub_type` pins for a `seal`
     /// layout label, else `None`.
     ///
@@ -218,6 +251,43 @@ mod tests {
         assert_eq!(VlmType::visual_sub_type(L::Seal), Some("seal"));
         assert_eq!(VlmType::visual_sub_type(L::Image), None);
         assert_eq!(VlmType::visual_sub_type(L::Chart), None);
+    }
+
+    #[test]
+    fn from_prompt_label_inverts_prompt_label() {
+        // Round-trips every non-skipped type through prompt_label -> from_prompt_label.
+        for ty in [
+            VlmType::Text,
+            VlmType::Title,
+            VlmType::Index,
+            VlmType::Code,
+            VlmType::RefText,
+            VlmType::AsideText,
+            VlmType::Header,
+            VlmType::Footer,
+            VlmType::PageNumber,
+            VlmType::PageFootnote,
+            VlmType::FormulaNumber,
+            VlmType::ImageCaption,
+            VlmType::ImageFootnote,
+            VlmType::Image,
+            VlmType::Chart,
+            VlmType::Table,
+            VlmType::Equation,
+        ] {
+            assert_eq!(VlmType::from_prompt_label(ty.prompt_label()), ty);
+        }
+    }
+
+    #[test]
+    fn from_prompt_label_folds_aliases_and_unknowns() {
+        // Aliases the full-page VLM can emit fold to their canonical type.
+        assert_eq!(VlmType::from_prompt_label("image_block"), VlmType::Image);
+        assert_eq!(VlmType::from_prompt_label("algorithm"), VlmType::Code);
+        assert_eq!(VlmType::from_prompt_label("table_caption"), VlmType::ImageCaption);
+        // Truly unknown labels drop out of the tree.
+        assert_eq!(VlmType::from_prompt_label("nonsense"), VlmType::Skipped);
+        assert_eq!(VlmType::from_prompt_label(""), VlmType::Skipped);
     }
 
     #[test]
