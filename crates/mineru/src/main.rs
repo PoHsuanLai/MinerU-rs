@@ -34,7 +34,7 @@ async fn main() -> anyhow::Result<()> {
         url: args.vlm_url.clone(),
         model: args.vlm_model.clone(),
     };
-    let backend = build_backend(args.backend, &config, &vlm);
+    let backend = build_backend(args.backend, &config, &vlm)?;
     let (md, json) = run::run_parse(backend.as_ref(), input, &args.output, &opts, mode).await?;
     println!("wrote {}", md.display());
     println!("wrote {}", json.display());

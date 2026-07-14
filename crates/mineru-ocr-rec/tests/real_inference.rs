@@ -20,13 +20,21 @@ use mineru_ocr_rec::{CharDict, RecConfig, TextRecognizer};
 const HF_REPO: &str = "opendatalab/PDF-Extract-Kit-1.0";
 const REC_REL_PATH: &str =
     "models/OCR/paddleocr_torch/ch_PP-OCRv6_small_rec_infer.safetensors";
-const CACHE_DIR: &str = "/Volumes/Archive/mineru/models";
+/// hf-hub download cache dir. Set `MINERU_MODELS_DIR` before running this
+/// `#[ignore]`d test; there is no baked-in machine path.
+fn cache_dir() -> PathBuf {
+    PathBuf::from(
+        std::env::var("MINERU_MODELS_DIR")
+            .expect("set MINERU_MODELS_DIR to a model cache directory"),
+    )
+}
 
 fn download(rel_path: &str) -> PathBuf {
     use hf_hub::api::sync::ApiBuilder;
-    std::fs::create_dir_all(CACHE_DIR).expect("create model cache dir");
+    let cache = cache_dir();
+    std::fs::create_dir_all(&cache).expect("create model cache dir");
     let api = ApiBuilder::new()
-        .with_cache_dir(PathBuf::from(CACHE_DIR))
+        .with_cache_dir(cache)
         .build()
         .expect("hf-hub api");
     api.model(HF_REPO.to_string())
@@ -39,12 +47,9 @@ fn download(rel_path: &str) -> PathBuf {
 fn loads_weights_and_recognizes_without_panic() {
     let weights = download(REC_REL_PATH);
 
-    // The ppocrv6 dict ships alongside the vendored python code; the test expects it
-    // to be present next to the repo checkout. Fall back to a repo-relative copy.
-    let dict_path = PathBuf::from(
-        "/Users/pohsuanlai/Documents/mineru/mineru/mineru/model/utils/pytorchocr/utils/resources/dict/ppocrv6_dict.txt",
-    );
-    let dict = CharDict::from_file(&dict_path, true).expect("load char dict");
+    // The v6 charset is bundled in the crate, so the test uses the embedded
+    // dictionary rather than an external machine-specific path.
+    let dict = CharDict::ppocrv6(true).expect("load embedded char dict");
 
     let device = cpu_device();
     let mut rec = TextRecognizer::<Cpu>::new(dict, RecConfig::default(), device);

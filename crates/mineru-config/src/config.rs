@@ -17,16 +17,6 @@ const ENV_DEVICE_MODE: &str = "MINERU_DEVICE_MODE";
 /// Environment variable overriding [`Config::model_source`].
 const ENV_MODEL_SOURCE: &str = "MINERU_MODEL_SOURCE";
 
-/// Default model directory: where the released model weights live on disk.
-///
-/// The user's main disk is tight, so large model weights live on the Archive
-/// volume by default. This points at the `models/` directory of the
-/// PDF-Extract-Kit-1.0 release (which directly contains `Layout/`, `OCR/`,
-/// `MFR/`, `TabRec/`, …), so the pipeline finds its weights out of the box.
-/// Override with `models_dir` in the config file or the `MINERU_MODELS_DIR`
-/// environment variable.
-const DEFAULT_MODELS_DIR: &str = "/Volumes/Archive/mineru/models/PDF-Extract-Kit-1.0/models";
-
 /// User configuration for the MinerU document parser.
 ///
 /// This is the Rust mirror of Python's `mineru.json`. Construct it with
@@ -39,7 +29,13 @@ pub struct Config {
     pub device: Device,
     /// Where model weights are fetched from.
     pub model_source: ModelSource,
-    /// Directory that caches downloaded model weights.
+    /// Directory holding (or caching) the model weights.
+    ///
+    /// There is no baked-in default machine path: this is resolved from the
+    /// `MINERU_MODELS_DIR` environment variable or the `models_dir` config-file
+    /// key. When neither is set it is empty; callers that need weights should
+    /// check [`Config::models_dir`] and surface a clear "set MINERU_MODELS_DIR"
+    /// error rather than guessing a location.
     pub models_dir: PathBuf,
     /// Base URL of an external OpenAI-compatible VLM server, if any.
     pub vlm_server_url: Option<String>,
@@ -50,7 +46,9 @@ impl Default for Config {
         Self {
             device: Device::default(),
             model_source: ModelSource::default(),
-            models_dir: PathBuf::from(DEFAULT_MODELS_DIR),
+            // No baked-in machine path: resolved from MINERU_MODELS_DIR / the
+            // config file. Empty means "unset" — callers requiring weights error.
+            models_dir: PathBuf::new(),
             vlm_server_url: None,
         }
     }
@@ -135,11 +133,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_models_dir_is_archive_volume() {
-        assert_eq!(
-            Config::default().models_dir,
-            PathBuf::from("/Volumes/Archive/mineru/models/PDF-Extract-Kit-1.0/models")
-        );
+    fn default_models_dir_is_empty_until_set() {
+        // No baked-in machine path: the default is empty and must be provided
+        // via MINERU_MODELS_DIR or the config file.
+        assert_eq!(Config::default().models_dir, PathBuf::new());
     }
 
     #[test]
@@ -205,10 +202,8 @@ mod tests {
         let json = r#"{ "device": "mps" }"#;
         let c: Config = serde_json::from_str(json).unwrap();
         assert_eq!(c.device, Device::Mps);
-        assert_eq!(
-            c.models_dir,
-            PathBuf::from("/Volumes/Archive/mineru/models/PDF-Extract-Kit-1.0/models")
-        );
+        // Unspecified models_dir stays empty (no baked-in machine default).
+        assert_eq!(c.models_dir, PathBuf::new());
         assert_eq!(c.model_source, ModelSource::HuggingFace);
     }
 

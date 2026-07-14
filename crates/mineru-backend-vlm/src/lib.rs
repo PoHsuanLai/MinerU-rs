@@ -157,7 +157,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a live VLM server and a matching libpdfium native library"]
     async fn analyzes_demo_pdf() {
-        let bytes = std::fs::read("/Users/pohsuanlai/Documents/mineru/mineru/demo/pdfs/demo1.pdf")
+        let demo_dir =
+            std::env::var("MINERU_DEMO_DIR").expect("set MINERU_DEMO_DIR to the demo/pdfs directory");
+        let bytes = std::fs::read(std::path::Path::new(&demo_dir).join("demo1.pdf"))
             .expect("demo pdf present");
         let backend = VlmBackend::new(VlmClientConfig::default());
         let doc = backend

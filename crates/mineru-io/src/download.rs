@@ -29,7 +29,7 @@ pub enum ModelSource {
 /// Snapshot-download every file in `repo_id` into `cache_dir`, returning the
 /// local directory that holds the fetched snapshot.
 ///
-/// hf-hub's cache is pointed at `cache_dir` (e.g. `/Volumes/Archive/mineru/models`)
+/// hf-hub's cache is pointed at `cache_dir` (e.g. a large-storage models dir)
 /// via [`ApiBuilder::with_cache_dir`], so downloads and reuse both live there.
 /// The returned path is the directory containing the snapshot's files.
 ///

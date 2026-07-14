@@ -48,7 +48,7 @@ impl ModelPaths {
     /// of the PDF-Extract-Kit-1.0 release.
     ///
     /// `models_dir` is the `models/` directory of the release (e.g.
-    /// `/Volumes/Archive/mineru/models/PDF-Extract-Kit-1.0/models`). All model
+    /// `/path/to/PDF-Extract-Kit-1.0/models`). All model
     /// weights are subpaths of it *except* the OCR character dictionary, which
     /// ships with the application rather than the model download — see
     /// [`ocr_rec_dict`](Self::ocr_rec_dict).

@@ -228,11 +228,9 @@ fn candidate_library_paths() -> Vec<PathBuf> {
     if let Ok(explicit) = std::env::var("MINERU_PDFIUM_LIB_PATH") {
         paths.push(PathBuf::from(explicit));
     }
-    for dir in [
-        "/Volumes/Archive/mineru/lib",
-        "/opt/homebrew/lib",
-        "/usr/local/lib",
-    ] {
+    // Generic cross-machine system locations. Anything machine-specific must
+    // come through MINERU_PDFIUM_LIB_PATH above, not a baked-in path.
+    for dir in ["/opt/homebrew/lib", "/usr/local/lib"] {
         paths.push(PathBuf::from(format!("{dir}/libpdfium.dylib")));
     }
     paths
@@ -243,7 +241,19 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    const DEMO_PDF: &str = "/Users/pohsuanlai/Documents/mineru/mineru/demo/pdfs/demo1.pdf";
+    /// Directory holding the demo PDFs for the `#[ignore]`d native-lib tests.
+    /// Set `MINERU_DEMO_DIR` to the repo's `demo/pdfs/` before running them.
+    fn demo_dir() -> std::path::PathBuf {
+        PathBuf::from(
+            std::env::var("MINERU_DEMO_DIR")
+                .expect("set MINERU_DEMO_DIR to the demo/pdfs directory"),
+        )
+    }
+
+    /// Path to a demo PDF by file name, under [`demo_dir`].
+    fn demo_pdf(name: &str) -> std::path::PathBuf {
+        demo_dir().join(name)
+    }
 
     /// Serializes PDFium use across the parallel test harness (PDFium is not safe
     /// for concurrent access — see the crate-level Threading note).
@@ -280,7 +290,7 @@ mod tests {
     #[ignore = "requires a matching libpdfium native library at runtime"]
     fn opens_counts_and_renders_demo1() {
         let _guard = PDFIUM_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        let bytes = std::fs::read(DEMO_PDF).expect("demo pdf present");
+        let bytes = std::fs::read(demo_pdf("demo1.pdf")).expect("demo pdf present");
         let lib = PdfiumLibrary::load().expect("load pdfium");
         let doc = lib.open(&bytes).expect("open demo pdf");
 
@@ -306,7 +316,7 @@ mod tests {
     #[ignore = "requires a matching libpdfium native library at runtime"]
     fn out_of_range_page_errors() {
         let _guard = PDFIUM_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        let bytes = std::fs::read(DEMO_PDF).expect("demo pdf present");
+        let bytes = std::fs::read(demo_pdf("demo1.pdf")).expect("demo pdf present");
         let lib = PdfiumLibrary::load().expect("load pdfium");
         let doc = lib.open(&bytes).expect("open demo pdf");
         let n = doc.page_count();
@@ -324,7 +334,7 @@ mod tests {
     #[ignore = "requires a matching libpdfium native library at runtime"]
     fn extracts_native_text_from_digital_demo() {
         let _guard = PDFIUM_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        let bytes = std::fs::read(DEMO_PDF).expect("demo pdf present");
+        let bytes = std::fs::read(demo_pdf("demo1.pdf")).expect("demo pdf present");
         let lib = PdfiumLibrary::load().expect("load pdfium");
         let doc = lib.open(&bytes).expect("open demo pdf");
 
@@ -366,8 +376,7 @@ mod tests {
         let _guard = PDFIUM_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let lib = PdfiumLibrary::load().expect("load pdfium");
         for name in ["demo1.pdf", "demo2.pdf", "demo3.pdf", "small_ocr.pdf"] {
-            let path = format!("/Users/pohsuanlai/Documents/mineru/mineru/demo/pdfs/{name}");
-            let bytes = std::fs::read(&path).expect("demo pdf present");
+            let bytes = std::fs::read(demo_pdf(name)).expect("demo pdf present");
             let doc = lib.open(&bytes).expect("open demo pdf");
             let page = doc.extract_text(0).expect("extract text");
             println!(

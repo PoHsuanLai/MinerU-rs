@@ -104,7 +104,7 @@ mod integration_tests {
     ///
     /// ```text
     /// MINERU_VLM_URL=http://localhost:30000/v1 \
-    /// MINERU_MODELS_DIR=/Volumes/Archive/mineru/models/PDF-Extract-Kit-1.0/models \
+    /// MINERU_MODELS_DIR=/path/to/PDF-Extract-Kit-1.0/models \
     /// MINERU_PDFIUM_LIB_PATH=/path/to/libpdfium.dylib \
     ///   cargo test -p mineru-backend-hybrid -- --ignored
     /// ```
@@ -123,7 +123,9 @@ mod integration_tests {
         let models = PipelineModels::load(&models_dir);
         let backend = HybridBackend::new(config, models, Effort::Medium);
 
-        let bytes = std::fs::read("/Users/pohsuanlai/Documents/mineru/mineru/demo/pdfs/demo1.pdf")
+        let demo_dir =
+            std::env::var("MINERU_DEMO_DIR").expect("set MINERU_DEMO_DIR to the demo/pdfs directory");
+        let bytes = std::fs::read(std::path::Path::new(&demo_dir).join("demo1.pdf"))
             .expect("demo pdf present");
         let doc = backend
             .analyze(DocInput::new(bytes), &ParseOptions::default())

@@ -21,13 +21,21 @@ use mineru_ocr_det::{DetConfig, TextDetector};
 const HF_REPO: &str = "opendatalab/PDF-Extract-Kit-1.0";
 const DET_REL_PATH: &str =
     "models/OCR/paddleocr_torch/ch_PP-OCRv6_small_det_infer.safetensors";
-const CACHE_DIR: &str = "/Volumes/Archive/mineru/models";
+/// hf-hub download cache dir. Set `MINERU_MODELS_DIR` before running this
+/// `#[ignore]`d test; there is no baked-in machine path.
+fn cache_dir() -> PathBuf {
+    PathBuf::from(
+        std::env::var("MINERU_MODELS_DIR")
+            .expect("set MINERU_MODELS_DIR to a model cache directory"),
+    )
+}
 
 fn download_weights() -> PathBuf {
     use hf_hub::api::sync::ApiBuilder;
-    std::fs::create_dir_all(CACHE_DIR).expect("create model cache dir");
+    let cache = cache_dir();
+    std::fs::create_dir_all(&cache).expect("create model cache dir");
     let api = ApiBuilder::new()
-        .with_cache_dir(PathBuf::from(CACHE_DIR))
+        .with_cache_dir(cache)
         .build()
         .expect("hf-hub api");
     api.model(HF_REPO.to_string())

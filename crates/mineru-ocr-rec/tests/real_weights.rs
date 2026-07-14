@@ -17,10 +17,9 @@ use std::path::PathBuf;
 use mineru_burn_common::backend::{cpu_device, Cpu};
 use mineru_ocr_rec::{CharDict, RecConfig, TextRecognizer};
 
-/// The PP-OCRv6 CTC output size: 18709 dictionary entries + 1 blank = 18710,
-/// matching `head.head.weight [18710, 120]` in the checkpoint. `CharDict::from_file`
-/// with `add_space = true` must yield this count from the shipped `ppocrv6_dict.txt`.
-const PPOCRV6_DICT: &str = "/Users/pohsuanlai/Documents/mineru/mineru/mineru/model/utils/pytorchocr/utils/resources/dict/ppocrv6_dict.txt";
+// The PP-OCRv6 CTC output size: 18709 dictionary entries + 1 blank = 18710,
+// matching `head.head.weight [18710, 120]` in the checkpoint. The bundled
+// `CharDict::ppocrv6` with `add_space = true` must yield this count.
 
 fn weights_path() -> Option<PathBuf> {
     std::env::var_os("MINERU_OCR_REC_WEIGHTS").map(PathBuf::from)
@@ -34,7 +33,7 @@ fn loads_all_keys_consumed() {
         return;
     };
 
-    let dict = CharDict::from_file(PPOCRV6_DICT, true).expect("load char dict");
+    let dict = CharDict::ppocrv6(true).expect("load embedded char dict");
     let device = cpu_device();
     let mut rec = TextRecognizer::<Cpu>::new(dict, RecConfig::default(), device);
 

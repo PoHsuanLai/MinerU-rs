@@ -5,6 +5,7 @@
 //! best-effort from the config's `models_dir`; the VLM backend wires an HTTP client
 //! to an external server.
 
+use anyhow::{bail, Context};
 use mineru_backend_pipeline::{PipelineBackend, PipelineModels};
 use mineru_backend_vlm::VlmBackend;
 use mineru_config::Config;
@@ -27,18 +28,34 @@ pub struct VlmOverrides {
 
 /// Builds the selected backend as a `Box<dyn Backend>`.
 ///
-/// The pipeline path is infallible (missing weights degrade to skipped stages, per
-/// [`PipelineModels::load`]). The VLM path only wires a client and cannot fail
+/// The pipeline path requires a models directory: it errors clearly if
+/// `config.models_dir` is unset (there is no baked-in machine default — set
+/// `MINERU_MODELS_DIR` or `models_dir` in the config file). Once a directory is
+/// given, missing individual weights degrade to skipped stages per
+/// [`PipelineModels::load`]. The VLM path only wires a client and cannot fail
 /// here — a bad URL surfaces on the first request.
 pub fn build_backend(
     kind: BackendKind,
     config: &Config,
     vlm: &VlmOverrides,
-) -> Box<dyn Backend> {
+) -> anyhow::Result<Box<dyn Backend>> {
     match kind {
         BackendKind::Pipeline => {
-            let models = PipelineModels::load(&config.models_dir);
-            Box::new(PipelineBackend::new(models))
+            if config.models_dir.as_os_str().is_empty() {
+                bail!(
+                    "no model directory configured for the pipeline backend: set \
+                     MINERU_MODELS_DIR (or `models_dir` in the config file) to the \
+                     directory containing the model weights"
+                );
+            }
+            let models_dir = config.models_dir.canonicalize().with_context(|| {
+                format!(
+                    "model directory {} does not exist (set MINERU_MODELS_DIR to a valid path)",
+                    config.models_dir.display()
+                )
+            })?;
+            let models = PipelineModels::load(&models_dir);
+            Ok(Box::new(PipelineBackend::new(models)))
         }
         BackendKind::Vlm => {
             let mut client = VlmClientConfig::default();
@@ -48,7 +65,7 @@ pub fn build_backend(
             if let Some(model) = vlm.model.clone() {
                 client.model = model;
             }
-            Box::new(VlmBackend::new(client))
+            Ok(Box::new(VlmBackend::new(client)))
         }
     }
 }
