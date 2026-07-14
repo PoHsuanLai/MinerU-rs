@@ -17,7 +17,26 @@ mineru-formula = { workspace = true }
 mineru-table = { workspace = true }
 mineru-burn-common = { workspace = true }
 
+# Burn is needed only for its `Backend` trait bound on the generic
+# `PipelineBackend<B>`/`PipelineModels<B>`; the model crates carry the actual
+# backend implementations. `ndarray` for the default CPU backend.
+burn = { workspace = true, features = ["ndarray"] }
+
 image = { version = "0.25", default-features = false }
 async-trait = "0.1"
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[features]
+default = []
+# Opt-in GPU (wgpu) backend for the neural stages (layout/OCR/formula); tables
+# stay on CPU. Forwards to burn and every GPU-capable model crate so a caller can
+# instantiate `PipelineBackend::<mineru_burn_common::Gpu>`.
+gpu = [
+    "burn/wgpu",
+    "mineru-burn-common/gpu",
+    "mineru-layout/gpu",
+    "mineru-ocr-det/gpu",
+    "mineru-ocr-rec/gpu",
+    "mineru-formula/gpu",
+]

@@ -94,7 +94,12 @@ impl<B: Backend> MBartAttention<B> {
             scores = scores + mask;
         }
         let probs = softmax(scores, 3);
-        let ctx = probs.matmul(v); // [B, heads, tgt, head_dim]
+        // ctx = probs @ v, written as `(vᵀ @ probsᵀ)ᵀ`: `v` (from `shape_v`) is a
+        // batch-permuted (`swap_dims(1, 2)`) view, and Burn 0.21's wgpu matmul reads
+        // a batch-permuted right-hand operand with wrong strides. Keeping it on the
+        // left with a last-two-dim transpose on the right avoids the bug (no-op on
+        // CPU). See the matching note in mineru-layout's `encoder.rs`.
+        let ctx = v.swap_dims(2, 3).matmul(probs.swap_dims(2, 3)).swap_dims(2, 3); // [B, heads, tgt, head_dim]
         let ctx = ctx.swap_dims(1, 2).reshape([b, tgt, d]);
         self.out_proj.forward(ctx)
     }

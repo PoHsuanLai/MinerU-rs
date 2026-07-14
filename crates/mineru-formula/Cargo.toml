@@ -30,3 +30,7 @@ regex = "1"
 
 [features]
 default = []
+# Opt-in GPU (wgpu) backend, forwarded to burn and the shared harness. The model
+# types are already generic over the Burn backend; this only makes the `Wgpu`
+# backend and `mineru_burn_common::Gpu` alias available for callers that select it.
+gpu = ["burn/wgpu", "mineru-burn-common/gpu"]

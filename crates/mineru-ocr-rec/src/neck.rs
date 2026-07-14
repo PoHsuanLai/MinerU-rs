@@ -110,8 +110,14 @@ impl<B: Backend> Attention<B> {
         // attn = softmax(q @ k^T * scale).
         let attn = q.matmul(k.swap_dims(2, 3)) * self.scale;
         let attn = softmax(attn, 3);
-        // out = attn @ v -> [b, heads, n, head_dim].
-        let out = attn.matmul(v);
+        // out = attn @ v, written as `(vᵀ @ attnᵀ)ᵀ` (transpose over the last two
+        // dims). `v` here is a permuted/narrowed view whose *batch* dims are not
+        // contiguous; Burn 0.21's wgpu/cubecl batched matmul reads a batch-permuted
+        // **right-hand** operand with the wrong strides (diverges from CPU by a large
+        // margin), whereas keeping the permuted operand on the **left** with only a
+        // last-two-dim transpose on the right matches CPU to float epsilon. No-op on
+        // CPU. See the matching note in mineru-layout's `encoder.rs`.
+        let out = v.swap_dims(2, 3).matmul(attn.swap_dims(2, 3)).swap_dims(2, 3);
         // -> [b, n, c].
         let out = out.swap_dims(1, 2).reshape([b, n, c]);
         self.projection.forward(out)

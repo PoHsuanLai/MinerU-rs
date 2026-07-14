@@ -85,9 +85,9 @@ impl<B: Backend> DecodeStep for ModelStep<'_, B> {
         let logits = self.model.decode(input_ids, self.encoder_hidden.clone()); // [1, T, vocab]
         // Take the last position's logits.
         let last = logits.narrow(1, t - 1, 1).reshape([self.vocab_size]);
-        last.into_data()
-            .to_vec()
-            .unwrap_or_else(|_| vec![0.0; self.vocab_size])
+        // Backend-portable host read: coerce to f32 regardless of the backend's
+        // float storage dtype (see `mineru_burn_common::float_to_vec_f32`).
+        mineru_burn_common::float_to_vec_f32(last)
     }
 }
 
@@ -204,29 +204,30 @@ impl<B: Backend> FormulaRecognizer<B> {
     }
 }
 
-impl FormulaRecognizer<Cpu> {
-    /// Loads a recognizer from a checkpoint directory on the CPU backend.
+impl<B: Backend> FormulaRecognizer<B> {
+    /// Loads a recognizer from a checkpoint directory onto an explicit device.
+    ///
+    /// Backend-generic form of [`FormulaRecognizer::from_pretrained`]: identical
+    /// loading, but on the caller's `device`/backend `B` (e.g. the wgpu GPU).
     ///
     /// Expects `dir` to contain `model.safetensors` and `tokenizer.json`. Weight
     /// loading uses the shared harness with the [`crate::weights::build_remap`]
-    /// rules; `coverage` controls how unmapped keys are treated (start with
-    /// [`Coverage::Lenient`] until the remap is verified against the real file).
+    /// rules; `coverage` controls how unmapped keys are treated.
     ///
     /// # Errors
     /// Returns an error if the tokenizer or weights fail to load. See
     /// [`crate::weights`] for the key-mismatch caveats.
-    pub fn from_pretrained(
+    pub fn from_pretrained_on(
         dir: impl AsRef<std::path::Path>,
         coverage: Coverage,
+        device: B::Device,
     ) -> Result<Self> {
-        use mineru_burn_common::backend::cpu_device;
         use mineru_burn_common::weights::load_weights_ignoring;
 
         let dir = dir.as_ref();
-        let device = cpu_device();
         let config = UniMerNetConfig::small_2503();
 
-        let mut model = UniMerNet::<Cpu>::new(&config, &device);
+        let mut model = UniMerNet::<B>::new(&config, &device);
         let remap = crate::weights::build_remap()?;
         let weights_path = dir.join("model.safetensors");
         // `IGNORED_KEYS` are training-only / recomputed buffers with no inference
@@ -249,6 +250,27 @@ impl FormulaRecognizer<Cpu> {
         }
 
         Ok(Self::new(model, tokenizer, config, device))
+    }
+}
+
+impl FormulaRecognizer<Cpu> {
+    /// Loads a recognizer from a checkpoint directory on the CPU backend.
+    ///
+    /// Expects `dir` to contain `model.safetensors` and `tokenizer.json`. Weight
+    /// loading uses the shared harness with the [`crate::weights::build_remap`]
+    /// rules; `coverage` controls how unmapped keys are treated (start with
+    /// [`Coverage::Lenient`] until the remap is verified against the real file).
+    ///
+    /// # Errors
+    /// Returns an error if the tokenizer or weights fail to load. See
+    /// [`crate::weights`] for the key-mismatch caveats.
+    pub fn from_pretrained(
+        dir: impl AsRef<std::path::Path>,
+        coverage: Coverage,
+    ) -> Result<Self> {
+        use mineru_burn_common::backend::cpu_device;
+
+        Self::from_pretrained_on(dir, coverage, cpu_device())
     }
 }
 

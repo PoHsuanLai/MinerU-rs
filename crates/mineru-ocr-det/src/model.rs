@@ -174,10 +174,11 @@ impl<B: Backend> TextDetector<B> {
             return Err(Error::ProbMapShape(format!("expected [1,1,H,W], got {dims:?}")));
         }
         let (mh, mw) = (dims[2], dims[3]);
-        let data = prob
-            .into_data()
-            .into_vec::<f32>()
-            .map_err(|e| Error::ProbMapShape(format!("prob map not f32: {e:?}")))?;
+        // Host read of the probability map: the post-process (bitmap threshold +
+        // contour tracing in `boxes_from_bitmap`) is host-side over a `Vec`, so the
+        // copy cannot be eliminated. Use the dtype-agnostic helper so it is correct on
+        // backends whose float storage isn't `f32` (e.g. `wgpu`).
+        let data = mineru_burn_common::float_to_vec_f32(prob);
 
         let map = ProbMap {
             data: &data,
@@ -204,9 +205,11 @@ impl<B: Backend> TextDetector<B> {
     #[doc(hidden)]
     pub fn forward_stages(&self, input: Tensor<B, 4>) -> StageDumps {
         let feats = self.net.model.backbone.forward(input);
+        // Dtype-agnostic host read so the parity hook works on any backend's float
+        // storage; library code never panics, so no `.expect`.
         let dump = |t: &Tensor<B, 4>| -> StageDump {
             let d = t.dims();
-            let v = t.clone().into_data().into_vec::<f32>().expect("f32 tensor");
+            let v = mineru_burn_common::float_to_vec_f32(t.clone());
             (v, [d[0], d[1], d[2], d[3]])
         };
         let backbone_dumps: Vec<_> = feats.iter().map(dump).collect();

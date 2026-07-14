@@ -135,7 +135,12 @@ impl<B: Backend> WindowAttention<B> {
         let scores = scores + bias;
 
         let probs = softmax(scores, 3);
-        let context = probs.matmul(v); // [bw, heads, N, head_dim]
+        // context = probs @ v, written as `(vᵀ @ probsᵀ)ᵀ`: `v` (from `to_heads`)
+        // is a batch-permuted view, and Burn 0.21's wgpu matmul reads a batch-
+        // permuted right-hand operand with wrong strides. Keeping it on the left
+        // with a last-two-dim transpose on the right avoids the bug (no-op on CPU).
+        // See the matching note in mineru-layout's `encoder.rs`.
+        let context = v.swap_dims(2, 3).matmul(probs.swap_dims(2, 3)).swap_dims(2, 3); // [bw, heads, N, head_dim]
         let context = context
             .swap_dims(1, 2)
             .reshape([bw, n, dim]);

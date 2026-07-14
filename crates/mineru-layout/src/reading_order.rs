@@ -159,11 +159,7 @@ impl<B: Backend> PositionRelationEmbedding<B> {
         // each inv_freq, then take sin and cos, and flatten the (component, freq)
         // axes. Output last dim = 4 * (2 * inv_freq.len()) = 4 * embed_dim.
         let [bsz, s0, s1, comps] = x.dims();
-        let data = x
-            .mul_scalar(scale)
-            .into_data()
-            .into_vec::<f32>()
-            .unwrap_or_default();
+        let data = mineru_burn_common::float_to_vec_f32(x.mul_scalar(scale));
         let nfreq = self.inv_freq.len();
         let out_dim = comps * 2 * nfreq;
         let mut out = vec![0f32; bsz * s0 * s1 * out_dim];
@@ -249,8 +245,15 @@ impl<B: Backend> RoLayer<B> {
         let mut scores = q.div_scalar(scale).matmul(k.swap_dims(2, 3));
         scores = scores.add(rel_2d_pos).add(attention_mask);
         let probs = cogview_attention(scores, RO.cogview_alpha);
-        let ctx = probs
-            .matmul(v)
+        // ctx = probs @ v, written as `(vᵀ @ probsᵀ)ᵀ`: `v` is a batch-permuted
+        // (`swap_dims(1, 2)`) view and Burn 0.21's wgpu matmul reads a batch-permuted
+        // right-hand operand with wrong strides. Keeping it on the left with a
+        // last-two-dim transpose on the right avoids the bug (a no-op on CPU).
+        // See the matching note in `encoder.rs`.
+        let ctx = v
+            .swap_dims(2, 3)
+            .matmul(probs.swap_dims(2, 3))
+            .swap_dims(2, 3)
             .swap_dims(1, 2)
             .reshape([bsz, seq, hs]);
 
@@ -357,7 +360,7 @@ impl<B: Backend> ReadingOrder<B> {
 
         // num_pred per batch = sum(keep_mask).
         let num_pred = keep_mask.clone().sum_dim(1).reshape([bsz]); // [B]
-        let num_pred_vals = num_pred.into_data().into_vec::<f32>().unwrap_or_default();
+        let num_pred_vals = mineru_burn_common::float_to_vec_f32(num_pred);
 
         // Build padded input_ids [B, seq+2], boxes, labels, position_ids on host.
         let ext = seq + 2;

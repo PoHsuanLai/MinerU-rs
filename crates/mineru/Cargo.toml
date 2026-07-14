@@ -37,6 +37,11 @@ vlm = ["dep:mineru-vlm-client", "dep:mineru-backend-vlm"]
 # Hybrid backend: pipeline layout drives per-region VLM extraction (needs both).
 hybrid = ["pipeline", "vlm", "dep:mineru-backend-hybrid"]
 
+# Opt-in GPU (wgpu) backend for the pipeline's neural stages (layout/OCR/formula);
+# tables stay on CPU. Selected at runtime via `MINERU_GPU=1`. Forwards the GPU
+# feature to the pipeline crate and the shared harness (for the `Gpu` alias).
+gpu = ["pipeline", "mineru-backend-pipeline/gpu", "mineru-burn-common/gpu"]
+
 # Individual model crates, so a downstream user can pull just one.
 burn-common = ["dep:mineru-burn-common"]
 ocr = ["dep:mineru-ocr-det", "dep:mineru-ocr-rec", "burn-common"]

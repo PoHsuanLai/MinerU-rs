@@ -176,7 +176,17 @@ impl<B: Backend> EncoderLayer<B> {
         // [B, H, L, L]
         let scores = q.mul_scalar(scale).matmul(k.swap_dims(2, 3));
         let probs = softmax(scores, 3);
-        let ctx = probs.matmul(v); // [B, H, L, hd]
+        // ctx = probs @ v, but written as `(vᵀ @ probsᵀ)ᵀ` (transpose over the last
+        // two dims). `v` here is a `split_heads` view whose *batch* dims (H, L) are
+        // permuted (`swap_dims(1, 2)`); Burn 0.21's wgpu/cubecl batched matmul reads
+        // a batch-permuted **right-hand** operand with the wrong strides (verified:
+        // it diverges from CPU by ~5e2, whereas this transposed form matches to
+        // ~1e-6). Keeping the permuted operand on the **left** with only a last-two-
+        // dim transpose on the right avoids the buggy path and is a no-op on CPU.
+        let ctx = v
+            .swap_dims(2, 3)
+            .matmul(probs.swap_dims(2, 3))
+            .swap_dims(2, 3); // [B, H, L, hd]
         let ctx = ctx
             .swap_dims(1, 2)
             .reshape([bsz, seq, d]);

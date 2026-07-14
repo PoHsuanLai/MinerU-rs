@@ -259,8 +259,15 @@ impl<B: Backend> DecoderLayer<B> {
             .swap_dims(1, 2);
         let scores = q.mul_scalar(scale).matmul(k.swap_dims(2, 3));
         let probs = softmax(scores, 3);
-        let ctx = probs
-            .matmul(v)
+        // ctx = probs @ v, written as `(vᵀ @ probsᵀ)ᵀ`: `v` is a batch-permuted
+        // (`swap_dims(1, 2)`) view, and Burn 0.21's wgpu matmul reads a batch-
+        // permuted right-hand operand with wrong strides. Keeping it on the left
+        // with a last-two-dim transpose on the right avoids the bug (a no-op on CPU).
+        // See the matching note in `encoder.rs`.
+        let ctx = v
+            .swap_dims(2, 3)
+            .matmul(probs.swap_dims(2, 3))
+            .swap_dims(2, 3)
             .swap_dims(1, 2)
             .reshape([bsz, num_q, d]);
         let attn_out = self.o_proj.forward(ctx);

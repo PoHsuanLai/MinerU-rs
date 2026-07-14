@@ -20,5 +20,11 @@ clipper2 = { version = "0.6", default-features = false }
 thiserror.workspace = true
 tracing.workspace = true
 
+[features]
+# Opt-in GPU (wgpu) backend, forwarded to burn and the shared harness. The model
+# types are already generic over the Burn backend; this only makes the `Wgpu`
+# backend and `mineru_burn_common::Gpu` alias available for callers that select it.
+gpu = ["burn/wgpu", "mineru-burn-common/gpu"]
+
 [dev-dependencies]
 hf-hub = "0.3"

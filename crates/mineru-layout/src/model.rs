@@ -233,49 +233,77 @@ impl<B: Backend> PpDocLayoutV2<B> {
 /// then dropped queries in ascending original-index order.
 ///
 /// Matches PyTorch `argsort(keep.int(), dim=1, descending=True, stable=True)`.
-/// Computed on the host because Burn's tensor `argsort` is unstable.
+///
+/// Computed entirely on-device as a prefix-sum partition, so no GPU→host copy
+/// (device sync) stalls the pipeline and it is backend-portable. A stable
+/// keep-first partition assigns each query its destination rank:
+///   - kept query `q`:  `cumsum(keep)[q] - 1`                (in original order),
+///   - dropped query `q`: `num_kept + cumsum(1-keep)[q] - 1` (after the kept block).
+///
+/// `cumsum` is inclusive and `keep`/`1-keep` are 0/1, so the ranks within each
+/// block increase in original-index order — exactly the stable order. We then
+/// `scatter` each original index `q` into its destination rank to build the
+/// gather permutation `order[new_pos] = original_index`. The destination ranks
+/// form a permutation (all distinct), so the `Assign` scatter is deterministic.
 fn stable_keep_first_order<B: Backend>(keep: &Tensor<B, 2, burn::tensor::Bool>, device: &B::Device) -> Tensor<B, 2, Int> {
+    use burn::tensor::IndexingUpdateOp;
     let [bsz, num_q] = keep.dims();
-    let flags = keep
-        .clone()
-        .int()
-        .into_data()
-        .into_vec::<i64>()
-        .unwrap_or_else(|_| vec![0; bsz * num_q]);
-    let mut order: Vec<i64> = Vec::with_capacity(bsz * num_q);
-    for b in 0..bsz {
-        let row = &flags[b * num_q..(b + 1) * num_q];
-        order.extend((0..num_q).filter(|&q| row[q] != 0).map(|q| q as i64));
-        order.extend((0..num_q).filter(|&q| row[q] == 0).map(|q| q as i64));
-    }
-    Tensor::<B, 1, Int>::from_data(TensorData::new(order, [bsz * num_q]), device).reshape([bsz, num_q])
+    let keep_i = keep.clone().int(); // 0/1, [B,Q]
+    let drop_i = keep_i.clone().neg().add_scalar(1); // 1-keep, [B,Q]
+
+    // Inclusive prefix sums along the query axis.
+    let kept_prefix = keep_i.clone().cumsum(1); // [B,Q]
+    let drop_prefix = drop_i.clone().cumsum(1); // [B,Q]
+    let num_kept = keep_i.clone().sum_dim(1); // [B,1]
+
+    // Destination rank per original query (see doc comment).
+    let kept_rank = kept_prefix.sub_scalar(1); // valid where kept
+    let drop_rank = drop_prefix.add(num_kept).sub_scalar(1); // valid where dropped
+    let dest_rank = keep_i.clone().mul(kept_rank).add(drop_i.mul(drop_rank)); // [B,Q]
+
+    // arange over the query axis, broadcast to [B,Q]: the original indices.
+    let src_idx = Tensor::<B, 1, Int>::arange(0..num_q as i64, device)
+        .reshape([1, num_q])
+        .expand([bsz, num_q]);
+
+    // order[b, dest_rank[b,q]] = q. We scatter with `Add` into a zeroed buffer
+    // rather than `Assign`: Burn 0.21's wgpu int `scatter` only implements the
+    // `Add` reduction (`Assign` is `unimplemented!`). Since `dest_rank` is a
+    // permutation (every destination distinct) and the buffer starts at 0, each
+    // slot is written exactly once, so `0 + q == q` — identical to `Assign` and
+    // backend-portable.
+    let zeros = Tensor::<B, 2, Int>::zeros([bsz, num_q], device);
+    zeros.scatter(1, dest_rank, src_idx, IndexingUpdateOp::Add)
 }
 
 /// Gathers per-query thresholds `[B, Q]` from `CLASS_THRESHOLDS` via class ids.
+///
+/// On-device: uploads the constant `[NUM_CLASSES]` threshold table once and
+/// `select`s by class id — no GPU→host copy. Class ids are argmax outputs in
+/// `0..NUM_CLASSES`, so every lookup is in range (matching the reference).
 fn gather_thresholds<B: Backend>(class_ids: &Tensor<B, 2, Int>, device: &B::Device) -> Tensor<B, 2> {
-    let ids = class_ids.clone().into_data().into_vec::<i64>().unwrap_or_default();
-    let dims = class_ids.dims();
-    let data: Vec<f32> = ids
-        .iter()
-        .map(|&c| {
-            crate::label::CLASS_THRESHOLDS
-                .get(c as usize)
-                .copied()
-                .unwrap_or(1.0)
-        })
-        .collect();
-    Tensor::<B, 1>::from_data(TensorData::new(data, [dims[0] * dims[1]]), device).reshape(dims)
+    let [bsz, num_q] = class_ids.dims();
+    let table = Tensor::<B, 1>::from_data(
+        TensorData::new(crate::label::CLASS_THRESHOLDS.to_vec(), [crate::label::CLASS_THRESHOLDS.len()]),
+        device,
+    );
+    let flat_ids = class_ids.clone().reshape([bsz * num_q]);
+    table.select(0, flat_ids).reshape([bsz, num_q])
 }
 
 /// Remaps detection class ids to reading-order category ids via `CLASS_ORDER`.
+///
+/// On-device: uploads the constant `[NUM_CLASSES]` remap table once and `select`s
+/// by class id — no GPU→host copy. Class ids are in `0..NUM_CLASSES` (argmax
+/// outputs, zeroed on dropped slots by the caller), so every lookup is in range.
 fn remap_class_order<B: Backend>(class_ids: &Tensor<B, 2, Int>, device: &B::Device) -> Tensor<B, 2, Int> {
-    let ids = class_ids.clone().into_data().into_vec::<i64>().unwrap_or_default();
-    let dims = class_ids.dims();
-    let data: Vec<i64> = ids
-        .iter()
-        .map(|&c| CLASS_ORDER.get(c as usize).copied().unwrap_or(0))
-        .collect();
-    Tensor::<B, 1, Int>::from_data(TensorData::new(data, [dims[0] * dims[1]]), device).reshape(dims)
+    let [bsz, num_q] = class_ids.dims();
+    let table = Tensor::<B, 1, Int>::from_data(
+        TensorData::new(CLASS_ORDER.to_vec(), [CLASS_ORDER.len()]),
+        device,
+    );
+    let flat_ids = class_ids.clone().reshape([bsz * num_q]);
+    table.select(0, flat_ids).reshape([bsz, num_q])
 }
 
 /// Gathers rows `[B, Q, feat]` from `[B, Q, feat]` by an index `[B, Q]`.

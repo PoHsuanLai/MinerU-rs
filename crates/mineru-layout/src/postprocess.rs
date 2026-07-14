@@ -153,11 +153,7 @@ pub fn boxes_to_xyxy<B: Backend>(pred_boxes: &Tensor<B, 3>) -> Result<Vec<f32>> 
     if dims[0] != 1 {
         return Err(Error::Shape(format!("expected batch size 1, got {}", dims[0])));
     }
-    let data = pred_boxes
-        .clone()
-        .into_data()
-        .into_vec::<f32>()
-        .map_err(|e| Error::Shape(format!("pred_boxes to_vec: {e:?}")))?;
+    let data = mineru_burn_common::float_to_vec_f32(pred_boxes.clone());
     let num_q = dims[1];
     let mut out = vec![0f32; num_q * 4];
     for q in 0..num_q {
@@ -177,22 +173,14 @@ pub fn boxes_to_xyxy<B: Backend>(pred_boxes: &Tensor<B, 3>) -> Result<Vec<f32>> 
 pub fn order_logits_flat<B: Backend>(order_logits: &Tensor<B, 3>) -> Result<(Vec<f32>, usize)> {
     let dims = order_logits.dims();
     let seq = dims[1];
-    let data = order_logits
-        .clone()
-        .into_data()
-        .into_vec::<f32>()
-        .map_err(|e| Error::Shape(format!("order_logits to_vec: {e:?}")))?;
+    let data = mineru_burn_common::float_to_vec_f32(order_logits.clone());
     Ok((data, seq))
 }
 
 /// Flattens a `[1, num_queries, num_classes]` logits tensor into a row-major `Vec`.
 pub fn logits_flat<B: Backend>(logits: &Tensor<B, 3>) -> Result<(Vec<f32>, usize, usize)> {
     let dims = logits.dims();
-    let data = logits
-        .clone()
-        .into_data()
-        .into_vec::<f32>()
-        .map_err(|e| Error::Shape(format!("logits to_vec: {e:?}")))?;
+    let data = mineru_burn_common::float_to_vec_f32(logits.clone());
     Ok((data, dims[1], dims[2]))
 }
 

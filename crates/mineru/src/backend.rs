@@ -54,8 +54,7 @@ pub fn build_backend(
                     config.models_dir.display()
                 )
             })?;
-            let models = PipelineModels::load(&models_dir);
-            Ok(Box::new(PipelineBackend::new(models)))
+            build_pipeline_backend(&models_dir)
         }
         BackendKind::Vlm => {
             let mut client = VlmClientConfig::default();
@@ -68,4 +67,35 @@ pub fn build_backend(
             Ok(Box::new(VlmBackend::new(client)))
         }
     }
+}
+
+/// Loads the pipeline models and boxes the backend, selecting the wgpu GPU when
+/// the `gpu` feature is compiled in *and* `MINERU_GPU` is set to a truthy value
+/// (`1`/`true`/`yes`), otherwise the CPU backend.
+///
+/// The neural stages (layout/OCR/formula) run on the selected backend; the table
+/// stages always run on CPU (their generated ONNX / SLANet types are CPU-pinned),
+/// so a GPU run is a hybrid. Selection is a runtime env var rather than a CLI flag
+/// so the same binary serves both without a plumbing change to the arg parser.
+fn build_pipeline_backend(models_dir: &std::path::Path) -> anyhow::Result<Box<dyn Backend>> {
+    #[cfg(feature = "gpu")]
+    {
+        if gpu_requested() {
+            use mineru_burn_common::backend::{gpu_device, Gpu};
+            tracing::info!("pipeline backend: wgpu GPU (neural stages) + CPU tables");
+            let models = PipelineModels::<Gpu>::load_on(models_dir, gpu_device());
+            return Ok(Box::new(PipelineBackend::new(models)));
+        }
+    }
+    tracing::info!("pipeline backend: CPU");
+    let models = PipelineModels::load(models_dir);
+    Ok(Box::new(PipelineBackend::new(models)))
+}
+
+/// Whether `MINERU_GPU` requests the GPU backend (truthy: `1`, `true`, `yes`).
+#[cfg(feature = "gpu")]
+fn gpu_requested() -> bool {
+    std::env::var("MINERU_GPU")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
 }

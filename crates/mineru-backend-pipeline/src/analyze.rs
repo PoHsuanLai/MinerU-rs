@@ -23,8 +23,10 @@
 //! its recognized text/latex/html — the layout structure is always emitted.
 
 use async_trait::async_trait;
+use burn::prelude::Backend as BurnBackend;
 use image::{imageops::crop_imm, RgbImage};
 
+use mineru_burn_common::backend::Cpu;
 use mineru_layout::LayoutDet;
 use mineru_pdf::{PageText, PdfiumLibrary, RenderOptions};
 use mineru_types::{
@@ -40,15 +42,19 @@ use crate::para::merge_paragraphs;
 /// Owns the loaded [`PipelineModels`] and implements
 /// [`Backend`](mineru_types::Backend). Cheap to share behind an `Arc`; the models
 /// are immutable after construction.
-pub struct PipelineBackend {
-    models: PipelineModels,
+///
+/// Generic over the Burn backend `B` (default [`Cpu`]) of the neural stages; the
+/// table stages inside [`PipelineModels`] always run on CPU (see its docs). Select
+/// the GPU with `PipelineBackend::<mineru_burn_common::Gpu>::new(models)`.
+pub struct PipelineBackend<B: BurnBackend = Cpu> {
+    models: PipelineModels<B>,
     dpi: f32,
 }
 
-impl PipelineBackend {
+impl<B: BurnBackend> PipelineBackend<B> {
     /// Builds a backend from already-loaded models, rasterizing at the MinerU
     /// default 200 DPI.
-    pub fn new(models: PipelineModels) -> Self {
+    pub fn new(models: PipelineModels<B>) -> Self {
         Self {
             models,
             dpi: mineru_pdf::DEFAULT_DPI,
@@ -332,7 +338,7 @@ impl PipelineBackend {
 }
 
 #[async_trait]
-impl Backend for PipelineBackend {
+impl<B: BurnBackend> Backend for PipelineBackend<B> {
     async fn analyze(
         &self,
         input: DocInput,

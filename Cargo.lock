@@ -3928,6 +3928,7 @@ name = "mineru-backend-pipeline"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "burn",
  "image",
  "mineru-burn-common",
  "mineru-formula",

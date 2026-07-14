@@ -9,6 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
+use burn::prelude::Backend;
 use mineru_burn_common::backend::{cpu_device, Cpu};
 use mineru_burn_common::weights::Coverage;
 use mineru_formula::FormulaRecognizer;
@@ -77,46 +78,67 @@ impl ModelPaths {
 /// The loaded model stages, each optional so the pipeline degrades gracefully when
 /// a weight file is absent.
 ///
-/// Construct with [`PipelineModels::load`] (best-effort, from a models directory)
-/// or assemble field-by-field for tests. All models run on the CPU
-/// ([`Cpu`]) backend.
-#[derive(Default)]
-pub struct PipelineModels {
+/// Construct with [`PipelineModels::load`] (best-effort CPU load from a models
+/// directory), [`PipelineModels::load_on`] (best-effort on an explicit backend/
+/// device — e.g. the wgpu GPU), or assemble field-by-field for tests.
+///
+/// The neural stages (layout, OCR det/rec, formula) are generic over the Burn
+/// backend `B` (default [`Cpu`]) so the whole pipeline can run on the GPU. The
+/// **table** stages ([`SlaNet`], [`UnetModel`]) are the burn-onnx-generated and
+/// SLANet types, which are hard-pinned to the CPU (`NdArray`) backend; they always
+/// run on CPU. A GPU pipeline is therefore a *hybrid*: layout/OCR/formula on the
+/// GPU, tables on CPU — which is fine, as tables are a small fraction of most
+/// documents and the generated ONNX graphs are not backend-generic.
+pub struct PipelineModels<B: Backend = Cpu> {
     /// Layout detector; drives every downstream stage.
-    pub layout: Option<LayoutModel<Cpu>>,
+    pub layout: Option<LayoutModel<B>>,
     /// OCR text-line detector.
-    pub ocr_det: Option<TextDetector<Cpu>>,
+    pub ocr_det: Option<TextDetector<B>>,
     /// OCR text recognizer.
-    pub ocr_rec: Option<TextRecognizer<Cpu>>,
+    pub ocr_rec: Option<TextRecognizer<B>>,
     /// Formula recognizer.
-    pub formula: Option<FormulaRecognizer<Cpu>>,
-    /// Wireless-table structure recognizer.
+    pub formula: Option<FormulaRecognizer<B>>,
+    /// Wireless-table structure recognizer (CPU-only; see the struct docs).
     pub table_wireless: Option<SlaNet>,
-    /// Wired-table line-segmentation recognizer.
+    /// Wired-table line-segmentation recognizer (CPU-only; see the struct docs).
     pub table_wired: Option<UnetModel>,
 }
 
-impl PipelineModels {
-    /// Loads every stage best-effort from the default paths under `models_dir`.
+// `#[derive(Default)]` would require `B: Default`; the fields are all `Option`/
+// `None`, so a hand-written impl over any backend is both correct and less
+// constrained.
+impl<B: Backend> Default for PipelineModels<B> {
+    fn default() -> Self {
+        Self {
+            layout: None,
+            ocr_det: None,
+            ocr_rec: None,
+            formula: None,
+            table_wireless: None,
+            table_wired: None,
+        }
+    }
+}
+
+impl<B: Backend> PipelineModels<B> {
+    /// Loads every stage best-effort from the default paths under `models_dir`,
+    /// with the neural stages on backend `B`/`device` and the tables on CPU.
     ///
     /// A stage whose weight file is missing or fails to load is left `None` and a
-    /// warning is traced; the returned `PipelineModels` is always valid. This never
-    /// errors, so a partially-provisioned models directory still yields a usable
-    /// (if reduced) pipeline.
-    pub fn load(models_dir: impl AsRef<Path>) -> Self {
-        Self::load_from(&ModelPaths::under(models_dir))
+    /// warning is traced; the returned `PipelineModels` is always valid.
+    pub fn load_on(models_dir: impl AsRef<Path>, device: B::Device) -> Self {
+        Self::load_from_on(&ModelPaths::under(models_dir), device)
     }
 
-    /// Loads every stage best-effort from explicit [`ModelPaths`].
-    pub fn load_from(paths: &ModelPaths) -> Self {
-        let device = cpu_device();
-
+    /// Loads every stage best-effort from explicit [`ModelPaths`], with the neural
+    /// stages on backend `B`/`device` and the tables on CPU.
+    pub fn load_from_on(paths: &ModelPaths, device: B::Device) -> Self {
         let layout = load_stage("layout", || {
-            LayoutModel::<Cpu>::from_safetensors(&paths.layout).map_err(Into::into)
+            LayoutModel::<B>::load(&paths.layout, device.clone()).map_err(Into::into)
         });
 
         let ocr_det = load_stage("ocr-det", || {
-            let mut det = TextDetector::<Cpu>::new(DetConfig::default(), device);
+            let mut det = TextDetector::<B>::new(DetConfig::default(), device.clone());
             det.load_weights(&paths.ocr_det)?;
             Ok(det)
         });
@@ -131,16 +153,21 @@ impl PipelineModels {
             } else {
                 CharDict::ppocrv6(true)?
             };
-            let mut rec = TextRecognizer::<Cpu>::new(dict, RecConfig::default(), device);
+            let mut rec = TextRecognizer::<B>::new(dict, RecConfig::default(), device.clone());
             rec.load_weights(&paths.ocr_rec)?;
             Ok(rec)
         });
 
         let formula = load_stage("formula", || {
-            FormulaRecognizer::<Cpu>::from_pretrained(&paths.formula_dir, Coverage::Lenient)
-                .map_err(Into::into)
+            FormulaRecognizer::<B>::from_pretrained_on(
+                &paths.formula_dir,
+                Coverage::Lenient,
+                device.clone(),
+            )
+            .map_err(Into::into)
         });
 
+        // Table stages are CPU-pinned (generated ONNX + SLANet types).
         let table_wireless = load_stage("table-wireless", || {
             SlaNet::load(&paths.table_wireless).map_err(Into::into)
         });
@@ -157,6 +184,20 @@ impl PipelineModels {
             table_wireless,
             table_wired,
         }
+    }
+}
+
+impl PipelineModels<Cpu> {
+    /// Loads every stage best-effort on the CPU backend from the default paths
+    /// under `models_dir`. Convenience wrapper over [`PipelineModels::load_on`].
+    pub fn load(models_dir: impl AsRef<Path>) -> Self {
+        Self::load_on(models_dir, cpu_device())
+    }
+
+    /// Loads every stage best-effort on the CPU backend from explicit
+    /// [`ModelPaths`]. Convenience wrapper over [`PipelineModels::load_from_on`].
+    pub fn load_from(paths: &ModelPaths) -> Self {
+        Self::load_from_on(paths, cpu_device())
     }
 }
 

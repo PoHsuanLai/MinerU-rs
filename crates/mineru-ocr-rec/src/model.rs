@@ -161,10 +161,11 @@ impl<B: Backend> TextRecognizer<B> {
             return Err(Error::LogitsShape(format!("expected batch 1, got {dims:?}")));
         }
         let (t, c) = (dims[1], dims[2]);
-        let data = logits
-            .into_data()
-            .into_vec::<f32>()
-            .map_err(|e| Error::LogitsShape(format!("logits not f32: {e:?}")))?;
+        // Host read of the full logits: both the CTC greedy decode (repeat-collapse
+        // over a `Vec`) and the confidence softmax are host-side reductions, so the
+        // copy cannot be eliminated. Use the dtype-agnostic helper so it is correct on
+        // backends whose float storage isn't `f32` (e.g. `wgpu`).
+        let data = mineru_burn_common::float_to_vec_f32(logits);
 
         // Greedy decode (collapse repeats, drop blank) on the raw logits.
         let indices = ctc_greedy_decode_slice(&data, t, c, 0);
@@ -189,9 +190,11 @@ impl<B: Backend> TextRecognizer<B> {
     /// public recognition API — it exists for the numerical-parity test.
     #[doc(hidden)]
     pub fn forward_stages(&self, input: Tensor<B, 4>) -> Result<RecStageDumps> {
+        // Dtype-agnostic host read so the parity hook works on any backend's float
+        // storage; library code never panics, so no `.expect`.
         let dump = |t: &Tensor<B, 4>| -> StageDump {
             let d = t.dims().to_vec();
-            let v = t.clone().into_data().into_vec::<f32>().expect("f32 tensor");
+            let v = mineru_burn_common::float_to_vec_f32(t.clone());
             (v, d)
         };
         let (stages, pooled) = self
@@ -204,7 +207,7 @@ impl<B: Backend> TextRecognizer<B> {
         let (neck, logits) = self.net.head.forward_stages(pooled);
         let neck_dump = dump(&neck);
         let ld = logits.dims().to_vec();
-        let logits_v = logits.into_data().into_vec::<f32>().expect("f32 tensor");
+        let logits_v = mineru_burn_common::float_to_vec_f32(logits);
         Ok((stage_dumps, pooled_dump, neck_dump, (logits_v, ld)))
     }
 
