@@ -172,9 +172,9 @@ impl TextLine {
 /// The native text layer of one page: its glyphs and their line grouping.
 ///
 /// `chars` are every surviving glyph (post-dedup) in PDFium reading order; `lines`
-/// is the `get_lines_from_chars` grouping over them. `fill_regions` uses `chars`
-/// directly (the char-in-span geometry works on glyphs); `lines` is exposed for
-/// callers that want ready-made line text.
+/// is the `get_lines_from_chars` grouping over them. `fill_regions` fills a region
+/// from its overlapping `lines` (each a single-line span for the char-in-span
+/// geometry); `lines` is also exposed for callers that want ready-made line text.
 #[derive(Debug, Clone, Default)]
 pub struct PageText {
     /// Every glyph on the page, deduplicated, in reading order.
@@ -197,45 +197,102 @@ impl PageText {
     /// Back-fills each region box with the native glyphs inside it, returning the
     /// filled text per region (`None` for a region no native text could fill).
     ///
-    /// Port of `fill_char_in_spans` + `chars_to_content` (`span_pre_proc.py`): for
-    /// every region, glyphs whose centre (or leading/trailing punctuation edge)
-    /// falls in the box and near its mid-line are collected via
-    /// [`calculate_char_in_span`], ordered by original char index, then joined with
-    /// `pdftext`'s inter-char space insertion. A region that ends up empty — or
-    /// whose text is too sparse for its width (the `len*height < width*0.5` guard)
-    /// — returns `None`, signaling the caller to OCR it.
+    /// Port of `fill_char_in_spans` + `chars_to_content` (`span_pre_proc.py`).
+    ///
+    /// # Why the region is filled line-by-line
+    ///
+    /// In the Python pipeline `fill_char_in_spans` receives *single-line* span
+    /// boxes (one per detected text line), so [`calculate_char_in_span`]'s
+    /// vertical [`SPAN_HEIGHT_RATIO`] test — which keeps only chars near the box
+    /// mid-line — is exactly right. This Rust caller instead passes whole
+    /// multi-line layout regions. Running the same mid-line test against a
+    /// multi-line box would drop every char far from the region centre (its first
+    /// and last text lines), so we must **not** treat a region as one span.
+    ///
+    /// Instead each region is intersected with the page's already-correct
+    /// [`get_lines_from_chars`] grouping ([`Self::lines`]): every overlapping
+    /// [`TextLine`] acts as the single-line span the geometry test expects. Chars
+    /// are collected per line (no vertical drop), lines are ordered top-to-bottom
+    /// and their chars left-to-right, each line is joined with `pdftext`'s
+    /// inter-char space insertion ([`join_with_spacing`], `median_width`
+    /// recomputed per line), and wrapped lines join with a single space — matching
+    /// how the pipeline later stitches a paragraph's line spans back together. A
+    /// region that ends up empty, or whose text is too sparse for its width (the
+    /// `len*height < width*0.5` guard), returns `None` so the caller OCRs it.
     ///
     /// `region_boxes` are in the same top-left page-point space as [`TextChar`].
     /// The returned vector is parallel to `region_boxes`.
     pub fn fill_regions(&self, region_boxes: &[BBox]) -> Vec<Option<FilledRegion>> {
-        // Median region height drives the empty-span guard (median_span_height).
-        let median_h = median(region_boxes.iter().map(BBox::height));
-
-        // Only upright glyphs participate (the Python `_get_chars_for_span_fill`
-        // keeps standard-rotation chars; rotated-water-mark handling is stubbed).
-        let mut buckets: Vec<Vec<&TextChar>> = vec![Vec::new(); region_boxes.len()];
-        for ch in self.chars.iter().filter(|c| c.is_upright()) {
-            let (cx, _cy) = ch.bbox.center();
-            for (i, region) in region_boxes.iter().enumerate() {
-                let is_flag = LINE_STOP_FLAG.contains(&ch.ch) || LINE_START_FLAG.contains(&ch.ch);
-                // Fast reject: non-flag chars must have their centre-x inside the
-                // region horizontally (mirrors the grid pre-filter in Python).
-                if !(is_flag || (region.x0 < cx && cx < region.x1)) {
-                    continue;
-                }
-                if calculate_char_in_span(&ch.bbox, region, ch.ch) {
-                    buckets[i].push(ch);
-                    break;
-                }
-            }
-        }
-
-        buckets
-            .into_iter()
-            .zip(region_boxes)
-            .map(|(chars, region)| finish_region(chars, region, median_h))
+        region_boxes
+            .iter()
+            .map(|region| self.fill_region(region))
             .collect()
     }
+
+    /// Fills a single region by collecting each overlapping page line's chars and
+    /// assembling them in reading order (see [`Self::fill_regions`]).
+    fn fill_region(&self, region: &BBox) -> Option<FilledRegion> {
+        // Each overlapping page line is a single-line "span" for the geometry
+        // test. Ordered top-to-bottom by the line's mid-y so wrapped lines read in
+        // visual order (mirrors `fill_char_in_spans`' top-to-bottom span sort).
+        let mut region_lines: Vec<RegionLine> = Vec::new();
+        for line in &self.lines {
+            // A line belongs to this region when its vertical centre falls inside
+            // the box. Using the centre (not mere overlap) keeps a neighbouring
+            // line that only clips the region's top/bottom edge from being slurped
+            // in, while still admitting a line that extends past the box sideways.
+            let (_, cy) = line.bbox.center();
+            if !(region.y0 <= cy && cy <= region.y1) {
+                continue;
+            }
+            let chars = collect_line_chars(line, region);
+            if chars.is_empty() {
+                continue;
+            }
+            region_lines.push(RegionLine { center_y: cy, chars });
+        }
+        finish_region(region_lines, region)
+    }
+}
+
+/// One page line's glyphs that fell inside a region, tagged with the line's
+/// vertical centre so lines can be ordered top-to-bottom within the region.
+struct RegionLine<'a> {
+    /// Mid-y of the source [`TextLine`] box (region top-to-bottom sort key).
+    center_y: f32,
+    /// The line's glyphs inside the region, in reading order.
+    chars: Vec<&'a TextChar>,
+}
+
+/// Collects the upright glyphs of one page line that fall inside `region`.
+///
+/// Runs the same char-in-span geometry as Python's `fill_char_in_spans`, but
+/// against the *line's* box (a true single-line span) rather than the multi-line
+/// region — so [`SPAN_HEIGHT_RATIO`] no longer drops a region's leading/trailing
+/// lines. The horizontal reject and leading/trailing-punctuation relaxation match
+/// the Python inner loop.
+fn collect_line_chars<'a>(line: &'a TextLine, region: &BBox) -> Vec<&'a TextChar> {
+    let mut chars: Vec<&TextChar> = Vec::new();
+    for span in &line.spans {
+        for ch in &span.chars {
+            if !ch.is_upright() {
+                continue;
+            }
+            let (cx, _cy) = ch.bbox.center();
+            // A char belongs to the region only if it is horizontally inside it —
+            // this is what confines a page-wide line to the region's column.
+            let is_flag = LINE_STOP_FLAG.contains(&ch.ch) || LINE_START_FLAG.contains(&ch.ch);
+            if !(is_flag || (region.x0 < cx && cx < region.x1)) {
+                continue;
+            }
+            // Vertical membership is tested against the line box (single line), so
+            // no char is dropped for being far from a multi-line region's centre.
+            if calculate_char_in_span(&ch.bbox, &line.bbox, ch.ch) {
+                chars.push(ch);
+            }
+        }
+    }
+    chars
 }
 
 /// A region successfully filled from native text.
@@ -247,29 +304,53 @@ pub struct FilledRegion {
     pub chars: Vec<TextChar>,
 }
 
-/// Assembles one region's collected glyphs into its final text, or `None` when the
+/// Assembles a region's per-line glyphs into its final text, or `None` when the
 /// region should fall through to OCR.
-fn finish_region(
-    mut chars: Vec<&TextChar>,
-    region: &BBox,
-    _median_h: f32,
-) -> Option<FilledRegion> {
-    if chars.is_empty() {
+///
+/// Lines are ordered top-to-bottom; each line's chars are ordered left-to-right by
+/// their original char index (`chars_to_content`), joined with `pdftext`'s
+/// inter-char spacing ([`join_with_spacing`], `median_width` recomputed per line),
+/// and the resulting line texts joined with a single space — the way a paragraph's
+/// wrapped lines are later stitched back together.
+fn finish_region(mut lines: Vec<RegionLine<'_>>, region: &BBox) -> Option<FilledRegion> {
+    if lines.is_empty() {
         return None;
     }
-    // `chars_to_content`: order by original char index (usually already sorted).
-    chars.sort_by_key(|c| c.char_idx);
-    // Drop control line-breaks so they don't drive spurious spacing.
-    let visible: Vec<&TextChar> = chars
-        .iter()
-        .copied()
-        .filter(|c| c.ch != '\r' && c.ch != '\n')
-        .collect();
-    if visible.is_empty() {
+    // Top-to-bottom reading order (top-left origin: smaller y is higher).
+    lines.sort_by(|a, b| {
+        a.center_y
+            .partial_cmp(&b.center_y)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut line_texts: Vec<String> = Vec::with_capacity(lines.len());
+    // Every glyph that filled the region, in reading order, for the caller.
+    let mut kept: Vec<TextChar> = Vec::new();
+    for line in &mut lines {
+        // `chars_to_content`: order by original char index (usually already sorted).
+        line.chars.sort_by_key(|c| c.char_idx);
+        // Drop control line-breaks so they don't drive spurious spacing.
+        let visible: Vec<&TextChar> = line
+            .chars
+            .iter()
+            .copied()
+            .filter(|c| c.ch != '\r' && c.ch != '\n')
+            .collect();
+        if visible.is_empty() {
+            continue;
+        }
+        let line_text = join_with_spacing(&visible);
+        if !line_text.trim().is_empty() {
+            line_texts.push(line_text.trim().to_string());
+            kept.extend(visible.into_iter().cloned());
+        }
+    }
+    if line_texts.is_empty() {
         return None;
     }
 
-    let text = join_with_spacing(&visible);
+    // Wrapped lines rejoin with a single space (the pipeline's paragraph line join).
+    let text = line_texts.join(" ");
     let trimmed = text.trim().to_string();
 
     // Empty-span guard: `len(content)*height < width*0.5` → treat as unfilled.
@@ -281,13 +362,15 @@ fn finish_region(
 
     Some(FilledRegion {
         text: trimmed,
-        chars: visible.into_iter().cloned().collect(),
+        chars: kept,
     })
 }
 
-/// Joins glyphs into text, inserting a space where the horizontal gap to the next
-/// glyph exceeds `0.25 * median_char_width` (port of the spacing loop in
-/// `chars_to_content`). Ligatures and the `\u{0002}` soft-hyphen are normalized.
+/// Joins one line's glyphs into text, inserting a space where the horizontal gap to
+/// the next glyph exceeds `0.25 * median_char_width` (port of the spacing loop in
+/// `chars_to_content`). `median_char_width` is computed over *this line's* chars, so
+/// the threshold tracks the line's font size. Ligatures and the `\u{0002}`
+/// soft-hyphen are normalized.
 fn join_with_spacing(chars: &[&TextChar]) -> String {
     let median_w = median(chars.iter().map(|c| c.bbox.width()));
     let mut out = String::new();
@@ -829,25 +912,40 @@ mod tests {
         assert_eq!(out.len(), 2);
     }
 
+    /// Builds a [`PageText`] from chars, grouping lines the way the real page does.
+    fn page_from_chars(chars: Vec<TextChar>) -> PageText {
+        let lines = get_lines_from_chars(&chars);
+        PageText {
+            chars,
+            lines,
+            rotation: 0,
+        }
+    }
+
+    /// One text row plus a PDFium end-of-line newline glyph, at vertical `y0`.
+    ///
+    /// The trailing `\n` (code 10) ends the row's span, so a following row starts a
+    /// fresh line — the shape real PDFium text pages have (see
+    /// `positional_drop_splits_lines`).
+    fn text_row(word: &str, y0: f32, x_start: f32, start_idx: usize, f: &Font) -> Vec<TextChar> {
+        let mut out = Vec::new();
+        let mut x = x_start;
+        for (i, c) in word.chars().enumerate() {
+            out.push(ch(c, x, y0, x + 7.0, y0 + 12.0, f.clone(), start_idx + i));
+            x += 8.0;
+        }
+        out.push(ch('\n', x, y0, x, y0 + 12.0, f.clone(), start_idx + word.chars().count()));
+        out
+    }
+
     /// A span fill collects exactly the chars whose centre lies in the region box.
     #[test]
     fn fill_region_picks_inside_chars() {
         let f = font("Arial", 12000);
         // Two rows: row 1 inside region, row 2 outside (below).
-        let mut chars = Vec::new();
-        for (i, c) in "IN".chars().enumerate() {
-            let x = 12.0 + i as f32 * 8.0;
-            chars.push(ch(c, x, 100.0, x + 7.0, 112.0, f.clone(), i));
-        }
-        for (i, c) in "NO".chars().enumerate() {
-            let x = 12.0 + i as f32 * 8.0;
-            chars.push(ch(c, x, 300.0, x + 7.0, 312.0, f.clone(), i + 2));
-        }
-        let page = PageText {
-            chars,
-            lines: Vec::new(),
-            rotation: 0,
-        };
+        let mut chars = text_row("IN", 100.0, 12.0, 0, &f);
+        chars.extend(text_row("NO", 300.0, 12.0, 10, &f));
+        let page = page_from_chars(chars);
         // Region covering only row 1.
         let region = BBox::new(8.0, 96.0, 40.0, 116.0);
         let filled = page.fill_regions(&[region]);
@@ -869,29 +967,115 @@ mod tests {
         assert!(filled[0].is_none());
     }
 
-    /// Wide gaps between glyphs insert a space (word separation).
+    /// Wide gaps between glyphs insert a space (word separation within a line).
     #[test]
     fn wide_gap_inserts_space() {
         let f = font("Arial", 12000);
         // "AB" then a big gap then "CD" on one line.
-        let mut chars = vec![
+        let chars = vec![
             ch('A', 10.0, 100.0, 16.0, 112.0, f.clone(), 0),
             ch('B', 16.5, 100.0, 22.5, 112.0, f.clone(), 1),
             // Gap of ~10pt (>> 0.25 * ~6pt median width).
             ch('C', 40.0, 100.0, 46.0, 112.0, f.clone(), 2),
             ch('D', 46.5, 100.0, 52.5, 112.0, f.clone(), 3),
         ];
-        // Region spans the whole line.
-        chars.iter_mut().for_each(|c| c.rotation = 0.0);
-        let page = PageText {
-            chars,
-            lines: Vec::new(),
-            rotation: 0,
-        };
+        let page = page_from_chars(chars);
         let region = BBox::new(5.0, 96.0, 60.0, 116.0);
         let filled = page.fill_regions(&[region]);
         let r = filled[0].as_ref().expect("filled");
         assert_eq!(r.text, "AB CD");
+    }
+
+    /// Regression (Defect #2): a two-line region must include BOTH lines' text, in
+    /// top-to-bottom order — the OLD whole-region fill dropped chars far from the
+    /// region mid-line (its first/last lines).
+    #[test]
+    fn two_line_region_keeps_both_lines_in_order() {
+        let f = font("Arial", 12000);
+        // Two rows, ~13pt apart, both inside a tall region.
+        let mut chars = text_row("First", 100.0, 12.0, 0, &f);
+        chars.extend(text_row("Second", 113.0, 12.0, 10, &f));
+        let page = page_from_chars(chars);
+        // Region tall enough to span BOTH rows; its mid-line sits between them.
+        let region = BBox::new(8.0, 96.0, 80.0, 130.0);
+        let r = page.fill_regions(&[region])[0]
+            .as_ref()
+            .expect("region filled")
+            .clone();
+        assert_eq!(r.text, "First Second");
+    }
+
+    /// Regression (Defect #2, vertical drop): chars whose centre is far from the
+    /// multi-line region's centre are NOT dropped. A three-line region keeps its
+    /// leading line — the exact symptom of the Abstract starting mid-sentence.
+    #[test]
+    fn far_from_center_chars_not_dropped() {
+        let f = font("Arial", 12000);
+        let mut chars = text_row("Top", 100.0, 12.0, 0, &f);
+        chars.extend(text_row("Mid", 120.0, 12.0, 10, &f));
+        chars.extend(text_row("Bot", 140.0, 12.0, 20, &f));
+        let page = page_from_chars(chars);
+        // Tall region: "Top" (y~106) is ~26pt above the region mid-line (~129),
+        // which the old SPAN_HEIGHT_RATIO test against the whole region dropped.
+        let region = BBox::new(8.0, 96.0, 60.0, 158.0);
+        let r = page.fill_regions(&[region])[0]
+            .as_ref()
+            .expect("region filled")
+            .clone();
+        assert_eq!(r.text, "Top Mid Bot");
+        assert!(r.text.starts_with("Top"), "leading line must not be dropped");
+    }
+
+    /// Regression (Defect #3): a line wrap yields a SPACE, not a word-join, even
+    /// though the next line's x0 is left of the previous line's x1. The OLD path
+    /// joined the whole region by char_idx as one line → "reproduceright".
+    #[test]
+    fn line_wrap_joins_with_space_not_wordjoin() {
+        let f = font("Arial", 12000);
+        // Line 1 ends at the right; line 2 restarts at the left (x0 < line1.x1).
+        let mut chars = text_row("reproduce", 100.0, 40.0, 0, &f);
+        chars.extend(text_row("right", 113.0, 12.0, 20, &f));
+        let page = page_from_chars(chars);
+        let region = BBox::new(8.0, 96.0, 130.0, 130.0);
+        let r = page.fill_regions(&[region])[0]
+            .as_ref()
+            .expect("region filled")
+            .clone();
+        assert_eq!(r.text, "reproduce right");
+        assert!(!r.text.contains("reproduceright"), "no cross-line word-join");
+    }
+
+    /// Regression (Defect #3): the intra-line space threshold uses the LINE's
+    /// median char width, so a real word gap in a small-font line yields a space
+    /// even when another line in the same region has a much larger font.
+    #[test]
+    fn per_line_median_width_spaces_small_font_line() {
+        let big = font("Arial", 24000);
+        let small = font("Arial", 10000);
+        // Big-font heading line (wide chars) at the top.
+        let mut chars = Vec::new();
+        let mut x = 12.0;
+        for (i, c) in "TITLE".chars().enumerate() {
+            chars.push(ch(c, x, 100.0, x + 18.0, 124.0, big.clone(), i));
+            x += 20.0;
+        }
+        chars.push(ch('\n', x, 100.0, x, 124.0, big.clone(), 5));
+        // Small-font line below: "to" gap "do" — gap ~4pt, small median width ~5pt.
+        let mut chars2 = vec![
+            ch('t', 12.0, 130.0, 17.0, 140.0, small.clone(), 6),
+            ch('o', 17.5, 130.0, 22.5, 140.0, small.clone(), 7),
+            // Word gap ~4pt (> 0.25 * ~5pt small median, but < 0.25 * big median).
+            ch('d', 27.0, 130.0, 32.0, 140.0, small.clone(), 8),
+            ch('o', 32.5, 130.0, 37.5, 140.0, small.clone(), 9),
+        ];
+        chars.append(&mut chars2);
+        let page = page_from_chars(chars);
+        let region = BBox::new(8.0, 96.0, 120.0, 146.0);
+        let r = page.fill_regions(&[region])[0]
+            .as_ref()
+            .expect("region filled")
+            .clone();
+        assert_eq!(r.text, "TITLE to do");
     }
 
     /// Median matches Python's `statistics.median` (even-count average).
