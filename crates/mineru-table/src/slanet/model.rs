@@ -211,6 +211,47 @@ impl SlaNet {
         let fea = self.inner.backbone.forward_sequence(x); // [1, T, 96]
         fea.into_data().into_vec::<f32>().ok()
     }
+
+    /// Returns per-step `(hidden[256], argmax, probs[50])` traces from the head,
+    /// for step-by-step comparison against the ONNX `Loop`.
+    pub fn debug_head_steps(
+        &self,
+        input: &super::preprocess::Preprocessed,
+        steps: usize,
+    ) -> Option<Vec<super::head::StepTrace>> {
+        let side = TABLE_MAX_LEN as usize;
+        if input.chw.len() != 3 * side * side {
+            return None;
+        }
+        let data = TensorData::new(input.chw.clone(), [1, 3, side, side]);
+        let x = Tensor::<Cpu, 4>::from_data(data, &self.device);
+        let fea = self.inner.backbone.forward_sequence(x);
+        Some(self.inner.head.debug_steps(fea, steps))
+    }
+
+    /// Runs the full decoder and returns the raw head outputs: flattened
+    /// `[L, NUM_CLASSES]` structure probabilities, flattened `[L, LOC_DIM]` box
+    /// *quad* corners (before the axis-aligned reduction [`SlaNet::forward`]
+    /// applies), and the decoded step count `L`. For quad-level parity against the
+    /// ONNX `[L, 8]` loc reference.
+    pub fn debug_raw_head(
+        &self,
+        input: &super::preprocess::Preprocessed,
+    ) -> Option<(Vec<f32>, Vec<f32>, usize)> {
+        if !self.ready {
+            return None;
+        }
+        let side = TABLE_MAX_LEN as usize;
+        if input.chw.len() != 3 * side * side {
+            return None;
+        }
+        let data = TensorData::new(input.chw.clone(), [1, 3, side, side]);
+        let x = Tensor::<Cpu, 4>::from_data(data, &self.device);
+        let fea = self.inner.backbone.forward_sequence(x);
+        let end_idx = build_vocab().end_idx;
+        let out = self.inner.head.forward(fea, MAX_STEPS, end_idx);
+        Some((out.structure_probs, out.loc_preds, out.len))
+    }
 }
 
 /// Reduces `[L, 8]` quadrilateral corner coordinates to `[L, 4]`

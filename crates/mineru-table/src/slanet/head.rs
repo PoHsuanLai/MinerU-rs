@@ -14,11 +14,12 @@
 //!    `softmax` over `T`, and take the weighted sum → a `[1, C_feat]` context.
 //! 2. **GRU** — feed `concat(context, prev_onehot)` (`[1, 146]`) through a GRU
 //!    cell (gate order reset/update/candidate, `h' = (1-z)·n + z·h`) → new hidden.
-//! 3. **Heads** — `linear3→relu→linear4` gives the `[1, 50]` structure logits
-//!    (softmaxed for the probability output), `linear5→relu→linear6→sigmoid` gives
-//!    the `[1, 8]` quadrilateral-corner box. The next step's one-hot input is the
-//!    `argmax` of the current structure logits (greedy teacher-forcing at
-//!    inference).
+//! 3. **Heads** — `linear4(linear3(h))` gives the `[1, 50]` structure logits
+//!    (softmaxed for the probability output), `sigmoid(linear6(linear5(h)))` gives
+//!    the `[1, 8]` quadrilateral-corner box. Both branches are plain two-layer
+//!    linear stacks with **no** intermediate activation (the ONNX `Loop` body has
+//!    no ReLU between the pairs). The next step's one-hot input is the `argmax` of
+//!    the current structure logits (greedy teacher-forcing at inference).
 //!
 //! The step-0 hidden state is zero and the step-0 one-hot input is class 0, both
 //! matching the ONNX loop's initial carried values.
@@ -30,26 +31,23 @@
 //!
 //! - the backbone/neck feature feed matches to `~5e-6`;
 //! - the attention context matches to `~1e-6`;
-//! - the GRU + structure/box heads reproduce the ONNX nodes bit-for-bit for a
-//!   single step (verified against a standalone graph built from the loop body).
+//! - the GRU hidden state matches to `~5e-7` at every step.
 //!
 //! A dependency trace of the ONNX loop body confirms the per-step structure logits
 //! and next hidden state are functions of only three carried values — the previous
 //! hidden state, the previous token's one-hot, and the (fixed) feature sequence —
 //! plus the weights: there is no hidden counter, position code, or scatter-buffer
-//! feedback. This port implements exactly that recurrence, and an equivalent
-//! decoder assembled purely from the ONNX loop-body nodes and run in `onnxruntime`
-//! produces *identical* per-step argmaxes to this Rust code.
+//! feedback.
 //!
-//! That node-level `onnxruntime` reconstruction itself diverges from the full ONNX
-//! `Loop` by a token on long runs of identical inputs (e.g. many consecutive
-//! `<td></td>` cells) — i.e. two different `onnxruntime` execution paths of the
-//! same math disagree — which pins the residual to float32 execution-order
-//! non-determinism amplified by greedy autoregressive feedback, not to the port's
-//! wiring. The practical effect is a well-formed table whose exact cell count may
-//! differ from the reference by a token or two on ambiguous/degenerate inputs;
-//! real table crops, whose cells carry distinguishing content, are far less prone
-//! to it.
+//! The head branches are the subtle part: the ONNX `Loop` computes
+//! `linear4(linear3(h))` and `sigmoid(linear6(linear5(h)))` with **no ReLU**
+//! between the linear pairs. An earlier port inserted a ReLU there; because ReLU
+//! only changes the output where `linear3(h)` has negative entries, the argmax
+//! happened to agree for the first few tokens and then flipped (structure token 6
+//! vs 48 at step 4 of the reference grid), giving the classic "matches N steps
+//! then diverges" symptom even though the carried hidden state was bit-accurate.
+//! Removing the ReLU makes the per-step argmax and probabilities match the ONNX
+//! `Loop` across the whole decode (see `tests/slanet_real.rs`).
 
 use burn::module::{Module, Param};
 use burn::prelude::Backend;
@@ -205,12 +203,16 @@ impl<B: Backend> SlaHead<B> {
             let gru_in = Tensor::cat(vec![context, prev_onehot.clone()], 1); // [1, 146]
             h = self.gru.forward(gru_in, h.clone());
 
-            // Structure logits and box.
-            let s_hidden = activation::relu(self.linear3.forward(h.clone()));
+            // Structure logits and box. The two head branches are plain
+            // two-layer linear stacks with NO intermediate activation — the ONNX
+            // `Loop` body computes `linear4(linear3(h))` and
+            // `sigmoid(linear6(linear5(h)))` directly, with no ReLU between the
+            // pairs (verified node-for-node against the graph).
+            let s_hidden = self.linear3.forward(h.clone());
             let s_logits = self.linear4.forward(s_hidden); // [1, NUM_CLASSES]
             let s_probs = activation::softmax(s_logits.clone(), 1);
 
-            let l_hidden = activation::relu(self.linear5.forward(h.clone()));
+            let l_hidden = self.linear5.forward(h.clone());
             let l_box = activation::sigmoid(self.linear6.forward(l_hidden)); // [1, LOC_DIM]
 
             let s_vec = to_vec::<B>(s_probs);
@@ -233,6 +235,44 @@ impl<B: Backend> SlaHead<B> {
             loc_preds,
             len,
         }
+    }
+}
+
+/// One per-step decode trace entry: `(hidden[HIDDEN], structure argmax,
+/// structure probs[NUM_CLASSES])`, used only by the hidden parity hooks.
+#[doc(hidden)]
+pub type StepTrace = (Vec<f32>, usize, Vec<f32>);
+
+/// Parity hook (hidden): per-step decode trace for numeric comparison against
+/// the ONNX `Loop`. Not part of the public API.
+#[doc(hidden)]
+impl<B: Backend> SlaHead<B> {
+    /// Runs `steps` decode steps and returns, per step, the post-GRU hidden state
+    /// `[HIDDEN]`, the structure argmax index, and the full `[NUM_CLASSES]` probs.
+    pub fn debug_steps(&self, fea: Tensor<B, 3>, steps: usize) -> Vec<StepTrace> {
+        let device = fea.device();
+        let fea_proj = self.linear0.forward(fea.clone());
+        let mut h = Tensor::<B, 2>::zeros([1, HIDDEN], &device);
+        let mut prev_onehot = onehot::<B>(0, NUM_CLASSES, &device);
+        let mut out = Vec::with_capacity(steps);
+        for _ in 0..steps {
+            let h_proj = self.linear1.forward(h.clone());
+            let e = activation::tanh(fea_proj.clone().add(h_proj.unsqueeze_dim(1)));
+            let score = self.linear2.forward(e);
+            let alpha = activation::softmax(score, 1);
+            let context = alpha.mul(fea.clone()).sum_dim(1).squeeze_dim::<2>(1);
+            let gru_in = Tensor::cat(vec![context, prev_onehot.clone()], 1);
+            h = self.gru.forward(gru_in, h.clone());
+            let s_hidden = self.linear3.forward(h.clone());
+            let s_logits = self.linear4.forward(s_hidden);
+            let s_probs = activation::softmax(s_logits, 1);
+            let s_vec = to_vec::<B>(s_probs);
+            let idx = argmax(&s_vec);
+            let h_vec = to_vec::<B>(h.clone());
+            out.push((h_vec, idx, s_vec));
+            prev_onehot = onehot::<B>(idx, NUM_CLASSES, &device);
+        }
+        out
     }
 }
 

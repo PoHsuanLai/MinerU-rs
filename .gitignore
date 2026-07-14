@@ -7,3 +7,7 @@
 # Local editor / OS
 .DS_Store
 *.swp
+
+# Regenerable ONNX reference dumps for parity tests (see the .py dumpers)
+crates/mineru-table/tests/reference/*.bin
+crates/mineru-table/tests/reference/*.shape
