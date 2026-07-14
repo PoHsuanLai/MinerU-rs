@@ -1,26 +1,52 @@
 //! The `content_list.json` renderer — the wire-compatibility boundary.
 //!
-//! [`ContentItem`] is a *separate* serialization type, kept apart from the
-//! in-memory [`Block`] enum on purpose: its field names, tag, and `snake_case`
-//! shape must match Python's `content_list.json` exactly, and pinning that shape
-//! to the domain model would let an internal refactor silently break the wire
-//! format. The mapping from [`Block`] to [`ContentItem`] lives in
+//! [`ContentItem`]/[`ContentBody`] are *separate* serialization types, kept apart
+//! from the in-memory [`Block`] enum on purpose: their field names, tag, and
+//! `snake_case` shape must match Python's `content_list.json` exactly, and pinning
+//! that shape to the domain model would let an internal refactor silently break
+//! the wire format. The mapping from [`Block`] to [`ContentItem`] lives in
 //! [`render_content_list`].
 
-use mineru_types::{Block, Captioned, CodeBody, Document, ImageBody, TableBody, TextRole};
+use mineru_types::{
+    BBox, Block, Captioned, CodeBody, Document, ImageBody, PageSize, TableBody, TextRole,
+};
 use serde::Serialize;
 
 use crate::path::join_image;
 use crate::text::{collect_texts, merge_lines};
 
-/// One entry in a `content_list.json` document.
+/// The edge length every `bbox` is normalized against, matching Python's 0–1000
+/// coordinate mapping (`_build_bbox`).
+const BBOX_SCALE: f32 = 1000.0;
+
+/// One entry in a `content_list.json` document: its type-specific payload plus
+/// the locator fields (`bbox`, `page_idx`) every entry carries.
 ///
-/// Tagged externally by a `type` field with `snake_case` variant names to match
+/// The payload is `#[serde(flatten)]`ed, so this serializes to a single flat
+/// object (`{"type": "text", "text": …, "bbox": …, "page_idx": 0}`) — matching
+/// Python, which appends the same two keys to every item regardless of type.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ContentItem {
+    /// The type-tagged, type-specific content.
+    #[serde(flatten)]
+    pub content: ContentBody,
+    /// The block's box, normalized to `0..=1000` against the page size. Absent
+    /// when the page has no usable size (matching Python's `_build_bbox`, which
+    /// returns `None` and omits the key).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bbox: Option<[i32; 4]>,
+    /// Zero-based index of the page this entry came from.
+    pub page_idx: usize,
+}
+
+/// The type-specific body of a [`ContentItem`].
+///
+/// Tagged internally by a `type` field with `snake_case` variant names to match
 /// the Python output. Empty collections and absent optionals are omitted so the
 /// JSON matches Python's conditional-key construction.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum ContentItem {
+pub enum ContentBody {
     /// Flowing text, optionally a heading (`text_level` present for titles).
     Text {
         /// The merged text of the block.
@@ -94,19 +120,44 @@ pub enum ContentItem {
 /// `image_dir` resolves image references (same joining as the Markdown
 /// renderer). Blocks with discard-y text roles produce no entry.
 pub fn render_content_list(doc: &Document, image_dir: &str) -> Vec<ContentItem> {
-    doc.blocks()
-        .filter_map(|block| content_item(block, image_dir))
+    // Iterate pages rather than `doc.blocks()`: each entry needs its page's index
+    // and size, which flattening over blocks would discard.
+    doc.pages
+        .iter()
+        .flat_map(|page| {
+            page.blocks.iter().filter_map(move |block| {
+                Some(ContentItem {
+                    content: content_body(block, image_dir)?,
+                    bbox: scale_bbox(block.bbox(), page.size),
+                    page_idx: page.index,
+                })
+            })
+        })
         .collect()
 }
 
-/// Maps one block to at most one [`ContentItem`].
+/// Normalizes a block's box to Python's `0..=1000` coordinate range.
+///
+/// Mirrors `_build_bbox`: divide by the page dimension, scale by 1000, and
+/// **truncate** (Python's `int()`), not round. Returns `None` for a degenerate
+/// page size, where the mapping is undefined and Python omits the key.
+fn scale_bbox(bbox: BBox, size: PageSize) -> Option<[i32; 4]> {
+    if size.width <= 0.0 || size.height <= 0.0 {
+        return None;
+    }
+    let sx = |v: f32| (v * BBOX_SCALE / size.width) as i32;
+    let sy = |v: f32| (v * BBOX_SCALE / size.height) as i32;
+    Some([sx(bbox.x0), sy(bbox.y0), sx(bbox.x1), sy(bbox.y1)])
+}
+
+/// Maps one block to at most one [`ContentBody`].
 ///
 /// Exhaustive over [`Block`] for the same reason as the Markdown renderer: a new
 /// variant must be handled here before it compiles.
-fn content_item(block: &Block, image_dir: &str) -> Option<ContentItem> {
+fn content_body(block: &Block, image_dir: &str) -> Option<ContentBody> {
     match block {
         Block::Text { role, lines, .. } => text_item(*role, merge_lines(lines)),
-        Block::InterlineEquation { latex, .. } => Some(ContentItem::Equation {
+        Block::InterlineEquation { latex, .. } => Some(ContentBody::Equation {
             text: latex.to_string(),
             text_format: "latex".to_owned(),
         }),
@@ -118,9 +169,9 @@ fn content_item(block: &Block, image_dir: &str) -> Option<ContentItem> {
 }
 
 /// Builds a text/heading item, dropping discard-y roles.
-fn text_item(role: TextRole, text: String) -> Option<ContentItem> {
+fn text_item(role: TextRole, text: String) -> Option<ContentBody> {
     match role {
-        TextRole::Title(level) => Some(ContentItem::Text {
+        TextRole::Title(level) => Some(ContentBody::Text {
             text,
             // Python omits `text_level` for the doc title (level 0).
             text_level: (level.0 != 0).then_some(level.0),
@@ -134,7 +185,7 @@ fn text_item(role: TextRole, text: String) -> Option<ContentItem> {
         | TextRole::List
         | TextRole::Index
         | TextRole::Abstract
-        | TextRole::RefText => Some(ContentItem::Text {
+        | TextRole::RefText => Some(ContentBody::Text {
             text,
             text_level: None,
         }),
@@ -142,8 +193,8 @@ fn text_item(role: TextRole, text: String) -> Option<ContentItem> {
 }
 
 /// Builds an image item.
-fn image_item(c: &Captioned<ImageBody>, image_dir: &str) -> ContentItem {
-    ContentItem::Image {
+fn image_item(c: &Captioned<ImageBody>, image_dir: &str) -> ContentBody {
+    ContentBody::Image {
         img_path: join_image(image_dir, c.body.image.as_str()),
         image_caption: collect_texts(&c.captions),
         image_footnote: collect_texts(&c.footnotes),
@@ -151,8 +202,8 @@ fn image_item(c: &Captioned<ImageBody>, image_dir: &str) -> ContentItem {
 }
 
 /// Builds a chart item.
-fn chart_item(c: &Captioned<ImageBody>, image_dir: &str) -> ContentItem {
-    ContentItem::Chart {
+fn chart_item(c: &Captioned<ImageBody>, image_dir: &str) -> ContentBody {
+    ContentBody::Chart {
         img_path: join_image(image_dir, c.body.image.as_str()),
         chart_caption: collect_texts(&c.captions),
         chart_footnote: collect_texts(&c.footnotes),
@@ -160,14 +211,14 @@ fn chart_item(c: &Captioned<ImageBody>, image_dir: &str) -> ContentItem {
 }
 
 /// Builds a table item; `img_path` is empty when the table has no cropped raster.
-fn table_item(c: &Captioned<TableBody>, image_dir: &str) -> ContentItem {
+fn table_item(c: &Captioned<TableBody>, image_dir: &str) -> ContentBody {
     let img_path = c
         .body
         .image
         .as_ref()
         .map(|r| join_image(image_dir, r.as_str()))
         .unwrap_or_default();
-    ContentItem::Table {
+    ContentBody::Table {
         img_path,
         table_body: c.body.html.to_string(),
         table_caption: collect_texts(&c.captions),
@@ -176,7 +227,7 @@ fn table_item(c: &Captioned<TableBody>, image_dir: &str) -> ContentItem {
 }
 
 /// Builds a code item; code lines join with newlines to preserve layout.
-fn code_item(c: &Captioned<CodeBody>) -> ContentItem {
+fn code_item(c: &Captioned<CodeBody>) -> ContentBody {
     let code_body = c
         .body
         .lines
@@ -184,7 +235,7 @@ fn code_item(c: &Captioned<CodeBody>) -> ContentItem {
         .map(crate::text::flatten_line)
         .collect::<Vec<_>>()
         .join("\n");
-    ContentItem::Code {
+    ContentBody::Code {
         code_body,
         code_language: c.body.language.as_ref().map(|l| l.to_string()),
         code_caption: collect_texts(&c.captions),
