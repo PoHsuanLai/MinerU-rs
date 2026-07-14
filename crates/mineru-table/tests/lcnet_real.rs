@@ -20,16 +20,15 @@
 //!
 //! The `.bin`/`.shape` dumps are gitignored (regenerate with the venv:
 //! `python tests/reference/py_ref_lcnet.py`). This test is `#[ignore]`d because
-//! it needs the model weights on disk + the `onnx-import` feature, and the
-//! ndarray CPU forward is slow. Run with:
+//! it triggers a runtime weight fetch (or reuses the cache under
+//! `MINERU_MODELS_DIR`) and the ndarray CPU forward is slow. The models are
+//! always compiled now, so no cargo feature is needed. Run with:
 //!
 //! ```text
 //! MINERU_MODELS_DIR=/Volumes/Archive/mineru/models/PDF-Extract-Kit-1.0 \
-//!   cargo test -p mineru-table --features onnx-import --release \
+//!   cargo test -p mineru-table --release \
 //!   --test lcnet_real -- --ignored --nocapture
 //! ```
-
-#![cfg(lcnet_generated)]
 
 use image::{Rgb, RgbImage};
 

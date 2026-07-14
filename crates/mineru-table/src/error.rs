@@ -7,11 +7,23 @@
 /// Errors originating in the table-recognition crate.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// A model was requested but the crate was built without the `onnx-import`
-    /// feature (or without the corresponding `.onnx` file), so no weights are
-    /// compiled in. Inference is unavailable; pure post-processing still works.
-    #[error("model `{0}` is not available: build with the `onnx-import` feature and the ONNX files present")]
+    /// A model's weights are not available for inference (e.g. the fetch has not
+    /// been attempted, or the mask → polygon post-processing that consumes the
+    /// forward output is not yet ported). The network itself is always compiled;
+    /// pure post-processing still works. Fetch/load failures use the more
+    /// specific [`Error::WeightFetch`]/[`Error::Cache`]/[`Error::WeightLoad`].
+    #[error("model `{0}` is not available")]
     ModelUnavailable(&'static str),
+
+    /// Downloading a model's `.bpk` weights from the release failed (network
+    /// error, non-200 HTTP status, or a SHA-256 mismatch on the fetched bytes).
+    #[error("failed to fetch model weights: {0}")]
+    WeightFetch(String),
+
+    /// Resolving or writing the on-disk weight cache failed (no writable cache
+    /// directory could be determined, or a filesystem I/O error occurred).
+    #[error("weight cache error: {0}")]
+    Cache(String),
 
     /// An input image had an unusable size for a model's fixed input geometry.
     #[error("image too small for {model}: got {width}x{height}, need at least {min_width}x{min_height}")]

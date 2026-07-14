@@ -9,9 +9,11 @@
 //! ## Status
 //!
 //! - The UNet itself is a plain conv/convtranspose/concat/sigmoid encoder-decoder
-//!   and imports cleanly via `burn-onnx` codegen behind the `onnx-import`
-//!   feature; [`UnetModel`] wraps the generated segmentation network and reports
-//!   [`crate::error::Error::ModelUnavailable`] when built without it.
+//!   that `burn-onnx` codegen imported directly; the generated source is
+//!   committed as vendored code (see [`crate::generated::unet`]) and always
+//!   compiled. [`UnetModel`] wraps it and loads its weights via a runtime fetch
+//!   ([`crate::weights`]); a `new()` (unloaded) handle reports
+//!   [`crate::error::Error::ModelUnavailable`].
 //! - The mask → polygon line-extraction stage (morphology, 8-connectivity
 //!   labeling, min-area-rect) is ported in [`extract`]; it reuses the hoisted
 //!   `cv2.minAreaRect` port and hand-rolls only the anisotropic 1-D line-kernel

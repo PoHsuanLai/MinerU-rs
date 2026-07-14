@@ -10,16 +10,19 @@
 //!   turns the mask into cell polygons, the logical grid is inferred, and OCR
 //!   text is rendered into `<table>` HTML with `rowspan`/`colspan`.
 //!
-//! ## Model availability
+//! ## Models and weights
 //!
-//! The neural networks are optional. The LCNet classifier and UNet segmenter are
-//! generated from their `.onnx` files at build time behind the `onnx-import`
-//! cargo feature; SLANet-plus is hand-ported and loaded from a weight file. When
-//! a model's weights are absent the corresponding `recognize_*`/`classify` entry
-//! point returns [`Error::ModelUnavailable`], while all pure pre/post-processing
-//! (structure decode, OCR↔cell matching, grid recovery, HTML assembly) works
-//! unconditionally and is fully unit-tested. This keeps the crate building — and
-//! its logic testable — with no model files and no network access.
+//! The LCNet classifier and UNet segmenter are Burn networks committed to the
+//! tree under [`generated`] (vendored `burn-onnx` output from the PDF-Extract-Kit
+//! ONNX exports); SLANet-plus is hand-ported. All three are always compiled in.
+//! Their weights are *not* embedded: the two generated models' `.bpk` files are
+//! fetched once from a public GitHub release and cached on disk by [`weights`] on
+//! first use (see that module for the cache location and the
+//! `MINERU_TABLE_WEIGHTS_BASE`/`MINERU_MODELS_DIR` overrides). All pure
+//! pre/post-processing (structure decode, OCR↔cell matching, grid recovery, HTML
+//! assembly) works with no network access and is fully unit-tested; only the
+//! neural forward paths need the fetched weights, and they surface a typed
+//! [`Error::WeightFetch`]/[`Error::WeightLoad`]/[`Error::Cache`] on failure.
 //!
 //! ## Output
 //!
@@ -35,26 +38,13 @@ pub mod matching;
 pub mod ocr;
 pub mod slanet;
 pub mod unet;
+pub mod weights;
 
-// Build-time generated Burn modules (present only under the `onnx-import`
-// feature with the corresponding `.onnx` files). Guarded by cfgs the build
-// script emits so the crate compiles with or without them.
-#[cfg(any(lcnet_generated, unet_generated))]
-mod model {
-    #[cfg(lcnet_generated)]
-    pub mod pp_lcnet_x1_0_table_cls {
-        // burn-onnx names the generated file after the ONNX file verbatim,
-        // preserving case and hyphens (`PP-LCNet_x1_0_table_cls.rs`).
-        include!(concat!(
-            env!("OUT_DIR"),
-            "/model/PP-LCNet_x1_0_table_cls.rs"
-        ));
-    }
-    #[cfg(unet_generated)]
-    pub mod unet {
-        include!(concat!(env!("OUT_DIR"), "/model/unet.rs"));
-    }
-}
+// Vendored, machine-generated Burn modules for the LCNet classifier and the UNet
+// segmenter (formerly generated into `$OUT_DIR` at build time; now committed
+// under `src/generated/` and compiled unconditionally). Do not hand-edit —
+// regenerate with `burn-onnx` and replace the files wholesale.
+mod generated;
 
 pub use cls::{classify, Classification, TableClass};
 pub use error::{Error, Result};

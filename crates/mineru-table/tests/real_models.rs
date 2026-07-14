@@ -1,16 +1,14 @@
 //! End-to-end integration tests that exercise the *real* generated neural
 //! networks (LCNet classifier + UNet segmenter).
 //!
-//! These require the `onnx-import` feature AND `MINERU_MODELS_DIR` set to a
-//! PDF-Extract-Kit checkout at build time (so build.rs can codegen the models).
-//! They are `#[ignore]`d because the ndarray CPU forward pass is slow. Run with:
+//! The models are always compiled in; running them triggers a runtime weight
+//! fetch (or reuses the cache under `MINERU_MODELS_DIR`). They are `#[ignore]`d
+//! because the ndarray CPU forward pass is slow. Run with:
 //!
 //! ```text
 //! MINERU_MODELS_DIR=/Volumes/Archive/mineru/models/PDF-Extract-Kit-1.0 \
-//!   cargo test -p mineru-table --features onnx-import --test real_models -- --ignored --nocapture
+//!   cargo test -p mineru-table --test real_models -- --ignored --nocapture
 //! ```
-
-#![cfg(lcnet_generated)]
 
 use image::{Rgb, RgbImage};
 
@@ -32,7 +30,7 @@ fn synthetic_table(w: u32, h: u32) -> RgbImage {
 }
 
 #[test]
-#[ignore = "requires onnx-import feature + MINERU_MODELS_DIR; slow ndarray forward"]
+#[ignore = "requires MINERU_MODELS_DIR or network for the weight fetch; slow ndarray forward"]
 fn classify_runs_real_lcnet_forward() {
     use mineru_table::cls::classify;
 
@@ -63,9 +61,8 @@ fn classify_runs_real_lcnet_forward() {
 }
 
 /// Exercises the UNet forward pass directly and asserts a sane 3-class mask.
-#[cfg(unet_generated)]
 #[test]
-#[ignore = "requires onnx-import feature + MINERU_MODELS_DIR; slow ndarray forward"]
+#[ignore = "requires MINERU_MODELS_DIR or network for the weight fetch; slow ndarray forward"]
 fn unet_forward_produces_mask() {
     use mineru_table::unet::model::UnetModel;
 
@@ -102,9 +99,8 @@ fn unet_forward_produces_mask() {
 /// 4 rows × 4 cols with unit rowspans/colspans — the endpoint adjustment
 /// (`adjust_lines`/`final_adjust_lines`) is what stops per-column y-jitter from
 /// over-segmenting rows (pre-fix this recovered 13 rows).
-#[cfg(unet_generated)]
 #[test]
-#[ignore = "requires onnx-import feature + MINERU_MODELS_DIR; slow ndarray forward"]
+#[ignore = "requires MINERU_MODELS_DIR or network for the weight fetch; slow ndarray forward"]
 fn unet_segment_cells_recovers_grid_html() {
     use mineru_table::unet::model::UnetModel;
     use mineru_table::unet::{plot_html_table, recover, COL_THRESHOLD, ROW_THRESHOLD};

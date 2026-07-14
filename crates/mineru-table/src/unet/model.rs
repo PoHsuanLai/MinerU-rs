@@ -1,34 +1,41 @@
 //! UNet line-segmentation model wrapper.
 //!
 //! The network is a conv/convtranspose/concat/sigmoid encoder-decoder that
-//! `burn-onnx` codegen can import directly (behind the `onnx-import` feature);
-//! this wrapper feeds the preprocessed 1024×1024 image through it and turns the
-//! 3-class ruling-line mask into cell quadrilaterals.
+//! `burn-onnx` codegen imported directly; the generated source is committed as
+//! vendored code (see [`crate::generated::unet`]) and always compiled in. This
+//! wrapper feeds the preprocessed 1024×1024 image through it and turns the
+//! 3-class ruling-line mask into cell quadrilaterals. The model's `.bpk` weights
+//! are fetched from the release and cached at runtime by [`crate::weights`].
 //!
 //! ## Status
 //!
-//! - **Neural forward pass** — wired under `onnx-import`: the generated network is
-//!   loaded (embedded `.bpk` weights) and run, producing the per-pixel 3-class
-//!   argmax mask (`0` background / `1` horizontal / `2` vertical line). See
+//! - **Neural forward pass** — the generated network is loaded (runtime-fetched
+//!   `.bpk` weights) and run, producing the per-pixel 3-class argmax mask
+//!   (`0` background / `1` horizontal / `2` vertical line). See
 //!   [`UnetModel::segment_mask`].
-//! - **Mask → polygon extraction** (OpenCV morphology, 8-connectivity labeling,
-//!   min-area-rect) is **not yet ported**, so [`UnetModel::segment_cells`] still
-//!   reports the model unavailable rather than fabricate polygons. The downstream
-//!   grid recovery + HTML assembly it feeds is fully implemented and tested (see
+//! - **Mask → polygon extraction** (morphology, 8-connectivity labeling,
+//!   min-area-rect) is ported in [`super::extract`], so [`UnetModel::segment_cells`]
+//!   runs the full wired-table segmentation → recovery → HTML path (see
 //!   [`super::recover_and_render`]).
 
 use image::RgbImage;
 
 use crate::error::{Error, Result};
+use crate::generated::unet as generated;
 
 use super::recover::Poly;
 
 /// UNet fixed input side (Python `inp_height = inp_width = 1024`).
 pub const INPUT_SIDE: u32 = 1024;
 
+/// The Burn CPU backend the vendored generated UNet compiles against.
+///
+/// The crate depends on `burn` with the `ndarray` feature, so the NdArray backend
+/// is the one available here.
+type Backend = burn::backend::NdArray<f32>;
+
 /// A segmentation mask: per-pixel class indices (`0` background, `1` horizontal
 /// line, `2` vertical line) laid out row-major over `height * width`.
-#[cfg(unet_generated)]
 #[derive(Debug, Clone)]
 pub struct SegMask {
     /// Mask height in pixels.
@@ -42,36 +49,34 @@ pub struct SegMask {
 /// The wired-table line-segmentation model.
 #[derive(Debug, Default)]
 pub struct UnetModel {
-    // Only read on the `unet_generated` path (where weights exist); without the
-    // feature every `segment_cells` call short-circuits to `ModelUnavailable`.
-    #[cfg_attr(not(unet_generated), allow(dead_code))]
+    /// Whether this handle is expected to run inference. A `new()` handle reports
+    /// [`Error::ModelUnavailable`] rather than trigger a weight fetch, matching
+    /// the previous behaviour; `loaded()` handles run the real forward.
     ready: bool,
 }
 
 impl UnetModel {
-    /// Creates an unweighted model; `segment_cells` reports it unavailable.
+    /// Creates a handle that reports the model unavailable; use [`Self::loaded`]
+    /// to run inference.
     pub fn new() -> Self {
         Self { ready: false }
     }
 
-    /// Creates a model with the embedded weights loaded.
+    /// Creates a handle that runs the real UNet forward.
     ///
-    /// Under `onnx-import` the generated network is loadable and its forward pass
-    /// runs (see [`UnetModel::segment_mask`]); without the feature this is
-    /// identical to [`UnetModel::new`].
-    #[cfg(unet_generated)]
+    /// The generated network is loaded with runtime-fetched weights on first use
+    /// (cached for the process lifetime by [`Self::segment_mask`]).
     pub fn loaded() -> Self {
         Self { ready: true }
     }
 
     /// Runs segmentation and returns recovered cell quadrilaterals.
     ///
-    /// Under `onnx-import` this runs the neural forward pass
-    /// ([`UnetModel::segment_mask`]) and then the classical mask → polygon
-    /// extraction ([`super::extract::extract_cell_polygons`]). Without the feature
-    /// (or without weights) it returns [`Error::ModelUnavailable`] rather than
-    /// fabricate cells.
-    #[cfg(unet_generated)]
+    /// Runs the neural forward pass ([`Self::segment_mask`]) and then the
+    /// classical mask → polygon extraction
+    /// ([`super::extract::extract_cell_polygons`]). A handle from [`Self::new`]
+    /// (or a weight fetch/load failure) returns [`Error::ModelUnavailable`] /
+    /// the relevant typed error rather than fabricate cells.
     pub fn segment_cells(&self, img: &RgbImage) -> Result<Vec<Poly>> {
         if !self.ready {
             return Err(Error::ModelUnavailable("unet"));
@@ -84,18 +89,6 @@ impl UnetModel {
         ))
     }
 
-    /// Runs segmentation and returns recovered cell quadrilaterals.
-    ///
-    /// Built without the `onnx-import` feature there are no weights compiled in, so
-    /// this always reports the model unavailable.
-    #[cfg(not(unet_generated))]
-    pub fn segment_cells(&self, _img: &RgbImage) -> Result<Vec<Poly>> {
-        Err(Error::ModelUnavailable("unet"))
-    }
-}
-
-#[cfg(unet_generated)]
-impl UnetModel {
     /// Preprocesses an RGB image into the planar `[3, 1024, 1024]` `f32` buffer
     /// the UNet expects: resize to `INPUT_SIDE` square, scale to `[0, 1]`, HWC →
     /// CHW. (Mirrors the Python `cv2.resize` + `/255` pipeline.)
@@ -120,9 +113,7 @@ impl UnetModel {
     /// argmax segmentation mask.
     ///
     /// This exercises the real neural network end-to-end (weight load is cached
-    /// for the process lifetime). It is the wired half of the wired-table path;
-    /// the mask → polygon post-processing that would consume this is still
-    /// unported (see [`UnetModel::segment_cells`]).
+    /// for the process lifetime). It is the wired half of the wired-table path.
     pub fn segment_mask(&self, img: &RgbImage) -> Result<SegMask> {
         Self::run_mask(Self::preprocess(img))
     }
@@ -151,29 +142,59 @@ impl UnetModel {
         Self::run_mask(input)
     }
 
+    /// Loads the generated UNet model with runtime-fetched weights, panic-free.
+    ///
+    /// Unlike the vendored `Model::from_bytes` (which `.expect()`s), this drives
+    /// the [`burn_store::BurnpackStore`] directly and maps every failure to a
+    /// typed [`Error`].
+    fn load_unet(
+        device: &burn::backend::ndarray::NdArrayDevice,
+    ) -> Result<generated::Model<Backend>> {
+        use burn_store::{BurnpackStore, ModuleSnapshot};
+
+        let path = crate::weights::weight_path(crate::weights::TableWeight::Unet)?;
+        let mut model = generated::Model::<Backend>::new(device);
+        let mut store = BurnpackStore::from_file(&path);
+        let result = model
+            .load_from(&mut store)
+            .map_err(|e| Error::WeightLoad(format!("UNet weights from {}: {e}", path.display())))?;
+        if !result.errors.is_empty() || !result.missing.is_empty() {
+            return Err(Error::WeightLoad(format!(
+                "UNet weights from {}: {} apply error(s), {} missing tensor(s)",
+                path.display(),
+                result.errors.len(),
+                result.missing.len()
+            )));
+        }
+        Ok(model)
+    }
+
     /// Runs the generated UNet forward over a preprocessed CHW buffer, returning
     /// the per-pixel 3-class argmax mask. The weights are cached for the process
     /// lifetime; repeated calls only pay for the forward pass.
     fn run_mask(input: Vec<f32>) -> Result<SegMask> {
         use burn::tensor::{Tensor, TensorData};
-
-        type B = burn::backend::NdArray<f32>;
-
-        use crate::model::unet::Model;
         use std::sync::OnceLock;
-        static MODEL: OnceLock<Model<B>> = OnceLock::new();
+
+        // Cache the (weight-load-failable) model for the process lifetime. A
+        // failed load is not cached, so a later call can retry.
+        static MODEL: OnceLock<generated::Model<Backend>> = OnceLock::new();
 
         let device = burn::backend::ndarray::NdArrayDevice::default();
-        let model = MODEL.get_or_init(|| {
-            let bytes = burn::tensor::Bytes::from_bytes_vec(
-                include_bytes!(concat!(env!("OUT_DIR"), "/model/unet.bpk")).to_vec(),
-            );
-            Model::from_bytes(bytes, &device)
-        });
+        let model = match MODEL.get() {
+            Some(m) => m,
+            None => {
+                let m = Self::load_unet(&device)?;
+                let _ = MODEL.set(m);
+                MODEL.get().ok_or_else(|| {
+                    Error::WeightLoad("UNet model cache unexpectedly empty".to_string())
+                })?
+            }
+        };
 
         let sz = INPUT_SIDE as usize;
         let data = TensorData::new(input, [1, 3, sz, sz]);
-        let x = Tensor::<B, 4>::from_data(data, &device);
+        let x = Tensor::<Backend, 4>::from_data(data, &device);
 
         // The generated top-level `forward` already argmaxes to an int class mask
         // of shape `[1, N, H, W]`.

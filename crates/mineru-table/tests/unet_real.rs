@@ -20,13 +20,13 @@
 //! ```text
 //! # 1. dump the input (test SKIPs):
 //! MINERU_MODELS_DIR=/Volumes/Archive/mineru/models/PDF-Extract-Kit-1.0 \
-//!   cargo test -p mineru-table --features onnx-import --release \
+//!   cargo test -p mineru-table --release \
 //!   --test unet_real -- --ignored --nocapture --test-threads=1
 //! # 2. produce the ONNX reference mask from that input:
 //! python tests/reference/py_ref_unet.py
 //! # 3. re-run: now asserts per-pixel parity:
 //! MINERU_MODELS_DIR=/Volumes/Archive/mineru/models/PDF-Extract-Kit-1.0 \
-//!   cargo test -p mineru-table --features onnx-import --release \
+//!   cargo test -p mineru-table --release \
 //!   --test unet_real -- --ignored --nocapture --test-threads=1
 //! ```
 //!
@@ -34,11 +34,10 @@
 //! **100.0%** of the 1024² pixels, so the gate asserts exact per-pixel equality.
 //!
 //! The `.bin`/`.shape` dumps are gitignored (regenerable). This test is
-//! `#[ignore]`d because it needs the model weights on disk + the `onnx-import`
-//! feature, and the ndarray CPU forward over a 1024² image is slow (minutes in
-//! debug — use `--release`).
-
-#![cfg(unet_generated)]
+//! `#[ignore]`d because it triggers a runtime weight fetch (or reuses the cache
+//! under `MINERU_MODELS_DIR`) and the ndarray CPU forward over a 1024² image is
+//! slow (minutes in debug — use `--release`). The models are always compiled, so
+//! no cargo feature is needed.
 
 use image::{Rgb, RgbImage};
 

@@ -2,9 +2,10 @@
 //!
 //! Port of `paddle_table_cls.py`. The model is a plain PP-LCNet CNN with a
 //! 2-class head; it imports cleanly via `burn-onnx` codegen (all ops supported),
-//! so the network itself is generated at build time behind the `onnx-import`
-//! feature. This module owns the pre-processing and the argmax head, and calls
-//! the generated model when present.
+//! so the network is committed as vendored generated source (see
+//! [`crate::generated::lcnet`]) and always compiled in. This module owns the
+//! pre-processing and the argmax head, and runs the generated model with weights
+//! fetched and cached at runtime by [`crate::weights`].
 //!
 //! Pre-processing (`PaddleTableClsModel.preprocess`):
 //! 1. resize so the shortest side is 256 (bilinear),
@@ -16,6 +17,7 @@
 use image::RgbImage;
 
 use crate::error::{Error, Result};
+use crate::generated::lcnet as generated;
 
 /// Shortest-side resize target before the center crop.
 const RESIZE_SHORT: u32 = 256;
@@ -140,32 +142,45 @@ pub fn head(logits: &[f32]) -> Result<Classification> {
 
 /// Classifies a table crop as wired or wireless.
 ///
-/// When the crate is built without the generated LCNet model (the default), this
-/// returns [`Error::ModelUnavailable`]. Pre-processing and the argmax head are
-/// still unit-tested independently.
+/// Runs the real generated LCNet forward. The model's `.bpk` weights are fetched
+/// from the release and cached on first use (see [`crate::weights`]); a fetch or
+/// load failure surfaces as a typed [`Error`]. Pre-processing and the argmax head
+/// are also unit-tested independently.
 pub fn classify(img: &RgbImage) -> Result<Classification> {
     let input = preprocess(img)?;
-    #[cfg(lcnet_generated)]
-    {
-        run_lcnet(input)
-    }
-    #[cfg(not(lcnet_generated))]
-    {
-        let _ = input;
-        Err(Error::ModelUnavailable("PP-LCNet"))
-    }
-}
-
-/// Runs the generated LCNet classifier over a preprocessed CHW buffer.
-///
-/// The whole CNN + its weights are expensive to build, so the loaded model is
-/// cached for the process lifetime; repeated calls only pay for the forward
-/// pass. The weights are embedded from the build-time `.bpk` next to the
-/// generated source, so no runtime path is needed.
-#[cfg(lcnet_generated)]
-fn run_lcnet(input: Vec<f32>) -> Result<Classification> {
     let out = debug_forward(input)?;
     head(&out)
+}
+
+/// The Burn CPU backend the vendored generated LCNet compiles against.
+///
+/// The crate depends on `burn` with the `ndarray` feature, so the NdArray backend
+/// is the one available here.
+type Backend = burn::backend::NdArray<f32>;
+
+/// Loads the generated LCNet model with runtime-fetched weights, panic-free.
+///
+/// Unlike the vendored `Model::from_bytes` (which `.expect()`s), this drives the
+/// [`burn_store::BurnpackStore`] directly and maps every failure to a typed
+/// [`Error`]. Used by the process-lifetime cache in [`debug_forward`].
+fn load_lcnet(device: &burn::backend::ndarray::NdArrayDevice) -> Result<generated::Model<Backend>> {
+    use burn_store::{BurnpackStore, ModuleSnapshot};
+
+    let path = crate::weights::weight_path(crate::weights::TableWeight::Lcnet)?;
+    let mut model = generated::Model::<Backend>::new(device);
+    let mut store = BurnpackStore::from_file(&path);
+    let result = model
+        .load_from(&mut store)
+        .map_err(|e| Error::WeightLoad(format!("LCNet weights from {}: {e}", path.display())))?;
+    if !result.errors.is_empty() || !result.missing.is_empty() {
+        return Err(Error::WeightLoad(format!(
+            "LCNet weights from {}: {} apply error(s), {} missing tensor(s)",
+            path.display(),
+            result.errors.len(),
+            result.missing.len()
+        )));
+    }
+    Ok(model)
 }
 
 /// Runs the generated LCNet forward over an already-preprocessed CHW buffer and
@@ -179,33 +194,35 @@ fn run_lcnet(input: Vec<f32>) -> Result<Classification> {
 ///
 /// The whole CNN + its weights are expensive to build, so the loaded model is
 /// cached for the process lifetime; repeated calls only pay for the forward
-/// pass. The weights are embedded from the build-time `.bpk` next to the
-/// generated source, so no runtime path is needed.
-#[cfg(lcnet_generated)]
+/// pass. The weights come from the runtime-fetched cached `.bpk`
+/// ([`crate::weights`]); a fetch/load failure is returned as a typed [`Error`].
 #[doc(hidden)]
 pub fn debug_forward(input: Vec<f32>) -> Result<Vec<f32>> {
     use burn::tensor::{Tensor, TensorData};
-
-    // The crate depends on `burn` with the `ndarray` feature, so the CPU NdArray
-    // backend is the one every generated module compiles against here.
-    type B = burn::backend::NdArray<f32>;
-
-    use crate::model::pp_lcnet_x1_0_table_cls::Model;
     use std::sync::OnceLock;
-    static MODEL: OnceLock<Model<B>> = OnceLock::new();
+
+    // Cache the (weight-load-failable) model for the process lifetime. The first
+    // successful load wins; a failed load is not cached, so a later call can
+    // retry (e.g. after the network recovers).
+    static MODEL: OnceLock<generated::Model<Backend>> = OnceLock::new();
 
     let device = burn::backend::ndarray::NdArrayDevice::default();
-    let model = MODEL.get_or_init(|| {
-        let bytes = burn::tensor::Bytes::from_bytes_vec(
-            include_bytes!(concat!(env!("OUT_DIR"), "/model/PP-LCNet_x1_0_table_cls.bpk")).to_vec(),
-        );
-        Model::from_bytes(bytes, &device)
-    });
+    let model = match MODEL.get() {
+        Some(m) => m,
+        None => {
+            let m = load_lcnet(&device)?;
+            // Ignore the race loser; both loads produce an equivalent model.
+            let _ = MODEL.set(m);
+            MODEL.get().ok_or_else(|| {
+                Error::WeightLoad("LCNet model cache unexpectedly empty".to_string())
+            })?
+        }
+    };
 
     // CHW `Vec<f32>` -> `[1, 3, 224, 224]` NCHW tensor.
     let side = CROP as usize;
     let data = TensorData::new(input, [1, 3, side, side]);
-    let x = Tensor::<B, 4>::from_data(data, &device);
+    let x = Tensor::<Backend, 4>::from_data(data, &device);
     model
         .forward(x)
         .into_data()
@@ -265,13 +282,8 @@ mod tests {
         ));
     }
 
-    // Only meaningful without the generated model: with `lcnet_generated`,
-    // `classify` runs the real forward and returns `Ok` (see the `real_models`
-    // integration test).
-    #[cfg(not(lcnet_generated))]
-    #[test]
-    fn classify_reports_unavailable_without_model() {
-        let img = RgbImage::new(300, 300);
-        assert!(matches!(classify(&img), Err(Error::ModelUnavailable(_))));
-    }
+    // `classify` now always runs the real forward, which triggers a runtime
+    // weight fetch — a network operation not exercised by the unit tests. Its
+    // success path is covered by the `#[ignore]`d `real_models`/`lcnet_real`
+    // integration gates; the pre-processing and argmax head are unit-tested above.
 }
