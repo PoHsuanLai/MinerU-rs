@@ -5,24 +5,67 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "The MinerU command-line tool: parses a PDF with a selectable backend (local pipeline or external VLM server) and writes Markdown + content_list.json."
+description = "MinerU document parser: an umbrella crate re-exporting the workspace's thin crates (types, models, backends) behind feature flags, plus the `mineru` command-line tool."
 
+# Library facade: re-exports the sub-crates under one module tree. Downstream
+# users can `mineru::types::BBox` / `mineru::layout::LayoutModel`, or still
+# `cargo add mineru-layout` for a single crate.
+[lib]
+name = "mineru"
+path = "src/lib.rs"
+
+# The command-line tool, built on top of the facade. Needs the `cli` feature
+# (which pulls both backends); `required-features` keeps a `--no-default-features`
+# library build from trying to compile the binary.
 [[bin]]
 name = "mineru"
 path = "src/main.rs"
+required-features = ["cli"]
+
+[features]
+# The bin needs both backends selectable at runtime, plus the CLI deps.
+default = ["cli"]
+cli = ["pipeline", "vlm", "dep:clap", "dep:tokio", "dep:anyhow", "dep:tracing-subscriber"]
+
+# Fully-local Burn pipeline backend + every model it composes.
+pipeline = [
+    "burn-common", "ocr", "layout", "table", "formula",
+    "dep:mineru-backend-pipeline",
+]
+# External OpenAI-compatible VLM backend + its client.
+vlm = ["dep:mineru-vlm-client", "dep:mineru-backend-vlm"]
+
+# Individual model crates, so a downstream user can pull just one.
+burn-common = ["dep:mineru-burn-common"]
+ocr = ["dep:mineru-ocr-det", "dep:mineru-ocr-rec", "burn-common"]
+layout = ["dep:mineru-layout", "burn-common"]
+table = ["dep:mineru-table", "burn-common"]
+formula = ["dep:mineru-formula", "burn-common"]
 
 [dependencies]
+# Foundation — always re-exported (lightweight, no Burn/pdfium-heavy graph
+# beyond pdfium in mineru-pdf, which the parser genuinely needs).
 mineru-types = { workspace = true }
 mineru-config = { workspace = true }
-mineru-vlm-client = { workspace = true }
-mineru-backend-vlm = { workspace = true }
-mineru-backend-pipeline = { workspace = true }
+mineru-io = { workspace = true }
 mineru-pdf = { workspace = true }
 mineru-render = { workspace = true }
 
-clap = { workspace = true }
-tokio = { workspace = true }
-anyhow = { workspace = true }
+# Model + backend crates — optional, gated by the features above.
+mineru-burn-common = { workspace = true, optional = true }
+mineru-ocr-det = { workspace = true, optional = true }
+mineru-ocr-rec = { workspace = true, optional = true }
+mineru-layout = { workspace = true, optional = true }
+mineru-table = { workspace = true, optional = true }
+mineru-formula = { workspace = true, optional = true }
+mineru-backend-pipeline = { workspace = true, optional = true }
+mineru-vlm-client = { workspace = true, optional = true }
+mineru-backend-vlm = { workspace = true, optional = true }
+
+# Binary-only deps — optional, pulled in by the `cli` feature.
+clap = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+anyhow = { workspace = true, optional = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
+tracing-subscriber = { workspace = true, optional = true }
 serde_json = { workspace = true }
