@@ -58,6 +58,11 @@ mineru-io = { workspace = true }
 mineru-pdf = { workspace = true }
 mineru-render = { workspace = true }
 
+# The facade's `Mineru` implements the object-safe `Backend` trait by delegation,
+# which uses `async-trait` (native async-fn-in-trait is not yet object-safe).
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+
 # Model + backend crates — optional, gated by the features above.
 mineru-burn-common = { workspace = true, optional = true }
 mineru-ocr-det = { workspace = true, optional = true }

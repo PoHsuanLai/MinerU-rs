@@ -3885,6 +3885,7 @@ name = "mineru"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
  "mineru-backend-hybrid",
  "mineru-backend-pipeline",
@@ -3902,6 +3903,7 @@ dependencies = [
  "mineru-types",
  "mineru-vlm-client",
  "serde_json",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -1,16 +1,64 @@
 //! MinerU — an umbrella crate for the Rust document parser.
 //!
-//! This crate is a thin facade: it re-exports the workspace's focused sub-crates
-//! under one module tree, so a downstream user can depend on a single `mineru`
-//! crate instead of wiring up a dozen. Each sub-crate remains independently
-//! publishable, so `cargo add mineru-layout` still works for anyone who wants only
-//! one model.
+//! This crate is two things at once:
+//!
+//! 1. A **thin re-export facade**: it re-exports the workspace's focused sub-crates
+//!    under one module tree, so a downstream user can depend on a single `mineru`
+//!    crate instead of wiring up a dozen. Each sub-crate remains independently
+//!    publishable, so `cargo add mineru-layout` still works for anyone who wants
+//!    only one model.
+//! 2. A **builder front door**: [`Mineru::builder`] configures and constructs a
+//!    ready-to-use parsing engine in a few lines, so a consumer never has to wire
+//!    up [`PipelineModels`](backend::pipeline)/[`PipelineBackend`](backend::pipeline)/
+//!    CPU-vs-GPU selection/weight downloading by hand. The engine implements the
+//!    [`Backend`](types::Backend) trait, which stays the principled core.
+//!
+//! # The builder front door
+//!
+//! ```no_run
+//! # #[cfg(feature = "pipeline")]
+//! # async fn demo() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+//! use mineru::types::{Backend, DocInput, ParseOptions};
+//!
+//! let engine = mineru::Mineru::builder()
+//!     .models_dir("/path/to/models") // optional; defaults to Config resolution
+//!     .gpu(false)                     // optional; default auto (GPU if available)
+//!     .auto_download(true)            // optional; default true — fetch missing weights
+//!     .build()?;                      // -> Mineru (impls Backend)
+//!
+//! let opts = ParseOptions::default();
+//! let bytes = std::fs::read("paper.pdf")?;
+//! let doc = engine.analyze(DocInput::new(bytes), &opts).await?;
+//! # let _ = doc;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Re-export facade
 //!
 //! ```no_run
 //! use mineru::types::BBox;
 //! # #[cfg(feature = "layout")]
 //! use mineru::layout::LayoutModel;
 //! ```
+//!
+//! # Environment variables
+//!
+//! The `MINERU_*` variables are a first-class part of the interface: they steer
+//! model/asset resolution and download for both the builder and the binary. Each
+//! is honest and optional — unset means the documented default.
+//!
+//! | Variable | What it does | Default |
+//! |---|---|---|
+//! | `MINERU_MODELS_DIR` | Root directory holding (or caching) model weights. Overrides the config file. | `dirs::cache_dir()/mineru/models` (e.g. `~/Library/Caches/mineru/models`, `~/.cache/mineru/models`); `./mineru-models` if no cache dir resolves. |
+//! | `MINERU_MODELS_BASE` | Base URL that missing pipeline weight files are auto-downloaded from. | Built-in release base URL (`DEFAULT_MODELS_BASE` in `mineru-config`). |
+//! | `MINERU_PDFIUM_LIB_PATH` | Explicit path to the PDFium shared library; if the file is absent PDFium is downloaded there. | Unset — probes common system locations, then a cache dir under the models/cache root. |
+//! | `MINERU_PDFIUM_DOWNLOAD_BASE` | Base URL PDFium binaries are downloaded from. | Built-in release base URL (`DEFAULT_DOWNLOAD_BASE` in `mineru-pdf`). |
+//! | `MINERU_TABLE_WEIGHTS_BASE` | Base URL the table-model `.bpk` weights are fetched from. | Built-in release base URL (`DEFAULT_WEIGHTS_BASE` in `mineru-table`). |
+//! | `MINERU_DEVICE_MODE` | Overrides the config's compute device (e.g. `cpu`, `cuda:1`, `mps`). | Config default (`cpu`). |
+//! | `MINERU_MODEL_SOURCE` | Overrides where weights are fetched from (e.g. `huggingface`, `modelscope`, a local path). | Config default (`huggingface`). |
+//! | `MINERU_TOOLS_CONFIG_JSON` | Path to a JSON config file to load. | Unset — falls back to `~/.mineru.json`, then built-in defaults. |
+//! | `HF_HOME` | Hugging Face cache root, honored transitively by the `hf-hub`-based downloaders. | The `hf-hub` default (`~/.cache/huggingface`). |
 //!
 //! # Features
 //!
@@ -28,6 +76,15 @@
 //!
 //! The foundation crates ([`types`], [`config`], [`io`], [`pdf`], [`render`]) are
 //! always available.
+
+// ---- Builder front door ----------------------------------------------------
+
+mod engine;
+pub use engine::{Error, Mineru, MineruBuilder};
+/// Loads the pipeline models and boxes the backend (CPU/GPU selection). Shared
+/// between the builder facade and the `mineru` binary so there is one copy.
+#[cfg(feature = "pipeline")]
+pub use engine::build_pipeline_backend;
 
 // ---- Foundation (always present) -------------------------------------------
 

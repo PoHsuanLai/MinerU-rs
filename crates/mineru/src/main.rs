@@ -34,7 +34,8 @@ async fn main() -> anyhow::Result<()> {
         url: args.vlm_url.clone(),
         model: args.vlm_model.clone(),
     };
-    let backend = build_backend(args.backend, args.gpu, &config, &vlm)?;
+    // Default is auto (try GPU, fall back to CPU); `--cpu` forces CPU.
+    let backend = build_backend(args.backend, !args.cpu, &config, &vlm)?;
     let (md, json) = run::run_parse(backend.as_ref(), &input, &args.output, &opts, mode).await?;
     println!("wrote {}", md.display());
     println!("wrote {}", json.display());

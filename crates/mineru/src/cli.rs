@@ -53,14 +53,15 @@ pub struct ParseArgs {
     #[arg(short = 'b', long = "backend", value_enum, default_value_t = BackendKind::Pipeline)]
     pub backend: BackendKind,
 
-    /// Run the neural stages on the GPU (wgpu/Metal) instead of the CPU.
+    /// Force the CPU backend, disabling GPU acceleration.
     ///
-    /// Faster on formula/layout-heavy documents; the table stages still run on
-    /// CPU (a hybrid). Requires the binary to be built with the `gpu` feature.
-    /// Falls back to the CPU when unset. The `MINERU_GPU` environment variable is
-    /// honored as an alias when this flag is not given.
+    /// By default the neural stages run on the GPU (wgpu/Metal) when a usable
+    /// adapter is present, falling back to CPU automatically otherwise. Pass
+    /// `--cpu` to skip that and run on the CPU unconditionally — the exact,
+    /// reproducible path (GPU results can differ at the floating-point tolerance
+    /// level). The table stages always run on CPU regardless.
     #[arg(long)]
-    pub gpu: bool,
+    pub cpu: bool,
 
     /// Language hint for OCR (e.g. `ch`, `en`). Omit to auto-detect.
     #[arg(long)]
@@ -206,7 +207,7 @@ mod tests {
             input_flag: None,
             output: PathBuf::from("out"),
             backend: BackendKind::Pipeline,
-            gpu: false,
+            cpu: false,
             lang: None,
             no_formula: false,
             no_table: false,
