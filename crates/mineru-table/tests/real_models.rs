@@ -97,8 +97,11 @@ fn unet_forward_produces_mask() {
 }
 
 /// Full wired-table path against the real UNet: `segment_cells` (forward pass +
-/// mask → polygon extraction) → grid recovery → HTML. Asserts a plausible cell
-/// count and a well-formed `<table>` with a sane rough row/col count.
+/// mask → polygon extraction, including the ported line endpoint-adjustment) →
+/// grid recovery → HTML. On a clean 1024² 4×4 ruled grid this must recover exactly
+/// 4 rows × 4 cols with unit rowspans/colspans — the endpoint adjustment
+/// (`adjust_lines`/`final_adjust_lines`) is what stops per-column y-jitter from
+/// over-segmenting rows (pre-fix this recovered 13 rows).
 #[cfg(unet_generated)]
 #[test]
 #[ignore = "requires onnx-import feature + MINERU_MODELS_DIR; slow ndarray forward"]
@@ -118,18 +121,23 @@ fn unet_segment_cells_recovers_grid_html() {
     for (i, p) in polys.iter().take(8).enumerate() {
         println!("  cell {i}: {p:?}");
     }
-    // A ruled grid must yield at least a handful of cells (not zero, not absurd).
-    assert!(
-        (1..=400).contains(&polys.len()),
-        "implausible cell count {}",
-        polys.len()
-    );
+    // A clean 4x4 grid should recover exactly 16 interior cells.
+    assert_eq!(polys.len(), 16, "expected 16 cells on a 4x4 grid");
 
     let logic = recover(&polys, ROW_THRESHOLD, COL_THRESHOLD);
     assert_eq!(logic.len(), polys.len());
     let max_row = logic.iter().map(|l| l.row_end).max().unwrap_or(0) + 1;
     let max_col = logic.iter().map(|l| l.col_end).max().unwrap_or(0) + 1;
     println!("recovered grid: {max_row} rows x {max_col} cols");
+
+    // The gate: a 4x4 grid must recover as exactly 4 rows x 4 cols (was 13x4).
+    assert_eq!(max_row, 4, "expected 4 rows, got {max_row}");
+    assert_eq!(max_col, 4, "expected 4 cols, got {max_col}");
+    // Every cell must be a unit 1x1 span (no spurious rowspan/colspan merging).
+    for l in &logic {
+        assert_eq!(l.row_start, l.row_end, "spurious rowspan: {l:?}");
+        assert_eq!(l.col_start, l.col_end, "spurious colspan: {l:?}");
+    }
 
     let text: HashMap<usize, Vec<String>> = HashMap::new();
     let html = plot_html_table(&logic, &text);
@@ -140,6 +148,14 @@ fn unet_segment_cells_recovers_grid_html() {
     assert!(html.starts_with("<html>"), "html: {html}");
     assert!(html.contains("<table>"));
     assert!(html.contains("</table>"));
-    // A grid should recover more than a single 1x1 cell.
-    assert!(max_row >= 2 || max_col >= 2, "grid collapsed to a single cell");
+    // No spurious spans in the rendered HTML either.
+    assert!(
+        !html.contains("rowspan=8") && !html.contains("colspan=8"),
+        "unexpected large span in html: {html}"
+    );
+    // Exactly 16 unit cells rendered.
+    let unit_cells = html.matches("<td rowspan=1 colspan=1>").count();
+    assert_eq!(unit_cells, 16, "expected 16 unit <td> cells, html: {html}");
+    // And exactly 4 table rows.
+    assert_eq!(html.matches("<tr>").count(), 4, "expected 4 <tr> rows");
 }

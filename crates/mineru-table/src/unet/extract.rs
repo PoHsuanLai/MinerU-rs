@@ -21,20 +21,29 @@
 //!    line image, keep those long enough along their axis, and reduce each to an
 //!    axis-aligned line segment via `min_area_rect` (the hoisted
 //!    [`mineru_burn_common::geometry::min_area_rectangle`], i.e. `cv2.minAreaRect`).
-//! 4. **Draw** all kept line segments onto a blank canvas.
-//! 5. **Cell regions** (`cal_region_boxes`): 8-connected components of the
+//! 4. **Endpoint adjustment** (`adjust_lines` + `final_adjust_lines` /
+//!    `line_to_line`): bridge collinear ruling fragments, then extend each ruling's
+//!    endpoints onto its intersections with the cross-rulings so a shared grid line
+//!    has one consistent coordinate across the table. This is load-bearing for
+//!    recovery: without it each column's top-edge y jitters a few pixels and the
+//!    fixed-threshold `recover::get_rows` splits a single row into several.
+//! 5. **Draw** all adjusted line segments onto a blank canvas.
+//! 6. **Cell regions** (`cal_region_boxes`): 8-connected components of the
 //!    *inverted* line canvas (the enclosed cell interiors), each reduced to a
 //!    min-area quad, with the same small/large-area filters as the Python.
+//! 7. **Sort into reading order** (`sorted_ocr_boxes`): top→bottom then
+//!    left→right. Python does this in `TSRUnet.__call__` before recovery; the
+//!    connected-component scan emits cells in arbitrary order, and
+//!    [`super::recover::get_rows`] diffs consecutive top-edge y's, so the sort is
+//!    required for even a clean grid to group into the correct rows.
 //!
 //! ## Deliberately-omitted heuristics (honesty)
 //!
-//! The Python `postprocess` additionally runs `adjust_lines` / `final_adjust_lines`
-//! / `line_to_line` (extend line endpoints so nearly-touching rulings connect) and
-//! an optional deskew (`cal_rotate_angle` + `warpAffine` + `unrotate_polygons`).
-//! Those are refinements on top of the core extraction; this port implements the
-//! core faithfully and leaves the endpoint-extension and deskew heuristics out, so
-//! the cell count can be *lower* than Python's on tables whose rulings have gaps or
-//! are visibly rotated. See [`extract_cell_polygons`].
+//! The Python `postprocess` additionally runs an optional deskew
+//! (`cal_rotate_angle`, `warpAffine`, `unrotate_polygons`). That is a refinement on
+//! top of the core extraction and is left out here, so results can differ from
+//! Python's on tables whose rulings are visibly rotated. See
+//! [`extract_cell_polygons`].
 
 use image::{GrayImage, Luma};
 use mineru_burn_common::geometry::min_area_rectangle;
@@ -416,6 +425,225 @@ fn to_recover_poly(c: &[(f32, f32); 4]) -> Poly {
     ]
 }
 
+/// Euclidean distance between two `(x, y)` endpoints (`utils_table_line_rec.sqrt`).
+fn seg_dist(p1: (f32, f32), p2: (f32, f32)) -> f32 {
+    ((p1.0 - p2.0).powi(2) + (p1.1 - p2.1).powi(2)).sqrt()
+}
+
+/// `adjust_lines`: bridge near-collinear endpoints of *distinct, non-overlapping*
+/// line segments with fresh connector segments.
+///
+/// Ports `utils_table_line_rec.adjust_lines(lines, alph, angle)`. For every ordered
+/// pair of segments `i != j` whose centres don't project inside one another (i.e.
+/// they are separate rulings, not the same one), it measures each of the four
+/// endpoint-to-endpoint gaps; when a gap is shorter than `alph` and its inclination
+/// is shallower than `angle` degrees it emits a new segment closing that gap. These
+/// connectors are appended to the ruling set so a ruling broken into two collinear
+/// pieces reads as one continuous line downstream.
+///
+/// `angle` is in degrees; `alph` is a pixel distance. The `+ 1e-10` guards a
+/// vertical gap's slope exactly as the Python does.
+fn adjust_lines(lines: &[LineBox], alph: f32, angle: f32) -> Vec<LineBox> {
+    let mut new_lines = Vec::new();
+    for (i, &[x1, y1, x2, y2]) in lines.iter().enumerate() {
+        let cx1 = (x1 + x2) / 2.0;
+        let cy1 = (y1 + y2) / 2.0;
+        for (j, &[x3, y3, x4, y4]) in lines.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            let cx2 = (x3 + x4) / 2.0;
+            let cy2 = (y3 + y4) / 2.0;
+            // Skip when either centre projects inside the other segment's span:
+            // those two boxes describe the *same* ruling, not a gap to bridge.
+            if (x3 < cx1 && cx1 < x4) || (y3 < cy1 && cy1 < y4) || (x1 < cx2 && cx2 < x2)
+                || (y1 < cy2 && cy2 < y2)
+            {
+                continue;
+            }
+            // Test each of the four endpoint pairings; emit a connector for the
+            // ones that are both short and shallow enough.
+            for &(pa, pb) in &[
+                ((x1, y1), (x3, y3)),
+                ((x1, y1), (x4, y4)),
+                ((x2, y2), (x3, y3)),
+                ((x2, y2), (x4, y4)),
+            ] {
+                let r = seg_dist(pa, pb);
+                let k = ((pb.1 - pa.1) / (pb.0 - pa.0 + 1e-10)).abs();
+                let a = k.atan().to_degrees();
+                if r < alph && a < angle {
+                    new_lines.push([pa.0, pa.1, pb.0, pb.1]);
+                }
+            }
+        }
+    }
+    new_lines
+}
+
+/// General-form line coefficients `(A, B, C)` with `A*x + B*y + C = 0` through two
+/// points (`utils_table_line_rec.fit_line`).
+fn fit_line(p1: (f32, f32), p2: (f32, f32)) -> (f32, f32, f32) {
+    let a = p2.1 - p1.1;
+    let b = p1.0 - p2.0;
+    let c = p2.0 * p1.1 - p1.0 * p2.1;
+    (a, b, c)
+}
+
+/// Signed side of point `p` relative to the line `A*x + B*y + C = 0`
+/// (`utils_table_line_rec.point_line_cor`).
+fn point_line_cor(p: (f32, f32), a: f32, b: f32, c: f32) -> f32 {
+    a * p.0 + b * p.1 + c
+}
+
+/// `line_to_line`: extend one endpoint of `points1` onto its intersection with the
+/// infinite line through `points2`, when they are close enough to be the same joint.
+///
+/// Ports `utils_table_line_rec.line_to_line(points1, points2, alpha, angle)`. If
+/// both endpoints of `points1` lie on the same side of `points2` (so `points1`
+/// stops short of `points2` rather than already crossing it), it computes the two
+/// lines' intersection `p`; if `p` is within `alpha` pixels of the nearer endpoint
+/// and the extension direction is within `angle` of horizontal *or* vertical, it
+/// replaces that endpoint with `p`. This is the step that snaps the shared grid
+/// coordinate of every ruling meeting a given cross-ruling to one consistent value,
+/// removing the per-column endpoint jitter that over-segments rows downstream.
+fn line_to_line(points1: LineBox, points2: LineBox, alpha: f32, angle: f32) -> LineBox {
+    let [x1, y1, x2, y2] = points1;
+    let [ox1, oy1, ox2, oy2] = points2;
+    let (a1, b1, c1) = fit_line((x1, y1), (x2, y2));
+    let (a2, b2, c2) = fit_line((ox1, oy1), (ox2, oy2));
+    let flag1 = point_line_cor((x1, y1), a2, b2, c2);
+    let flag2 = point_line_cor((x2, y2), a2, b2, c2);
+
+    // Same side of the cross-line (both positive or both negative) => points1 has
+    // not yet reached points2, so extending toward the intersection is meaningful.
+    if !((flag1 > 0.0 && flag2 > 0.0) || (flag1 < 0.0 && flag2 < 0.0)) {
+        return points1;
+    }
+    let denom = a1 * b2 - a2 * b1;
+    if denom == 0.0 {
+        return points1; // parallel: no intersection
+    }
+    let x = (b1 * c2 - b2 * c1) / denom;
+    let y = (a2 * c1 - a1 * c2) / denom;
+    let p = (x, y);
+    let r0 = seg_dist(p, (x1, y1));
+    let r1 = seg_dist(p, (x2, y2));
+
+    if r0.min(r1) >= alpha {
+        return points1;
+    }
+    if r0 < r1 {
+        // Extend from endpoint 1 to p, keeping endpoint 2.
+        let k = ((y2 - p.1) / (x2 - p.0 + 1e-10)).abs();
+        let a = k.atan().to_degrees();
+        if a < angle || (90.0 - a).abs() < angle {
+            return [p.0, p.1, x2, y2];
+        }
+    } else {
+        // Extend from endpoint 2 to p, keeping endpoint 1.
+        let k = ((y1 - p.1) / (x1 - p.0 + 1e-10)).abs();
+        let a = k.atan().to_degrees();
+        if a < angle || (90.0 - a).abs() < angle {
+            return [x1, y1, p.0, p.1];
+        }
+    }
+    points1
+}
+
+/// `final_adjust_lines`: mutually snap every row/col endpoint pair via
+/// [`line_to_line`], matching the Python's nested-loop order (rows updated first
+/// against each col, then the col re-updated against the freshly-adjusted row).
+///
+/// Uses the Python's fixed `alpha = 20`, `angle = 30`.
+// Index loops: each step writes `rowboxes[i]` from `colboxes[j]`, then writes
+// `colboxes[j]` from the *just-updated* `rowboxes[i]` — a simultaneous read+write
+// of both slices that iterator adaptors can't express.
+#[allow(clippy::needless_range_loop)]
+fn final_adjust_lines(rowboxes: &mut [LineBox], colboxes: &mut [LineBox]) {
+    for i in 0..rowboxes.len() {
+        for j in 0..colboxes.len() {
+            rowboxes[i] = line_to_line(rowboxes[i], colboxes[j], 20.0, 30.0);
+            colboxes[j] = line_to_line(colboxes[j], rowboxes[i], 20.0, 30.0);
+        }
+    }
+}
+
+/// Whether one box is contained in the other along a single axis (`y` here),
+/// returning `Some(1)` if box1 is (mostly) inside box2's y-span, `Some(2)` if box2
+/// is inside box1's, else `None`. Port of `utils_table_recover.is_single_axis_contained`
+/// for `axis="y"`.
+fn is_single_axis_contained_y(box1: (f32, f32, f32, f32), box2: (f32, f32, f32, f32), thresh: f32) -> Option<u8> {
+    let (_, b1y1, _, b1y2) = box1;
+    let (_, b2y1, _, b2y2) = box2;
+    let b1_area = b1y2 - b1y1;
+    let b2_area = b2y2 - b2y1;
+    let i_area = b1y2.min(b2y2) - b1y1.max(b2y1);
+    let ratio_b1 = if b1_area > 0.0 { (b1_area - i_area) / b1_area } else { 0.0 };
+    let ratio_b2 = if b2_area > 0.0 { (b2_area - i_area) / b2_area } else { 0.0 };
+    if ratio_b1 < thresh {
+        Some(1)
+    } else if ratio_b2 < thresh {
+        Some(2)
+    } else {
+        None
+    }
+}
+
+/// Sorts cell polygons into reading order (top→bottom, then left→right), returning
+/// the reordered polygons.
+///
+/// Port of `utils_table_recover.sorted_ocr_boxes` (with `box_4_2_poly_to_box_4_1`
+/// reducing each quad to `(xmin, ymin, xmax, ymax)` from corners `0`/`2`). This is
+/// the sort the Python `TSRUnet.__call__` applies to `postprocess`'s polygons
+/// *before* handing them to `TableRecover`; [`super::recover::get_rows`] diffs
+/// consecutive top-edge y's and so requires this ordering — without it even a
+/// clean grid over-segments. The primary key is `(ymin, xmin)`; a stable bubble
+/// pass then swaps adjacent boxes that share a y-band but are out of x-order.
+fn sort_polygons_reading_order(polys: Vec<Poly>) -> Vec<Poly> {
+    let n = polys.len();
+    if n <= 1 {
+        return polys;
+    }
+    // Reduce each quad to (xmin, ymin, xmax, ymax) via corners 0 (tl) and 2 (br).
+    let box_of = |p: &Poly| (p[0][0], p[0][1], p[2][0], p[2][1]);
+
+    // Primary sort by (ymin, xmin), stable.
+    let mut idx: Vec<usize> = (0..n).collect();
+    idx.sort_by(|&a, &b| {
+        let ba = box_of(&polys[a]);
+        let bb = box_of(&polys[b]);
+        ba.1
+            .total_cmp(&bb.1)
+            .then(ba.0.total_cmp(&bb.0))
+    });
+    let mut boxes: Vec<(f32, f32, f32, f32)> = idx.iter().map(|&i| box_of(&polys[i])).collect();
+
+    // Bubble refinement (Python fixed threshold 20): pull a box that shares box j's
+    // y-band but starts further left ahead of it.
+    const THRESH: f32 = 20.0;
+    for i in 0..n.saturating_sub(1) {
+        let mut j = i as isize;
+        while j >= 0 {
+            let ju = j as usize;
+            let contained =
+                is_single_axis_contained_y(boxes[ju], boxes[ju + 1], THRESH).is_some();
+            if contained
+                && boxes[ju + 1].0 < boxes[ju].0
+                && (boxes[ju].1 - boxes[ju + 1].1).abs() < THRESH
+            {
+                boxes.swap(ju, ju + 1);
+                idx.swap(ju, ju + 1);
+            } else {
+                break;
+            }
+            j -= 1;
+        }
+    }
+
+    idx.into_iter().map(|i| polys[i]).collect()
+}
+
 /// Rounds a kernel side the way the Python does: `int(sqrt(side) * 1.2)`.
 fn kernel_len(side: u32) -> u32 {
     ((side as f64).sqrt() * 1.2) as u32
@@ -458,8 +686,25 @@ pub fn extract_cell_polygons(classes: &[i64], mask_w: usize, mask_h: usize) -> V
     // 3. Line boxes (get_table_line). Python lineW: col=30 (vertical), row=50 (horizontal).
     const COL_LINE_W: u32 = 30;
     const ROW_LINE_W: u32 = 50;
-    let colboxes = get_table_line(&vpred, false, COL_LINE_W);
-    let rowboxes = get_table_line(&hpred, true, ROW_LINE_W);
+    let mut colboxes = get_table_line(&vpred, false, COL_LINE_W);
+    let mut rowboxes = get_table_line(&hpred, true, ROW_LINE_W);
+
+    // 3b. Endpoint adjustment (Python `postprocess` with enhance_box_line=True):
+    //   - `adjust_lines` bridges collinear ruling fragments (more_h/more_v_lines).
+    //     Python thresholds: h_lines_threshold=100, v_lines_threshold=15, angle=50.
+    //   - `final_adjust_lines` then extends each ruling's endpoints onto its
+    //     intersections with the cross-rulings (extend_line), so every horizontal
+    //     ruling that meets a given vertical snaps to the *same* y (and vice versa).
+    //     Without this the top-edge y of each column jitters a few pixels and
+    //     `recover::get_rows` (fixed rows_thresh) splits one row into several.
+    const H_LINES_THRESHOLD: f32 = 100.0;
+    const V_LINES_THRESHOLD: f32 = 15.0;
+    const ADJUST_ANGLE: f32 = 50.0;
+    let mut extra_rows = adjust_lines(&rowboxes, H_LINES_THRESHOLD, ADJUST_ANGLE);
+    let mut extra_cols = adjust_lines(&colboxes, V_LINES_THRESHOLD, ADJUST_ANGLE);
+    rowboxes.append(&mut extra_rows);
+    colboxes.append(&mut extra_cols);
+    final_adjust_lines(&mut rowboxes, &mut colboxes);
 
     // 4. Draw every line onto a blank canvas (lineW = 2 in Python).
     let mut line_img = GrayImage::new(w, h);
@@ -468,7 +713,12 @@ pub fn extract_cell_polygons(classes: &[i64], mask_w: usize, mask_h: usize) -> V
     }
 
     // 5. Cell regions from the inverted canvas (cal_region_boxes).
-    cal_region_boxes(&line_img)
+    let polys = cal_region_boxes(&line_img);
+
+    // 6. Sort into reading order (top→bottom, left→right), as Python's
+    //    `TSRUnet.__call__` does before recovery: `recover::get_rows` diffs
+    //    consecutive top-edge y's and requires this ordering.
+    sort_polygons_reading_order(polys)
 }
 
 #[cfg(test)]
@@ -544,6 +794,67 @@ mod tests {
     }
 
     #[test]
+    fn adjust_lines_bridges_collinear_fragments() {
+        // Two collinear horizontal fragments with a small gap between them.
+        // Their centres don't project inside one another, and the near endpoints
+        // are close + shallow, so adjust_lines emits a bridging connector.
+        let lines = vec![[0.0f32, 100.0, 40.0, 100.0], [60.0, 100.0, 100.0, 100.0]];
+        let extra = adjust_lines(&lines, 100.0, 50.0);
+        assert!(
+            !extra.is_empty(),
+            "expected a bridging connector for the gap"
+        );
+        // At least one connector should span the gap ends (40,100)-(60,100).
+        assert!(
+            extra
+                .iter()
+                .any(|l| (l[0] - 40.0).abs() < 1e-3 && (l[2] - 60.0).abs() < 1e-3),
+            "connector should join the near endpoints: {extra:?}"
+        );
+    }
+
+    #[test]
+    fn line_to_line_extends_endpoint_to_intersection() {
+        // A horizontal ruling stopping short at x=100 of a vertical ruling at x=110.
+        // Both its endpoints are on the same side of the vertical, and the gap
+        // (10px) is within alpha=20, so it extends to x=110.
+        let row = [0.0f32, 50.0, 100.0, 50.0];
+        let col = [110.0f32, 0.0, 110.0, 200.0];
+        let adjusted = line_to_line(row, col, 20.0, 30.0);
+        // Endpoint 2 (the near one) should snap to x=110.
+        assert!(
+            (adjusted[2] - 110.0).abs() < 1e-3,
+            "endpoint should extend to the intersection x=110, got {adjusted:?}"
+        );
+        assert!((adjusted[3] - 50.0).abs() < 1e-3, "y unchanged: {adjusted:?}");
+    }
+
+    #[test]
+    fn final_adjust_lines_snaps_jittered_row_endpoints() {
+        // A 2-col grid: two horizontal rulings whose right endpoints stop short of
+        // the vertical by differing jitter (x=246 vs x=248), plus a vertical ruling
+        // at x=250. `line_to_line` extends each row endpoint onto the vertical, so
+        // afterward both rows share the same right-x (the vertical's) — removing the
+        // per-row endpoint jitter that would otherwise over-segment the grid.
+        let mut rows = vec![
+            [0.0f32, 100.0, 246.0, 100.0],
+            [0.0, 300.0, 248.0, 300.0],
+        ];
+        let mut cols = vec![[250.0f32, 0.0, 250.0, 400.0]];
+        final_adjust_lines(&mut rows, &mut cols);
+        let rx0 = rows[0][2];
+        let rx1 = rows[1][2];
+        assert!(
+            (rx0 - rx1).abs() < 1.0,
+            "row right-endpoints should snap together, got {rx0} and {rx1}"
+        );
+        assert!(
+            (rx0 - 250.0).abs() < 1.0 && (rx1 - 250.0).abs() < 1.0,
+            "both rows should snap to the vertical x=250, got {rx0} and {rx1}"
+        );
+    }
+
+    #[test]
     fn kernel_len_matches_python_formula() {
         // int(sqrt(1024) * 1.2) = int(32 * 1.2) = int(38.4) = 38.
         assert_eq!(kernel_len(1024), 38);
@@ -556,15 +867,20 @@ mod tests {
 
         let side = 300;
         let polys = extract_cell_polygons(&grid_mask(side, 3, 3), side, side);
-        assert!(!polys.is_empty(), "grid must yield cells");
+        assert_eq!(polys.len(), 9, "3x3 grid must yield 9 cells");
 
         let logic = recover(&polys, ROW_THRESHOLD, COL_THRESHOLD);
         assert_eq!(logic.len(), polys.len());
-        // A 3x3 grid should recover 3 distinct row starts and 3 col starts.
-        let max_row = logic.iter().map(|l| l.row_end).max().unwrap_or(0);
-        let max_col = logic.iter().map(|l| l.col_end).max().unwrap_or(0);
-        assert!(max_row >= 2, "expected >=3 rows, got max_row {max_row}");
-        assert!(max_col >= 2, "expected >=3 cols, got max_col {max_col}");
+        // Now that extraction sorts into reading order, a clean 3x3 grid must
+        // recover as exactly 3 rows x 3 cols with unit spans (no over-segmentation).
+        let max_row = logic.iter().map(|l| l.row_end).max().unwrap_or(0) + 1;
+        let max_col = logic.iter().map(|l| l.col_end).max().unwrap_or(0) + 1;
+        assert_eq!(max_row, 3, "expected 3 rows, got {max_row}");
+        assert_eq!(max_col, 3, "expected 3 cols, got {max_col}");
+        for l in &logic {
+            assert_eq!(l.row_start, l.row_end, "spurious rowspan: {l:?}");
+            assert_eq!(l.col_start, l.col_end, "spurious colspan: {l:?}");
+        }
 
         let text: HashMap<usize, Vec<String>> = HashMap::new();
         let html = crate::unet::plot_html_table(&logic, &text);
