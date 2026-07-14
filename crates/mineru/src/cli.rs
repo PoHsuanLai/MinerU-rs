@@ -88,6 +88,20 @@ pub struct ParseArgs {
     #[arg(long)]
     pub no_images: bool,
 
+    /// Which layout source drives extraction (hybrid backend only).
+    ///
+    /// `medium` (default): the local pipeline's layout model detects the regions
+    /// and the VLM extracts each one — one VLM call per region, no VLM layout
+    /// pass. Image/chart content analysis is forced off on this path.
+    ///
+    /// `high`: the VLM runs its own layout pass *and* extraction (as in `-b vlm`),
+    /// while the pipeline layout is used only for title-splitting and OCR
+    /// sidecars. More VLM work per page; image/chart analysis is honored.
+    ///
+    /// Ignored by the other backends.
+    #[arg(long, value_enum)]
+    pub effort: Option<EffortArg>,
+
     /// Also write `<stem>_document.json`: the full parsed document tree.
     ///
     /// This is the complete intermediate structure — every page, block, line and
@@ -118,6 +132,17 @@ pub enum BackendKind {
     Pipeline,
     /// External OpenAI-compatible VLM server (needs a running server).
     Vlm,
+    /// Local layout models + a VLM server (needs both).
+    Hybrid,
+}
+
+/// Which layout source drives the hybrid backend's per-region extraction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum EffortArg {
+    /// The pipeline's layout detects the regions; the VLM extracts each one.
+    Medium,
+    /// The VLM runs its own layout pass as well as extraction.
+    High,
 }
 
 impl ParseArgs {
@@ -229,6 +254,7 @@ mod tests {
             no_table: false,
             pages: None,
             no_images: false,
+            effort: None,
             debug_output: false,
             vlm_url: None,
             vlm_model: None,

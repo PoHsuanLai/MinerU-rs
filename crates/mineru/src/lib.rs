@@ -72,7 +72,8 @@
 //!   per-region VLM extraction (implies `pipeline` + `vlm`).
 //! - **`ocr`**, **`layout`**, **`table`**, **`formula`**, **`burn_common`** — pull a
 //!   single model crate.
-//! - **`cli`** (default) — builds the `mineru` binary; implies `pipeline` + `vlm`.
+//! - **`cli`** (default) — builds the `mineru` binary; implies `pipeline` + `vlm`
+//!   + `hybrid`, so every `-b` value works out of the box.
 //!
 //! The foundation crates ([`types`], [`config`], [`io`], [`pdf`], [`render`]) are
 //! always available.
@@ -80,7 +81,7 @@
 // ---- Builder front door ----------------------------------------------------
 
 mod engine;
-pub use engine::{Error, Mineru, MineruBuilder};
+pub use engine::{Error, HybridEffort, Mineru, MineruBuilder};
 /// Loads the pipeline models and boxes the backend (CPU/GPU selection). Shared
 /// between the builder facade and the `mineru` binary so there is one copy.
 #[cfg(feature = "pipeline")]

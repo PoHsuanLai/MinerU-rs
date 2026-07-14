@@ -20,7 +20,19 @@ just the umbrella `mineru` crate (feature-gated) or on an individual model crate
 |---|---|---|
 | **pipeline** | `-b pipeline` | Fully local Burn models on disk. No network at inference (weights fetched once). |
 | **vlm** | `-b vlm` | An external OpenAI-compatible VLM server (e.g. Qwen2-VL via vLLM / mistral.rs). |
-| **hybrid** | *(library only)* | Pipeline layout + per-region VLM extraction. `effort` medium/high. |
+| **hybrid** | `-b hybrid` | Both of the above: local layout models detect the regions, the VLM extracts each one, pipeline OCR post-fills. See `--effort`. |
+
+The hybrid backend needs **both** halves — a models directory *and* a reachable VLM
+server:
+
+```bash
+mineru paper.pdf -o out -b hybrid --vlm-url http://127.0.0.1:8000/v1 --vlm-model MinerU2.5
+```
+
+`--effort medium` (the default) has the local layout model detect each region and the
+VLM extract it — one VLM call per region, no VLM layout pass, image/chart analysis off.
+`--effort high` has the VLM run its own layout pass as well, using the local layout only
+for title-splitting and OCR sidecars. Hybrid's local models always run on the CPU.
 
 Office formats (docx/pptx/xlsx) are deferred (a future `mineru-office` crate).
 
@@ -92,15 +104,22 @@ single stage at a specific file, bypassing the `MINERU_MODELS_DIR` layout.
 ## CLI
 
 ```
-mineru [OPTIONS]
+mineru [OPTIONS] <PDF>
 
-  -p, --path <INPUT>       Input PDF path
+  <PDF>                    Input PDF path
   -o, --output <OUTPUT>    Output directory (default: output)
-  -b, --backend <BACKEND>  pipeline | vlm  (default: pipeline)
+  -b, --backend <BACKEND>  pipeline | vlm | hybrid  (default: pipeline)
+      --effort <EFFORT>    medium | high — which layout source drives extraction
+                           (hybrid only; default medium)
+      --cpu                Force CPU (default: use the GPU when one is usable)
       --lang <LANG>        OCR language hint (e.g. ch, en); omit to auto-detect
       --no-formula         Disable formula recognition
       --no-table           Disable table recognition
+      --no-images          Drop images/charts (text-only Markdown, no crops written)
       --pages <PAGES>      Page range START or START:END (0-based, END exclusive)
+      --vlm-url <URL>      VLM server base URL      (vlm / hybrid)
+      --vlm-model <NAME>   VLM served model name    (vlm / hybrid)
+      --debug-output       Also write <stem>_document.json (the full parsed tree)
   -v, --verbose            Debug-level logging
       --config <CONFIG>    Path to a JSON config file
 ```

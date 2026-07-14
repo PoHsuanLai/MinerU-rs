@@ -35,7 +35,7 @@ async fn main() -> anyhow::Result<()> {
         model: args.vlm_model.clone(),
     };
     // Default is auto (try GPU, fall back to CPU); `--cpu` forces CPU.
-    let backend = build_backend(args.backend, !args.cpu, &config, &vlm)?;
+    let backend = build_backend(args.backend, !args.cpu, &config, &vlm, args.effort)?;
     // The written paths are reported by `run_parse` via tracing; no separate
     // stdout print, so all output goes through the subscriber.
     run::run_parse(

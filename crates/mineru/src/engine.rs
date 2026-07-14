@@ -121,6 +121,32 @@ enum Kind {
         /// Override for the served model name.
         model: Option<String>,
     },
+    /// Pipeline layout driving per-region VLM extraction. Needs both halves.
+    #[cfg_attr(not(feature = "hybrid"), allow(dead_code))]
+    Hybrid {
+        /// Override for the server base URL; falls back to the config, then the
+        /// client default.
+        url: Option<String>,
+        /// Override for the served model name.
+        model: Option<String>,
+        /// Which layout source drives extraction; `None` uses the crate default.
+        effort: Option<HybridEffort>,
+    },
+}
+
+/// Which layout source drives the hybrid backend's per-region extraction.
+///
+/// Mirrors [`mineru_backend_hybrid::Effort`], re-declared here so the builder's
+/// public API does not depend on the `hybrid` feature being enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HybridEffort {
+    /// The pipeline's layout drives the VLM, which extracts each detected region.
+    /// Image analysis is forced off.
+    #[default]
+    Medium,
+    /// The VLM runs its own layout pass and extraction; the pipeline layout is
+    /// used only for title-splitting and OCR sidecars. Image analysis is honored.
+    High,
 }
 
 /// Builder for [`Mineru`]. Obtain one from [`Mineru::builder`].
@@ -200,6 +226,29 @@ impl MineruBuilder {
         self
     }
 
+    /// Selects the hybrid backend: the local pipeline detects regions, the VLM
+    /// extracts each region's content, and pipeline OCR post-fills any text the
+    /// VLM left empty.
+    ///
+    /// Needs *both* halves — the models directory (like the pipeline) and a
+    /// reachable VLM server (like VLM) — so it requires the `hybrid` feature, which
+    /// implies `pipeline` and `vlm`. `url`/`model` override the server as in
+    /// [`vlm`](Self::vlm); `effort` selects which layout source drives extraction
+    /// (default [`HybridEffort::Medium`]).
+    ///
+    /// Note the pipeline half runs on the CPU regardless of [`gpu`](Self::gpu):
+    /// the hybrid backend takes the CPU-specialized model set.
+    #[must_use]
+    pub fn hybrid(
+        mut self,
+        url: Option<String>,
+        model: Option<String>,
+        effort: Option<HybridEffort>,
+    ) -> Self {
+        self.kind = Kind::Hybrid { url, model, effort };
+        self
+    }
+
     /// Builds the engine.
     ///
     /// For the pipeline: resolves the models directory, optionally auto-downloads
@@ -230,6 +279,9 @@ impl MineruBuilder {
         let backend = match self.kind {
             Kind::Pipeline => build_pipeline(&config, try_gpu, auto_download)?,
             Kind::Vlm { url, model } => build_vlm(&config, url, model)?,
+            Kind::Hybrid { url, model, effort } => {
+                build_hybrid(&config, url, model, effort, auto_download)?
+            }
         };
         Ok(Mineru { backend })
     }
@@ -245,6 +297,17 @@ fn build_pipeline(
     try_gpu: bool,
     auto_download: bool,
 ) -> Result<Box<dyn Backend>, Error> {
+    let models_dir = resolve_models_dir(config, auto_download)?;
+    Ok(build_pipeline_backend(&models_dir, try_gpu))
+}
+
+/// Resolves the models directory for the local-model backends: optionally fetch
+/// missing weights, ensure the root exists, then canonicalize.
+///
+/// Shared by the pipeline and hybrid paths so both get identical
+/// download/degradation behavior.
+#[cfg(feature = "pipeline")]
+fn resolve_models_dir(config: &Config, auto_download: bool) -> Result<PathBuf, Error> {
     tracing::info!("pipeline models dir: {}", config.models_dir.display());
     if auto_download {
         // Best-effort: fetch any MISSING weights before loading. A fully-present
@@ -259,11 +322,10 @@ fn build_pipeline(
     if let Err(e) = std::fs::create_dir_all(&config.models_dir) {
         tracing::warn!("could not create models dir {}: {e}", config.models_dir.display());
     }
-    let models_dir = config
+    config
         .models_dir
         .canonicalize()
-        .map_err(|source| Error::ModelsDir { path: config.models_dir.clone(), source })?;
-    Ok(build_pipeline_backend(&models_dir, try_gpu))
+        .map_err(|source| Error::ModelsDir { path: config.models_dir.clone(), source })
 }
 
 #[cfg(not(feature = "pipeline"))]
@@ -349,6 +411,61 @@ fn build_vlm(
     _model: Option<String>,
 ) -> Result<Box<dyn Backend>, Error> {
     Err(Error::MissingFeature("vlm"))
+}
+
+/// Builds the hybrid backend: both the local models and a VLM client.
+///
+/// Loads the pipeline models from the resolved directory exactly as the pipeline
+/// path does (same auto-download and skip-missing-stage degradation), then hands
+/// them to [`HybridBackend`](mineru_backend_hybrid::HybridBackend) alongside the
+/// VLM client config. Requires the `hybrid` feature.
+///
+/// The models load on the CPU: `HybridBackend` takes the CPU-specialized
+/// `PipelineModels`, so there is no GPU path to select here.
+#[cfg(feature = "hybrid")]
+fn build_hybrid(
+    config: &Config,
+    url: Option<String>,
+    model: Option<String>,
+    effort: Option<HybridEffort>,
+    auto_download: bool,
+) -> Result<Box<dyn Backend>, Error> {
+    use mineru_backend_hybrid::{Effort, HybridBackend};
+    use mineru_backend_pipeline::PipelineModels;
+    use mineru_vlm_client::VlmClientConfig;
+
+    let models_dir = resolve_models_dir(config, auto_download)?;
+
+    let mut client = VlmClientConfig::default();
+    if let Some(url) = url.or_else(|| config.vlm_server_url.clone()) {
+        client.base_url = url;
+    }
+    if let Some(model) = model {
+        client.model = model;
+    }
+
+    let effort = match effort.unwrap_or_default() {
+        HybridEffort::Medium => Effort::Medium,
+        HybridEffort::High => Effort::High,
+    };
+    tracing::info!(
+        effort = effort.as_str(),
+        "hybrid backend: CPU pipeline layout + VLM extraction"
+    );
+
+    let models = PipelineModels::load(&models_dir);
+    Ok(Box::new(HybridBackend::new(client, models, effort)))
+}
+
+#[cfg(not(feature = "hybrid"))]
+fn build_hybrid(
+    _config: &Config,
+    _url: Option<String>,
+    _model: Option<String>,
+    _effort: Option<HybridEffort>,
+    _auto_download: bool,
+) -> Result<Box<dyn Backend>, Error> {
+    Err(Error::MissingFeature("hybrid"))
 }
 
 #[cfg(test)]

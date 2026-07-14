@@ -23,9 +23,11 @@ path = "src/main.rs"
 required-features = ["cli"]
 
 [features]
-# The bin needs both backends selectable at runtime, plus the CLI deps.
+# The bin needs every backend selectable at runtime, plus the CLI deps.
+# `hybrid` implies `pipeline` + `vlm` and adds no further model deps, so making
+# `-b hybrid` work out of the box costs only the hybrid crate itself.
 default = ["cli"]
-cli = ["pipeline", "vlm", "dep:clap", "dep:tokio", "dep:anyhow", "dep:tracing-subscriber"]
+cli = ["pipeline", "vlm", "hybrid", "dep:clap", "dep:tokio", "dep:anyhow", "dep:tracing-subscriber"]
 
 # Fully-local Burn pipeline backend + every model it composes.
 pipeline = [
