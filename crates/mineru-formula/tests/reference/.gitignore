@@ -1,0 +1,4 @@
+# Regenerable Python reference dumps (produced by py_ref_formula.py). Not
+# committed -- run the script to regenerate them before the parity test.
+*.bin
+*.shape

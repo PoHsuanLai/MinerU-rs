@@ -152,6 +152,47 @@ impl<B: Backend> FormulaRecognizer<B> {
         Ok(Latex(cleaned))
     }
 
+    /// Parity hook: run preprocessing and return the `[1, 3, H, W]` pixel tensor.
+    ///
+    /// Exposes exactly what [`FormulaRecognizer::predict`] feeds the encoder (margin
+    /// crop → resize → pad → grayscale-normalise → repeat to 3 channels), so the
+    /// parity test can diff the Rust preprocess path against the Python input.
+    ///
+    /// # Errors
+    /// Returns [`Error::Image`] on an empty/undecodable image.
+    #[doc(hidden)]
+    pub fn preprocess_pixels(&self, image: &image::RgbImage) -> Result<Tensor<B, 4>> {
+        let pre = preprocess::preprocess(image, preprocess::DEFAULT_TARGET)?;
+        Ok(self.to_pixel_values(&pre))
+    }
+
+    /// Parity hook: Swin encoder forward exposing per-stage activations.
+    ///
+    /// See [`SwinEncoder::forward_stages`]. Used only by the parity test.
+    #[doc(hidden)]
+    pub fn encode_stages(&self, pixel_values: Tensor<B, 4>) -> (Tensor<B, 3>, Vec<Tensor<B, 3>>) {
+        self.model.encoder.forward_stages(pixel_values)
+    }
+
+    /// Parity hook: first-step decoder logits `[1, vocab]` for a fixed prefix.
+    ///
+    /// Runs the decoder over `input_ids` `[1, T]` given `encoder_hidden`, and returns
+    /// the logits at the last position — the deterministic quantity the parity test
+    /// compares (feed just the BOS token for the true first step).
+    #[doc(hidden)]
+    pub fn decoder_step_logits(
+        &self,
+        input_ids: &[u32],
+        encoder_hidden: Tensor<B, 3>,
+    ) -> Tensor<B, 2> {
+        let t = input_ids.len();
+        let data: Vec<i64> = input_ids.iter().map(|&x| x as i64).collect();
+        let ids: Tensor<B, 2, Int> = Tensor::from_data(TensorData::new(data, [1, t]), &self.device);
+        let logits = self.model.decode(ids, encoder_hidden); // [1, T, vocab]
+        let vocab = self.config.decoder.vocab_size;
+        logits.narrow(1, t - 1, 1).reshape([1, vocab])
+    }
+
     /// Turns the single normalised channel into a `[1, 3, H, W]` pixel tensor by
     /// repeating the channel three times (mirroring `pixel_values.repeat(1,3,1,1)`).
     fn to_pixel_values(&self, pre: &PreprocessedImage) -> Tensor<B, 4> {

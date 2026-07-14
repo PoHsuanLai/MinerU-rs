@@ -182,4 +182,28 @@ impl<B: Backend> SwinEncoder<B> {
         }
         hidden
     }
+
+    /// Parity hook: forward that also returns the per-stage activations.
+    ///
+    /// Returns `(patch_embed, [stage_0, .., stage_3])` where `patch_embed` is the
+    /// post-LayerNorm patch-embedding output and each stage entry is that stage's
+    /// output (post-merge for stages 0..2). The final stage output is the encoder
+    /// memory. Used only by the numerical-parity test; not part of the stable API.
+    #[doc(hidden)]
+    pub fn forward_stages(
+        &self,
+        pixel_values: Tensor<B, 4>,
+    ) -> (Tensor<B, 3>, Vec<Tensor<B, 3>>) {
+        let (mut hidden, (mut h, mut w)) = self.embeddings.forward(pixel_values);
+        let embed = hidden.clone();
+        let mut stages = Vec::with_capacity(self.stages.len());
+        for stage in &self.stages {
+            let (out, (nh, nw)) = stage.forward(hidden, h, w);
+            hidden = out;
+            h = nh;
+            w = nw;
+            stages.push(hidden.clone());
+        }
+        (embed, stages)
+    }
 }
