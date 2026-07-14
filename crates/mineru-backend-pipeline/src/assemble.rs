@@ -579,7 +579,7 @@ mod tests {
             region(title, LayoutLabel::DocTitle, 0, lines("The Title", title)),
             region(body, LayoutLabel::Text, 1, lines("Body paragraph.", body)),
             region(img, LayoutLabel::Image, 2, RegionContent {
-                image: Some(ImageRef("images/p0_img0.png".into())),
+                image: Some(ImageRef("p0_img0.png".into())),
                 ..Default::default()
             }),
             region(cap, LayoutLabel::FigureTitle, 3, lines("Figure 1.", cap)),
@@ -603,7 +603,7 @@ mod tests {
         match &page.blocks[2] {
             Block::Image(c) => {
                 assert_eq!(c.captions.len(), 1);
-                assert_eq!(c.body.image, ImageRef("images/p0_img0.png".into()));
+                assert_eq!(c.body.image, ImageRef("p0_img0.png".into()));
             }
             other => panic!("expected image block, got {other:?}"),
         }

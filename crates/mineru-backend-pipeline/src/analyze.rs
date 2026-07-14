@@ -297,9 +297,12 @@ impl PipelineBackend {
     ///
     /// Persisting the crop bytes is the caller's job (the writer stage owns the
     /// output image directory); here we only mint the reference so the assembled
-    /// [`Document`] points at a deterministic path.
+    /// [`Document`] points at a deterministic path. The reference is the bare
+    /// file name — the renderer joins it under the image directory (mirroring
+    /// Python's `f"{img_bucket}/{image}"`), so baking a directory prefix in here
+    /// would double it (`images/images/…`).
     fn crop_image(&self, page: usize, det: &LayoutDet, _image: &RgbImage) -> RegionContent {
-        let name = format!("images/p{page}_o{}.png", det.order);
+        let name = format!("p{page}_o{}.png", det.order);
         RegionContent {
             image: Some(ImageRef(name)),
             ..Default::default()
