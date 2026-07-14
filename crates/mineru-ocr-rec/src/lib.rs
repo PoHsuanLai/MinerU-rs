@@ -42,4 +42,6 @@ pub mod neck;
 
 pub use dict::CharDict;
 pub use error::{Error, Result};
+#[doc(hidden)]
+pub use model::{RecStageDumps, StageDump};
 pub use model::{RecConfig, TextRecognizer};

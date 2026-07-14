@@ -66,6 +66,16 @@ impl Default for RecConfig {
     }
 }
 
+/// A single activation dump: flat row-major `f32` data plus its rank-`N` shape.
+/// Used only by the parity hook [`TextRecognizer::forward_stages`].
+#[doc(hidden)]
+pub type StageDump = (Vec<f32>, Vec<usize>);
+
+/// The per-stage activations returned by [`TextRecognizer::forward_stages`]:
+/// `(backbone_stages, backbone_pooled, neck_out, logits)`.
+#[doc(hidden)]
+pub type RecStageDumps = (Vec<StageDump>, StageDump, StageDump, StageDump);
+
 /// LightSVTR CTC recognizer: PP-LCNetV4 backbone → CTC head → CTC decode.
 pub struct TextRecognizer<B: Backend> {
     net: RecNet<B>,
@@ -161,6 +171,50 @@ impl<B: Backend> TextRecognizer<B> {
         let text = self.dict.decode(&indices);
         let score = mean_max_softmax(&data, t, c);
         Ok((text, score))
+    }
+
+    /// Test/parity hook: runs the network on an already-preprocessed `[1, 3, H, W]`
+    /// tensor and returns every stage's activations as flat row-major `f32` data
+    /// paired with its shape.
+    ///
+    /// Returns `(backbone_stages, backbone_pooled, neck_out, logits)`:
+    /// - `backbone_stages`: the four `PPLCNetV4Block` outputs in order;
+    /// - `backbone_pooled`: the `avg_pool2d([3, 2])` height-pooled feature the head
+    ///   consumes (`[1, C, 1, W]`);
+    /// - `neck_out`: the LightSVTR neck output before squeeze/permute (`[1, dims, 1, W]`);
+    /// - `logits`: the raw CTC logits `[1, T, num_classes]`.
+    ///
+    /// Bypasses resize/normalise so a caller can feed the exact tensor the Python
+    /// reference used and diff each stage to localise any divergence. Not part of the
+    /// public recognition API — it exists for the numerical-parity test.
+    #[doc(hidden)]
+    pub fn forward_stages(&self, input: Tensor<B, 4>) -> Result<RecStageDumps> {
+        let dump = |t: &Tensor<B, 4>| -> StageDump {
+            let d = t.dims().to_vec();
+            let v = t.clone().into_data().into_vec::<f32>().expect("f32 tensor");
+            (v, d)
+        };
+        let (stages, pooled) = self
+            .net
+            .backbone
+            .forward_stages(input)
+            .ok_or_else(|| Error::LogitsShape("backbone feature height < 3".into()))?;
+        let stage_dumps: Vec<_> = stages.iter().map(dump).collect();
+        let pooled_dump = dump(&pooled);
+        let (neck, logits) = self.net.head.forward_stages(pooled);
+        let neck_dump = dump(&neck);
+        let ld = logits.dims().to_vec();
+        let logits_v = logits.into_data().into_vec::<f32>().expect("f32 tensor");
+        Ok((stage_dumps, pooled_dump, neck_dump, (logits_v, ld)))
+    }
+
+    /// Test/parity hook: preprocesses `crop` exactly as [`TextRecognizer::recognize`]
+    /// does, returning the `[1, 3, H, W]` input tensor. Lets a parity test drive
+    /// [`TextRecognizer::forward_stages`] with the same tensor the Python reference
+    /// consumed. Not part of the public API.
+    #[doc(hidden)]
+    pub fn preprocess_at(&self, crop: &RgbImage) -> Result<Tensor<B, 4>> {
+        self.preprocess(crop)
     }
 
     /// Runs backbone + head, returning raw logits `[1, T, num_classes]`.

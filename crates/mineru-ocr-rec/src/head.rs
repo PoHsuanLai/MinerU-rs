@@ -72,4 +72,16 @@ impl<B: Backend> CtcMultiHead<B> {
         let ctc = ctc.swap_dims(1, 2);
         self.head.forward(ctc)
     }
+
+    /// Parity hook: returns the LightSVTR neck output `[N, dims, 1, W]` and the raw
+    /// logits `[N, T, num_classes]`. Not part of the public API — it lets the
+    /// numerical-parity test diff the neck and the head separately.
+    #[doc(hidden)]
+    pub fn forward_stages(&self, x: Tensor<B, 4>) -> (Tensor<B, 4>, Tensor<B, 3>) {
+        let neck = self.encoder.forward(x);
+        let [n, c, _h, w] = neck.dims();
+        let ctc = neck.clone().reshape([n, c, w]).swap_dims(1, 2);
+        let logits = self.head.forward(ctc);
+        (neck, logits)
+    }
 }

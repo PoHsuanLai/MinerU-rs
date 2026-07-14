@@ -299,6 +299,21 @@ impl<B: Backend> Encoder<B> {
         }
         h
     }
+
+    /// Runs the stem then each stage, collecting every stage output in order.
+    ///
+    /// Mirrors `PPLCNetV4Encoder.forward`, which appends the running feature map
+    /// after every `PPLCNetV4Block`. Used only by the parity hook so a test can diff
+    /// each backbone stage against the Python reference.
+    fn forward_stages(&self, x: Tensor<B, 4>) -> Vec<Tensor<B, 4>> {
+        let mut h = self.convolution.forward(x);
+        let mut feats = Vec::with_capacity(self.blocks.len());
+        for stage in &self.blocks {
+            h = stage.forward(h);
+            feats.push(h.clone());
+        }
+        feats
+    }
 }
 
 /// PP-LCNetV4 recognition backbone (`PPLCNetV4` with `det=False`).
@@ -330,5 +345,22 @@ impl<B: Backend> PpLcNetV4Rec<B> {
         // avg_pool2d kernel [3, 2], stride defaults to kernel size (Paddle/torch
         // F.avg_pool2d default). count_include_pad=true, ceil_mode=false, no pad.
         Some(avg_pool2d(feat, [3, 2], [3, 2], [0, 0], true, false))
+    }
+
+    /// Parity hook: returns the four raw stage outputs and the final height-pooled
+    /// feature. `None` if the last stage's height is below the pooling kernel.
+    ///
+    /// Not part of the public API — it exists so the numerical-parity test can reach
+    /// each backbone stage as well as the pooled sequence the head consumes.
+    #[doc(hidden)]
+    pub fn forward_stages(&self, x: Tensor<B, 4>) -> Option<(Vec<Tensor<B, 4>>, Tensor<B, 4>)> {
+        let feats = self.encoder.forward_stages(x);
+        let last = feats.last()?.clone();
+        let [_, _, h, _] = last.dims();
+        if h < 3 {
+            return None;
+        }
+        let pooled = avg_pool2d(last, [3, 2], [3, 2], [0, 0], true, false);
+        Some((feats, pooled))
     }
 }
