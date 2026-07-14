@@ -164,6 +164,26 @@ pub fn classify(img: &RgbImage) -> Result<Classification> {
 /// generated source, so no runtime path is needed.
 #[cfg(lcnet_generated)]
 fn run_lcnet(input: Vec<f32>) -> Result<Classification> {
+    let out = debug_forward(input)?;
+    head(&out)
+}
+
+/// Runs the generated LCNet forward over an already-preprocessed CHW buffer and
+/// returns the raw 2-wide output vector.
+///
+/// The output is post-*softmax* probabilities, not raw logits: the ONNX graph
+/// (and therefore the generated forward) ends in a `Softmax`. This is a
+/// `#[doc(hidden)]` parity hook — the `lcnet_real` numeric gate feeds the exact
+/// same preprocessed input the Python ONNX dumper used and diffs this vector
+/// against the committed reference dump. Not part of the public API.
+///
+/// The whole CNN + its weights are expensive to build, so the loaded model is
+/// cached for the process lifetime; repeated calls only pay for the forward
+/// pass. The weights are embedded from the build-time `.bpk` next to the
+/// generated source, so no runtime path is needed.
+#[cfg(lcnet_generated)]
+#[doc(hidden)]
+pub fn debug_forward(input: Vec<f32>) -> Result<Vec<f32>> {
     use burn::tensor::{Tensor, TensorData};
 
     // The crate depends on `burn` with the `ndarray` feature, so the CPU NdArray
@@ -186,13 +206,11 @@ fn run_lcnet(input: Vec<f32>) -> Result<Classification> {
     let side = CROP as usize;
     let data = TensorData::new(input, [1, 3, side, side]);
     let x = Tensor::<B, 4>::from_data(data, &device);
-
-    let logits = model.forward(x);
-    let out: Vec<f32> = logits
+    model
+        .forward(x)
         .into_data()
         .into_vec::<f32>()
-        .map_err(|e| Error::Decode(format!("classifier output decode: {e:?}")))?;
-    head(&out)
+        .map_err(|e| Error::Decode(format!("classifier output decode: {e:?}")))
 }
 
 #[cfg(test)]

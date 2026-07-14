@@ -124,6 +124,37 @@ impl UnetModel {
     /// the mask → polygon post-processing that would consume this is still
     /// unported (see [`UnetModel::segment_cells`]).
     pub fn segment_mask(&self, img: &RgbImage) -> Result<SegMask> {
+        Self::run_mask(Self::preprocess(img))
+    }
+
+    /// Preprocesses `img` into the planar `[3, 1024, 1024]` `f32` buffer the UNet
+    /// consumes.
+    ///
+    /// A `#[doc(hidden)]` parity hook: the `unet_real` numeric gate dumps this
+    /// exact buffer so the Python ONNX dumper can feed the *identical* input to
+    /// `onnxruntime` (the `image` crate's Triangle resize is not trivially
+    /// reproducible in numpy, so both sides must consume the same bytes). Not
+    /// part of the public API.
+    #[doc(hidden)]
+    pub fn debug_preprocess(img: &RgbImage) -> Vec<f32> {
+        Self::preprocess(img)
+    }
+
+    /// Runs the generated UNet forward over an already-preprocessed CHW buffer.
+    ///
+    /// A `#[doc(hidden)]` parity hook mirroring [`Self::debug_preprocess`]: the
+    /// `unet_real` gate runs this on the same buffer it dumped and diffs the
+    /// resulting class mask against the committed ONNX reference. Not part of the
+    /// public API.
+    #[doc(hidden)]
+    pub fn debug_segment_from_input(&self, input: Vec<f32>) -> Result<SegMask> {
+        Self::run_mask(input)
+    }
+
+    /// Runs the generated UNet forward over a preprocessed CHW buffer, returning
+    /// the per-pixel 3-class argmax mask. The weights are cached for the process
+    /// lifetime; repeated calls only pay for the forward pass.
+    fn run_mask(input: Vec<f32>) -> Result<SegMask> {
         use burn::tensor::{Tensor, TensorData};
 
         type B = burn::backend::NdArray<f32>;
@@ -140,13 +171,12 @@ impl UnetModel {
             Model::from_bytes(bytes, &device)
         });
 
-        let input = Self::preprocess(img);
         let sz = INPUT_SIDE as usize;
         let data = TensorData::new(input, [1, 3, sz, sz]);
         let x = Tensor::<B, 4>::from_data(data, &device);
 
         // The generated top-level `forward` already argmaxes to an int class mask
-        // of shape `[N, 1, H, W]`.
+        // of shape `[1, N, H, W]`.
         let mask = model.forward(x);
         let dims = mask.dims();
         let (h, w) = (dims[2], dims[3]);
