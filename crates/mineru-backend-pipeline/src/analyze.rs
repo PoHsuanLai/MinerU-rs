@@ -149,6 +149,7 @@ impl PipelineBackend {
                 self.recognize_text(&pixel_bbox, &point_bbox, image, scale, page_text)
             }
             RegionKind::Equation => self.recognize_formula(&pixel_bbox, image),
+            RegionKind::InlineFormula => self.recognize_inline_formula(&pixel_bbox, image),
             RegionKind::Table => self.recognize_table(&pixel_bbox, image),
             RegionKind::Image | RegionKind::Chart => self.crop_image(page, &det, image),
             RegionKind::Ignored => RegionContent::default(),
@@ -245,6 +246,26 @@ impl PipelineBackend {
         };
         RegionContent {
             latex: model.predict(&crop).ok(),
+            ..Default::default()
+        }
+    }
+
+    /// Inline formula: recognize LaTeX for the inline-formula crop.
+    ///
+    /// Runs the same MFR model as [`recognize_formula`](Self::recognize_formula)
+    /// (Python feeds `inline_formula` and `display_formula` dets to one MFR batch —
+    /// `batch_analyze.py`), but stores the result in
+    /// [`RegionContent::inline_latex`] so the assembler folds it into the
+    /// surrounding text block as an inline `$…$` span rather than a `$$…$$` block.
+    fn recognize_inline_formula(&self, pixel_bbox: &BBox, image: &RgbImage) -> RegionContent {
+        let Some(model) = &self.models.formula else {
+            return RegionContent::default();
+        };
+        let Some((crop, _, _)) = crop_region(image, pixel_bbox) else {
+            return RegionContent::default();
+        };
+        RegionContent {
+            inline_latex: model.predict(&crop).ok(),
             ..Default::default()
         }
     }

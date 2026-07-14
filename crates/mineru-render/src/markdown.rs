@@ -53,7 +53,12 @@ fn render_block(block: &Block, mode: MakeMode, image_dir: &str) -> Option<String
 fn render_text(role: TextRole, text: String) -> Option<String> {
     match role {
         TextRole::Title(level) => {
-            let depth = usize::from(level.0).max(1);
+            // Heading depth = level + 1: [`TitleLevel(0)`] (the document title) is a
+            // single `#`, [`TitleLevel(1)`] (a section) is `##`, and so on — matching
+            // Python, where `doc_title` → level 1 → `#` and `paragraph_title` →
+            // level 2 → `##` (`pipeline_middle_json_mkcontent.py`). Capped at 6, the
+            // deepest ATX heading Markdown defines.
+            let depth = (usize::from(level.0) + 1).min(6);
             Some(format!("{} {}", "#".repeat(depth), text))
         }
         TextRole::Header

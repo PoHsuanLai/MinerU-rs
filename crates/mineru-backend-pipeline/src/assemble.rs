@@ -34,6 +34,12 @@ pub struct RegionContent {
     pub text_lines: Vec<RecognizedLine>,
     /// LaTeX for a display-formula region.
     pub latex: Option<Latex>,
+    /// LaTeX for an *inline*-formula region (`InlineFormula` label). Unlike
+    /// [`latex`](Self::latex) (which becomes a standalone `$$…$$` block), this is
+    /// folded into the text block it sits within as a `$…$` inline span. Mirrors
+    /// Python `MagicModel.page_inline_formula`, whose spans carry
+    /// `type=INLINE_EQUATION, content=latex`.
+    pub inline_latex: Option<Latex>,
     /// HTML for a table region.
     pub table_html: Option<Html>,
     /// An extracted raster reference for an image/chart region.
@@ -83,8 +89,11 @@ pub enum RegionKind {
     Footnote,
     /// A region dropped from the main flow (header/footer/page-number/seal/…).
     Discarded(TextRole),
-    /// A region the pipeline does not emit (e.g. inline formula / formula number,
-    /// which are folded into their parent line elsewhere).
+    /// An inline-formula region: not a standalone block. Its recognized LaTeX is
+    /// folded into the text block it overlaps as a `Span::InlineEquation`.
+    InlineFormula,
+    /// A region the pipeline does not emit (e.g. formula number, which is folded
+    /// into its display formula elsewhere).
     Ignored,
 }
 
@@ -128,7 +137,12 @@ impl RegionKind {
 
             // Inline formula / formula number are folded into their parent line
             // during span extraction, not emitted as standalone blocks.
-            L::InlineFormula | L::FormulaNumber => RegionKind::Ignored,
+            // Inline formulas are recognized (MFR) then folded into the text block
+            // they overlap as inline `$…$` spans (see `fold_inline_formulas`).
+            L::InlineFormula => RegionKind::InlineFormula,
+            // Formula numbers are folded into their adjacent display formula
+            // elsewhere; not emitted as standalone blocks.
+            L::FormulaNumber => RegionKind::Ignored,
         }
     }
 
@@ -166,10 +180,12 @@ impl PageAssembler {
         // Reading order is the detector's `order`; sort once so output is stable.
         regions.sort_by_key(|r| r.det.order);
 
-        // Partition by role. Captions/footnotes are held back for nesting.
+        // Partition by role. Captions/footnotes are held back for nesting;
+        // inline formulas for folding into their text block afterwards.
         let mut bodies: Vec<(usize, Region)> = Vec::new();
         let mut captions: Vec<Region> = Vec::new();
         let mut footnotes: Vec<Region> = Vec::new();
+        let mut inline_formulas: Vec<InlineFormula> = Vec::new();
         let mut out: Vec<Slot> = Vec::new();
         let mut discarded: Vec<Block> = Vec::new();
 
@@ -177,6 +193,14 @@ impl PageAssembler {
             match RegionKind::classify(region.det.label) {
                 RegionKind::Caption => captions.push(region),
                 RegionKind::Footnote => footnotes.push(region),
+                RegionKind::InlineFormula => {
+                    if let Some(latex) = region.content.inline_latex.clone() {
+                        inline_formulas.push(InlineFormula {
+                            bbox: region.det.bbox,
+                            latex,
+                        });
+                    }
+                }
                 RegionKind::Ignored => {}
                 RegionKind::Discarded(role) => {
                     discarded.push(text_block(region.det.bbox, role, &region.content));
@@ -186,6 +210,7 @@ impl PageAssembler {
                     out.push(Slot::Pending);
                 }
                 RegionKind::Text(role) => {
+                    let role = title_role(role, &region.content);
                     out.push(Slot::Block(text_block(
                         region.det.bbox,
                         role,
@@ -212,6 +237,10 @@ impl PageAssembler {
             }
         }
 
+        // Fold each recognized inline formula into the text block it overlaps as a
+        // `Span::InlineEquation`, positioned by x-order within its line.
+        fold_inline_formulas(&mut out, inline_formulas);
+
         let blocks = out
             .into_iter()
             .filter_map(|s| match s {
@@ -229,6 +258,121 @@ impl PageAssembler {
 enum Slot {
     Block(Block),
     Pending,
+}
+
+/// A recognized inline formula awaiting folding into its text block: its box (page
+/// points) and recognized LaTeX. Mirrors one entry of Python
+/// `MagicModel.page_inline_formula` (`type=INLINE_EQUATION, content=latex`).
+struct InlineFormula {
+    bbox: BBox,
+    latex: Latex,
+}
+
+/// Folds recognized inline formulas into the text blocks they overlap, as
+/// `Span::InlineEquation` spans placed in reading order within each line.
+///
+/// Ports Python `SpanBlockMatcher` (`utils/span_pre_proc.py`) + the line
+/// re-sort in `span_block_fix.py`, adapted to our already-assembled block tree:
+///
+/// - **Block assignment** (Python `collect_for_block`, threshold `0.5`): a formula
+///   goes to the first text block (reading order) that contains more than half of
+///   the formula's own area — `formula.overlap_ratio(block) > 0.5`, where
+///   `BBox::overlap_ratio` is `intersection / self.area`, exactly Python's
+///   `calculate_overlap_area_in_bbox1_area_ratio(span_bbox, block_bbox)`. Assignment
+///   is greedy and consume-once: a formula claimed by one block is never reconsidered.
+/// - **Line assignment** (Python `merge_spans_to_line`, y-overlap `> 0.6`): within
+///   the block, the formula joins the line whose vertical span it most overlaps
+///   (inline-equation spans do *not* force their own line, unlike display equations).
+/// - **Intra-line order** (Python `line_sort_spans_by_left_to_right`): after
+///   insertion the line's spans are sorted ascending by `bbox.x0`, so the formula
+///   lands at its left-to-right reading position among the text spans.
+fn fold_inline_formulas(out: &mut [Slot], formulas: Vec<InlineFormula>) {
+    for formula in formulas {
+        // Greedy, consume-once: first text block covering >50% of the formula area.
+        let target = out.iter_mut().find_map(|slot| match slot {
+            Slot::Block(Block::Text { bbox, lines, .. })
+                if formula.bbox.overlap_ratio(bbox) > 0.5 =>
+            {
+                Some(lines)
+            }
+            _ => None,
+        });
+        if let Some(lines) = target {
+            insert_inline_span(lines, &formula);
+        }
+    }
+}
+
+/// Inserts an inline-formula span into the best-matching line of a text block,
+/// then re-sorts that line's spans left-to-right.
+///
+/// The best line is the one whose vertical extent the formula most overlaps
+/// (Python's y-overlap grouping); with no line (an empty block) a new single-span
+/// line is appended so the formula is never dropped.
+fn insert_inline_span(lines: &mut Vec<TextLine>, formula: &InlineFormula) {
+    let span = Span::InlineEquation {
+        bbox: formula.bbox,
+        latex: formula.latex.clone(),
+        score: Score(1.0),
+    };
+    match best_line(lines, &formula.bbox) {
+        Some(i) => {
+            lines[i].spans.push(span);
+            lines[i]
+                .spans
+                .sort_by(|a, b| a.bbox().x0.total_cmp(&b.bbox().x0));
+            lines[i].bbox = merge_line_bbox(&lines[i].spans);
+        }
+        None => lines.push(TextLine {
+            bbox: formula.bbox,
+            spans: vec![span],
+        }),
+    }
+}
+
+/// Index of the line whose vertical span the box most overlaps, above the Python
+/// `0.6` y-overlap threshold; `None` when no line clears it.
+fn best_line(lines: &[TextLine], bbox: &BBox) -> Option<usize> {
+    let mut best: Option<(usize, f32)> = None;
+    for (i, line) in lines.iter().enumerate() {
+        let ratio = y_overlap_ratio(bbox, &line.bbox);
+        if ratio > 0.6 && best.is_none_or(|(_, r)| ratio > r) {
+            best = Some((i, ratio));
+        }
+    }
+    best.map(|(i, _)| i)
+}
+
+/// Fraction of the shorter box's height that the two boxes share vertically —
+/// Python `_is_overlaps_y_exceeds_threshold`'s ratio (`overlap / min(height)`).
+fn y_overlap_ratio(a: &BBox, b: &BBox) -> f32 {
+    let overlap = a.y1.min(b.y1) - a.y0.max(b.y0);
+    if overlap <= 0.0 {
+        return 0.0;
+    }
+    let min_h = a.height().min(b.height());
+    if min_h > 0.0 {
+        overlap / min_h
+    } else {
+        0.0
+    }
+}
+
+/// The bounding box enclosing all of a line's spans (Python's per-line
+/// `[min x0, min y0, max x1, max y1]`).
+fn merge_line_bbox(spans: &[Span]) -> BBox {
+    spans
+        .iter()
+        .map(Span::bbox)
+        .reduce(|acc, b| {
+            BBox::new(
+                acc.x0.min(b.x0),
+                acc.y0.min(b.y0),
+                acc.x1.max(b.x1),
+                acc.y1.max(b.y1),
+            )
+        })
+        .unwrap_or_else(|| BBox::new(0.0, 0.0, 0.0, 0.0))
 }
 
 /// Nests caption and footnote regions onto their nearest visual body and builds the
@@ -354,6 +498,99 @@ fn as_text_block(bbox: BBox, content: &RegionContent) -> TextBlock {
     }
 }
 
+/// Refines a title region's level from its heading text.
+///
+/// # Why this exists (deviation from Python, documented)
+///
+/// Python MinerU derives a title's `level` purely from the layout model's class:
+/// `doc_title → level 1` (`#`) and `paragraph_title → level 2` (`##`)
+/// (`model_json_to_middle_json.py::_post_block_process`, lines 201-206). It runs
+/// **no** text heuristic.
+///
+/// Our PP-DocLayoutV2 checkpoint, however, labels *every* heading on some papers
+/// (the doc title *and* every numbered section) as `doc_title`, collapsing them all
+/// to `#`. Since fixing the model is out of scope (it lives in `mineru-layout`), we
+/// recover the two-level split Python gets for free by reading the heading text:
+///
+/// - A heading that opens with a section number (`N`, `N.M`, `N.M.K`, …) or is a
+///   well-known unnumbered section word (`Abstract`, `References`, …) is a *section*
+///   → [`TitleLevel(1)`] (`##`), matching Python's `paragraph_title` level.
+/// - Any other title keeps its model-assigned level (the true doc title stays
+///   [`TitleLevel(0)`] → `#`).
+///
+/// Non-title roles pass through unchanged. This reproduces Python's flat two-level
+/// output (title `#`, all sections `##`; Python does *not* nest deeper on `3.2.1`).
+fn title_role(role: TextRole, content: &RegionContent) -> TextRole {
+    let TextRole::Title(level) = role else {
+        return role;
+    };
+    // Only refine the model's top level (0); an explicitly deeper level is kept.
+    if level.0 != 0 {
+        return role;
+    }
+    let text = first_line_text(content);
+    if is_section_heading(text.trim()) {
+        TextRole::Title(TitleLevel(1))
+    } else {
+        role
+    }
+}
+
+/// The text of a region's first recognized line (the heading text), or `""`.
+fn first_line_text(content: &RegionContent) -> &str {
+    content
+        .text_lines
+        .first()
+        .map(|l| l.text.as_str())
+        .unwrap_or("")
+}
+
+/// Whether a heading is a *section* heading (as opposed to the document title):
+/// it either opens with a numeric section prefix (`3`, `3.1`, `3.2.1`, …) or is a
+/// well-known unnumbered section word.
+fn is_section_heading(text: &str) -> bool {
+    has_section_number(text) || is_known_section_word(text)
+}
+
+/// Whether the heading opens with a section number: one or more dot-separated
+/// integer groups (`3`, `3.1`, `3.2.1`) followed by a space or end-of-string. A
+/// bare leading integer must be followed by whitespace to avoid catching prose that
+/// merely starts with a digit.
+fn has_section_number(text: &str) -> bool {
+    let head: &str = text.split_whitespace().next().unwrap_or("");
+    if head.is_empty() {
+        return false;
+    }
+    let mut groups = 0usize;
+    for group in head.split('.') {
+        if group.is_empty() || !group.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+        groups += 1;
+    }
+    // `head` is all-digit groups; require it be a genuine prefix (some following
+    // heading text) so a lone page-number-like token isn't treated as a section.
+    groups >= 1 && text.len() > head.len()
+}
+
+/// Whether the heading is a well-known unnumbered section word (case-insensitive):
+/// abstract, references, acknowledgment(s), appendix, conclusion, introduction.
+fn is_known_section_word(text: &str) -> bool {
+    let lower = text.trim_end_matches('.').to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "abstract"
+            | "references"
+            | "acknowledgment"
+            | "acknowledgments"
+            | "acknowledgement"
+            | "acknowledgements"
+            | "appendix"
+            | "conclusion"
+            | "introduction"
+    )
+}
+
 /// Converts recognized OCR lines into typed [`TextLine`]s, one text span each.
 fn text_lines(content: &RegionContent) -> Vec<TextLine> {
     content
@@ -429,7 +666,11 @@ mod tests {
             RegionKind::classify(L::Number),
             RegionKind::Discarded(TextRole::PageNumber)
         );
-        assert_eq!(RegionKind::classify(L::InlineFormula), RegionKind::Ignored);
+        assert_eq!(
+            RegionKind::classify(L::InlineFormula),
+            RegionKind::InlineFormula
+        );
+        assert_eq!(RegionKind::classify(L::FormulaNumber), RegionKind::Ignored);
     }
 
     #[test]
@@ -609,5 +850,235 @@ mod tests {
         }
         // Table carries its HTML.
         assert!(matches!(&page.blocks[3], Block::Table(_)));
+    }
+
+    /// Builds a region carrying an inline-formula's recognized LaTeX.
+    fn inline_formula(bbox: BBox, latex: &str, order: usize) -> Region {
+        region(
+            bbox,
+            LayoutLabel::InlineFormula,
+            order,
+            RegionContent {
+                inline_latex: Some(Latex(latex.to_string())),
+                ..Default::default()
+            },
+        )
+    }
+
+    // ----- DEFECT #1: inline-formula folding -----
+
+    #[test]
+    fn inline_formula_folds_into_overlapping_text_block() {
+        // A one-line text region whose recognized line spans the whole width; an
+        // inline formula sits inside it (>50% contained), overlapping that line's
+        // vertical extent. The formula is inserted into the line and x-sorted:
+        // the text span starts at x0=0, the formula at x0=80, so text comes first.
+        let block = BBox::new(0.0, 0.0, 200.0, 20.0);
+        let formula = BBox::new(80.0, 2.0, 110.0, 18.0);
+        let page = PageAssembler.assemble(vec![
+            region(
+                block,
+                LayoutLabel::Text,
+                0,
+                lines("let N be six", BBox::new(0.0, 0.0, 200.0, 20.0)),
+            ),
+            inline_formula(formula, "N=6", 1),
+        ]);
+
+        assert_eq!(page.blocks.len(), 1, "only the text block is emitted");
+        let Block::Text { lines, .. } = &page.blocks[0] else {
+            panic!("expected text block, got {:?}", page.blocks[0]);
+        };
+        // One line, now holding the original text span plus the inline formula,
+        // ordered left-to-right by x0 (text at x0=0 before formula at x0=80).
+        assert_eq!(lines.len(), 1, "one line");
+        let kinds: Vec<&str> = lines[0]
+            .spans
+            .iter()
+            .map(|s| match s {
+                Span::Text { .. } => "text",
+                Span::InlineEquation { .. } => "eq",
+                Span::Image { .. } => "img",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["text", "eq"],
+            "inline equation is inserted after the text span it follows in x-order"
+        );
+        // And it carries the recognized LaTeX.
+        match &lines[0].spans[1] {
+            Span::InlineEquation { latex, .. } => assert_eq!(latex, &Latex("N=6".into())),
+            other => panic!("expected inline equation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inline_formula_x_orders_before_a_later_text_span() {
+        // When a line already has a text span to the formula's RIGHT, the formula
+        // sorts before it (x0 ordering). Here the text span is at x0=120 and the
+        // formula at x0=80, so the emitted order is [eq, text].
+        let block = BBox::new(0.0, 0.0, 200.0, 20.0);
+        let formula = BBox::new(80.0, 2.0, 110.0, 18.0);
+        let page = PageAssembler.assemble(vec![
+            region(
+                block,
+                LayoutLabel::Text,
+                0,
+                lines("be six", BBox::new(120.0, 0.0, 200.0, 20.0)),
+            ),
+            inline_formula(formula, "N=6", 1),
+        ]);
+        let Block::Text { lines, .. } = &page.blocks[0] else {
+            panic!("expected text block");
+        };
+        let kinds: Vec<&str> = lines[0]
+            .spans
+            .iter()
+            .map(|s| match s {
+                Span::InlineEquation { .. } => "eq",
+                _ => "text",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["eq", "text"], "formula (x0=80) sorts before text (x0=120)");
+    }
+
+    #[test]
+    fn inline_formula_goes_to_the_block_it_overlaps() {
+        // Two text blocks; the formula overlaps only the SECOND.
+        let b0 = BBox::new(0.0, 0.0, 100.0, 20.0);
+        let b1 = BBox::new(0.0, 40.0, 100.0, 60.0);
+        let formula = BBox::new(40.0, 42.0, 70.0, 58.0); // inside b1
+        let page = PageAssembler.assemble(vec![
+            region(b0, LayoutLabel::Text, 0, lines("first block", b0)),
+            region(b1, LayoutLabel::Text, 1, lines("second", BBox::new(0.0, 40.0, 30.0, 60.0))),
+            inline_formula(formula, "x^2", 2),
+        ]);
+        assert_eq!(page.blocks.len(), 2);
+        let has_eq = |b: &Block| match b {
+            Block::Text { lines, .. } => lines
+                .iter()
+                .flat_map(|l| &l.spans)
+                .any(|s| matches!(s, Span::InlineEquation { .. })),
+            _ => false,
+        };
+        assert!(!has_eq(&page.blocks[0]), "first block has no inline equation");
+        assert!(has_eq(&page.blocks[1]), "second block folds the formula");
+    }
+
+    #[test]
+    fn unmatched_inline_formula_is_dropped() {
+        // A formula overlapping no text block is not emitted as its own block
+        // (Python drops leftover inline spans; we do too).
+        let block = BBox::new(0.0, 0.0, 100.0, 20.0);
+        let far = BBox::new(0.0, 500.0, 30.0, 520.0);
+        let page = PageAssembler.assemble(vec![
+            region(block, LayoutLabel::Text, 0, lines("body", block)),
+            inline_formula(far, "y", 1),
+        ]);
+        assert_eq!(page.blocks.len(), 1, "no phantom equation block");
+        let Block::Text { lines, .. } = &page.blocks[0] else {
+            panic!("expected text block");
+        };
+        let n_eq = lines
+            .iter()
+            .flat_map(|l| &l.spans)
+            .filter(|s| matches!(s, Span::InlineEquation { .. }))
+            .count();
+        assert_eq!(n_eq, 0);
+    }
+
+    // ----- DEFECT #6: section-heading level derivation -----
+
+    #[test]
+    fn numbered_section_heading_becomes_level_two() {
+        let bbox = BBox::new(0.0, 0.0, 200.0, 20.0);
+        for heading in ["1 Introduction", "3.1 Encoder", "3.2.1 Scaled Dot-Product"] {
+            let page = PageAssembler.assemble(vec![region(
+                bbox,
+                LayoutLabel::DocTitle, // model labels every heading DocTitle
+                0,
+                lines(heading, bbox),
+            )]);
+            match &page.blocks[0] {
+                Block::Text { role, .. } => assert_eq!(
+                    *role,
+                    TextRole::Title(TitleLevel(1)),
+                    "section {heading:?} should be level 1 (##)"
+                ),
+                other => panic!("expected text block, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn known_section_word_becomes_level_two() {
+        let bbox = BBox::new(0.0, 0.0, 200.0, 20.0);
+        for heading in ["Abstract", "References", "Acknowledgments"] {
+            let page = PageAssembler.assemble(vec![region(
+                bbox,
+                LayoutLabel::DocTitle,
+                0,
+                lines(heading, bbox),
+            )]);
+            match &page.blocks[0] {
+                Block::Text { role, .. } => assert_eq!(
+                    *role,
+                    TextRole::Title(TitleLevel(1)),
+                    "section {heading:?} should be level 1 (##)"
+                ),
+                other => panic!("expected text block, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn doc_title_stays_level_one() {
+        // A real document title (no section number, not a section word) stays
+        // level 0 (`#`).
+        let bbox = BBox::new(0.0, 0.0, 400.0, 40.0);
+        let page = PageAssembler.assemble(vec![region(
+            bbox,
+            LayoutLabel::DocTitle,
+            0,
+            lines("Attention Is All You Need", bbox),
+        )]);
+        match &page.blocks[0] {
+            Block::Text { role, .. } => {
+                assert_eq!(*role, TextRole::Title(TitleLevel(0)), "doc title is #")
+            }
+            other => panic!("expected text block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn paragraph_title_prose_is_not_promoted_or_demoted() {
+        // A ParagraphTitle (already level 1) whose text is prose (no number) keeps
+        // its model level — the heuristic only refines top-level (0) titles.
+        let bbox = BBox::new(0.0, 0.0, 200.0, 20.0);
+        let page = PageAssembler.assemble(vec![region(
+            bbox,
+            LayoutLabel::ParagraphTitle,
+            0,
+            lines("Some Subsection", bbox),
+        )]);
+        match &page.blocks[0] {
+            Block::Text { role, .. } => assert_eq!(*role, TextRole::Title(TitleLevel(1))),
+            other => panic!("expected text block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn section_number_detection_edge_cases() {
+        assert!(has_section_number("1 Introduction"));
+        assert!(has_section_number("3.2.1 Foo"));
+        assert!(has_section_number("10.4 Bar"));
+        // No trailing text → not a heading prefix (could be a page number token).
+        assert!(!has_section_number("3.1"));
+        assert!(!has_section_number("3"));
+        // Leading digit inside prose is not a section number.
+        assert!(!has_section_number("3D rendering of the scene"));
+        assert!(!has_section_number("A Introduction"));
+        assert!(!has_section_number(""));
     }
 }

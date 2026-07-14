@@ -84,14 +84,19 @@ mod tests {
 
     #[test]
     fn title_becomes_heading() {
-        let d = doc(vec![text_block(TextRole::Title(TitleLevel(2)), "Intro")]);
+        // Heading depth = level + 1: a section title (level 1) is `##`, matching
+        // Python's `paragraph_title` → level 2 → `##`.
+        let d = doc(vec![text_block(TextRole::Title(TitleLevel(1)), "Intro")]);
         assert_eq!(render_markdown(&d, MakeMode::MmMarkdown, "img"), "## Intro");
+        // A deeper subsection (level 2) is `###`.
+        let d = doc(vec![text_block(TextRole::Title(TitleLevel(2)), "Sub")]);
+        assert_eq!(render_markdown(&d, MakeMode::MmMarkdown, "img"), "### Sub");
     }
 
     #[test]
     fn doc_title_level_zero_uses_single_hash() {
         let d = doc(vec![text_block(TextRole::Title(TitleLevel(0)), "Doc")]);
-        // level 0 clamps to depth 1 in markdown.
+        // The document title (level 0) is a single `#` (Python `doc_title` → level 1).
         assert_eq!(render_markdown(&d, MakeMode::MmMarkdown, "img"), "# Doc");
     }
 
@@ -216,7 +221,7 @@ mod tests {
     #[test]
     fn blocks_join_with_blank_line() {
         let d = doc(vec![
-            text_block(TextRole::Title(TitleLevel(1)), "Title"),
+            text_block(TextRole::Title(TitleLevel(0)), "Title"),
             text_block(TextRole::Body, "Para"),
         ]);
         assert_eq!(
