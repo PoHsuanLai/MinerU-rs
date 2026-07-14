@@ -35,6 +35,7 @@
 pub mod cls;
 pub mod error;
 pub mod matching;
+mod model_cache;
 pub mod ocr;
 pub mod slanet;
 pub mod unet;

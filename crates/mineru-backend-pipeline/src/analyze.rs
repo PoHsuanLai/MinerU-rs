@@ -22,6 +22,9 @@
 //! [`PipelineModels`](crate::PipelineModels)) still produces a block, just without
 //! its recognized text/latex/html — the layout structure is always emitted.
 
+use std::cell::Cell;
+use std::time::{Duration, Instant};
+
 use async_trait::async_trait;
 use burn::prelude::Backend as BurnBackend;
 use image::{imageops::crop_imm, RgbImage};
@@ -36,6 +39,86 @@ use mineru_types::{
 use crate::assemble::{PageAssembler, RecognizedLine, Region, RegionContent, RegionKind};
 use crate::models::PipelineModels;
 use crate::para::merge_paragraphs;
+
+/// Per-stage wall-clock accumulators, gated behind `MINERU_PROFILE=1`.
+///
+/// Purely diagnostic: when disabled every timing helper is a no-op and the
+/// pipeline output is unchanged. The serial page loop means a plain [`Cell`]
+/// (single-threaded, panic-free) suffices — no locking. Times are summed across
+/// all pages and logged once at the end of [`PipelineBackend::run`].
+#[derive(Default)]
+struct Profile {
+    enabled: bool,
+    rasterize: Cell<Duration>,
+    native_text: Cell<Duration>,
+    layout: Cell<Duration>,
+    ocr: Cell<Duration>,
+    formula: Cell<Duration>,
+    table_classify: Cell<Duration>,
+    table_recognize: Cell<Duration>,
+}
+
+impl Profile {
+    /// Reads `MINERU_PROFILE`; enabled for any non-empty value other than `0`.
+    fn from_env() -> Self {
+        let enabled = std::env::var("MINERU_PROFILE")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false);
+        Self {
+            enabled,
+            ..Default::default()
+        }
+    }
+
+    /// Adds `elapsed` to `slot` (no-op when profiling is disabled).
+    fn add(&self, slot: &Cell<Duration>, elapsed: Duration) {
+        if self.enabled {
+            slot.set(slot.get() + elapsed);
+        }
+    }
+
+    /// Emits the accumulated per-stage summary as a single `tracing::info!` line.
+    fn log_summary(&self) {
+        if !self.enabled {
+            return;
+        }
+        let ras = self.rasterize.get();
+        let nat = self.native_text.get();
+        let lay = self.layout.get();
+        let ocr = self.ocr.get();
+        let formula = self.formula.get();
+        let t_cls = self.table_classify.get();
+        let t_rec = self.table_recognize.get();
+        let table = t_cls + t_rec;
+        let total = ras + nat + lay + ocr + formula + table;
+        let pct = |d: Duration| {
+            if total.is_zero() {
+                0.0
+            } else {
+                d.as_secs_f64() / total.as_secs_f64() * 100.0
+            }
+        };
+        tracing::info!(
+            target: "mineru_profile",
+            rasterize_s = ras.as_secs_f64(),
+            rasterize_pct = pct(ras),
+            native_text_s = nat.as_secs_f64(),
+            native_text_pct = pct(nat),
+            layout_s = lay.as_secs_f64(),
+            layout_pct = pct(lay),
+            ocr_s = ocr.as_secs_f64(),
+            ocr_pct = pct(ocr),
+            formula_s = formula.as_secs_f64(),
+            formula_pct = pct(formula),
+            table_classify_s = t_cls.as_secs_f64(),
+            table_recognize_s = t_rec.as_secs_f64(),
+            table_s = table.as_secs_f64(),
+            table_pct = pct(table),
+            stage_sum_s = total.as_secs_f64(),
+            "per-stage wall-clock summary (sum of instrumented stages)"
+        );
+    }
+}
 
 /// The local Burn-model pipeline backend.
 ///
@@ -81,19 +164,28 @@ impl<B: BurnBackend> PipelineBackend<B> {
         let (start, end) = page_bounds(doc.page_count(), opts);
         let mut pages = Vec::with_capacity(end.saturating_sub(start));
 
+        let profile = Profile::from_env();
+
         // SERIAL iteration: PDFium is not safe for concurrent page ops.
         for index in start..end {
             let size = doc.page_size(index)?;
-            let image = doc.render_page(index, &render)?.into_inner();
+            let t = Instant::now();
+            let rendered = doc.render_page(index, &render)?;
+            profile.add(&profile.rasterize, t.elapsed());
+            let image = rendered.into_inner();
             // Native text layer for this page (empty for scanned pages). A read
             // failure is non-fatal: fall back to OCR for the whole page.
+            let t = Instant::now();
             let page_text = doc.extract_text(index).unwrap_or_else(|e| {
                 tracing::warn!(page = index, error = %e, "native text extraction failed");
                 PageText::default()
             });
-            let page = self.analyze_page(index, size, &image, &page_text);
+            profile.add(&profile.native_text, t.elapsed());
+            let page = self.analyze_page(index, size, &image, &page_text, &profile);
             pages.push(page);
         }
+
+        profile.log_summary();
 
         Ok(Document { pages })
     }
@@ -105,10 +197,12 @@ impl<B: BurnBackend> PipelineBackend<B> {
         size: PageSize,
         image: &RgbImage,
         page_text: &PageText,
+        profile: &Profile,
     ) -> Page {
         let scale = self.scale();
 
         // Layout is the driver; with no layout model the page is empty.
+        let t = Instant::now();
         let dets = match &self.models.layout {
             Some(layout) => layout.detect(image).unwrap_or_else(|e| {
                 tracing::warn!(page = index, error = %e, "layout detect failed");
@@ -116,10 +210,11 @@ impl<B: BurnBackend> PipelineBackend<B> {
             }),
             None => Vec::new(),
         };
+        profile.add(&profile.layout, t.elapsed());
 
         let regions: Vec<Region> = dets
             .into_iter()
-            .map(|det| self.recognize_region(index, det, image, scale, page_text))
+            .map(|det| self.recognize_region(index, det, image, scale, page_text, profile))
             .collect();
 
         let assembled = PageAssembler.assemble(regions);
@@ -143,20 +238,37 @@ impl<B: BurnBackend> PipelineBackend<B> {
         image: &RgbImage,
         scale: f32,
         page_text: &PageText,
+        profile: &Profile,
     ) -> Region {
         let pixel_bbox = det.bbox;
         // Detection box in page points (the space native text lives in).
         let point_bbox = scale_bbox(pixel_bbox, 1.0 / scale);
         let content = match RegionKind::classify(det.label) {
             RegionKind::Text(_) | RegionKind::Caption | RegionKind::Footnote => {
-                self.recognize_text(&pixel_bbox, &point_bbox, image, scale, page_text)
+                let t = Instant::now();
+                let c = self.recognize_text(&pixel_bbox, &point_bbox, image, scale, page_text);
+                profile.add(&profile.ocr, t.elapsed());
+                c
             }
             RegionKind::Discarded(_) => {
-                self.recognize_text(&pixel_bbox, &point_bbox, image, scale, page_text)
+                let t = Instant::now();
+                let c = self.recognize_text(&pixel_bbox, &point_bbox, image, scale, page_text);
+                profile.add(&profile.ocr, t.elapsed());
+                c
             }
-            RegionKind::Equation => self.recognize_formula(&pixel_bbox, image),
-            RegionKind::InlineFormula => self.recognize_inline_formula(&pixel_bbox, image),
-            RegionKind::Table => self.recognize_table(&pixel_bbox, image),
+            RegionKind::Equation => {
+                let t = Instant::now();
+                let c = self.recognize_formula(&pixel_bbox, image);
+                profile.add(&profile.formula, t.elapsed());
+                c
+            }
+            RegionKind::InlineFormula => {
+                let t = Instant::now();
+                let c = self.recognize_inline_formula(&pixel_bbox, image);
+                profile.add(&profile.formula, t.elapsed());
+                c
+            }
+            RegionKind::Table => self.recognize_table(&pixel_bbox, image, profile),
             RegionKind::Image | RegionKind::Chart => self.crop_image(page, &det, image),
             RegionKind::Ignored => RegionContent::default(),
         };
@@ -281,15 +393,27 @@ impl<B: BurnBackend> PipelineBackend<B> {
     /// OCR spans are needed by the recognizers; this v1 passes an empty span set
     /// (structure-only) — full OCR-span matching is a later phase. Any missing
     /// model leaves `table_html` empty.
-    fn recognize_table(&self, pixel_bbox: &BBox, image: &RgbImage) -> RegionContent {
+    fn recognize_table(
+        &self,
+        pixel_bbox: &BBox,
+        image: &RgbImage,
+        profile: &Profile,
+    ) -> RegionContent {
         let Some((crop, _, _)) = crop_region(image, pixel_bbox) else {
             return RegionContent::default();
         };
-        let html = match mineru_table::classify(&crop) {
+        let t = Instant::now();
+        // Tables are wired on CPU (see `PipelineModels`); classify on the same
+        // backend as the recognizers it dispatches to.
+        let classified = mineru_table::classify::<Cpu>(&crop);
+        profile.add(&profile.table_classify, t.elapsed());
+        let t = Instant::now();
+        let html = match classified {
             Ok(cls) => self.recognize_table_class(cls.class, &crop),
             // No classifier (model unavailable): try wireless as a default.
             Err(_) => self.recognize_wireless(&crop),
         };
+        profile.add(&profile.table_recognize, t.elapsed());
         RegionContent {
             table_html: html,
             ..Default::default()

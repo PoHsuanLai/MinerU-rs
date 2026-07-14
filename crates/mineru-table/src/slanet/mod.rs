@@ -46,8 +46,8 @@ use crate::ocr::OcrSpan;
 /// Requires a loaded [`model::SlaNet`]; when the crate is built without weights
 /// this returns [`crate::error::Error::ModelUnavailable`]. The pure decode/match
 /// steps are exercised directly in tests without a model.
-pub fn recognize_wireless(
-    model: &model::SlaNet,
+pub fn recognize_wireless<B: burn::prelude::Backend>(
+    model: &model::SlaNet<B>,
     img: &RgbImage,
     spans: &[OcrSpan],
 ) -> Result<Html> {

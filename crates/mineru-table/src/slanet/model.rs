@@ -42,8 +42,8 @@
 use std::path::Path;
 
 use burn::module::Module;
+use burn::prelude::Backend;
 use burn::tensor::{Tensor, TensorData};
-use mineru_burn_common::backend::{cpu_device, Cpu};
 use mineru_burn_common::weights::{load_weights, Coverage, KeyRemap};
 
 use crate::error::{Error, Result};
@@ -95,27 +95,29 @@ pub struct SlaNetInner<B: burn::prelude::Backend> {
 
 /// The hand-ported SLANet-plus model.
 ///
-/// Construct it with [`SlaNet::load`]. When the sibling `.safetensors` weights are
-/// absent, construction still succeeds but [`SlaNet::forward`] returns
-/// [`Error::ModelUnavailable`], so the pipeline degrades gracefully.
+/// Generic over the Burn backend `B`; in practice the pipeline instantiates it on
+/// [`Cpu`](mineru_burn_common::backend::Cpu). Construct it with [`SlaNet::load`].
+/// When the sibling `.safetensors` weights are absent, construction still succeeds
+/// but [`SlaNet::forward`] returns [`Error::ModelUnavailable`], so the pipeline
+/// degrades gracefully.
 #[derive(Debug)]
-pub struct SlaNet {
-    inner: SlaNetInner<Cpu>,
-    device: burn::backend::ndarray::NdArrayDevice,
+pub struct SlaNet<B: Backend> {
+    inner: SlaNetInner<B>,
+    device: B::Device,
     ready: bool,
     num_classes: usize,
 }
 
-impl Default for SlaNet {
+impl<B: Backend> Default for SlaNet<B> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl SlaNet {
+impl<B: Backend> SlaNet<B> {
     /// Creates an unweighted model. `forward` reports the model unavailable.
     pub fn new() -> Self {
-        let device = cpu_device();
+        let device = B::Device::default();
         let inner = SlaNetInner {
             backbone: Backbone::new(&device),
             head: SlaHead::init(&device),
@@ -153,7 +155,7 @@ impl SlaNet {
         let remap = KeyRemap::new()
             .rename(r"^(conv|bn)\.", "backbone.$1.")
             .map_err(|e| Error::WeightLoad(e.to_string()))?;
-        load_weights::<Cpu, _>(&mut model.inner, &weights, &remap, Coverage::Strict)
+        load_weights::<B, _>(&mut model.inner, &weights, &remap, Coverage::Strict)
             .map_err(|e| Error::WeightLoad(e.to_string()))?;
         model.ready = true;
         Ok(model)
@@ -178,7 +180,7 @@ impl SlaNet {
         }
 
         let data = TensorData::new(input.chw.clone(), [1, 3, side, side]);
-        let x = Tensor::<Cpu, 4>::from_data(data, &self.device);
+        let x = Tensor::<B, 4>::from_data(data, &self.device);
 
         let fea = self.inner.backbone.forward_sequence(x); // [1, T, 96]
         let end_idx = build_vocab().end_idx;
@@ -199,7 +201,7 @@ impl SlaNet {
 /// and returns the flattened `[T, 96]` feature sequence, for numeric comparison
 /// against the ONNX reference. Not part of the public API.
 #[doc(hidden)]
-impl SlaNet {
+impl<B: Backend> SlaNet<B> {
     /// Returns the backbone/neck feature sequence `[T·96]` (row-major `[T, 96]`).
     pub fn debug_backbone_feature(&self, input: &super::preprocess::Preprocessed) -> Option<Vec<f32>> {
         let side = TABLE_MAX_LEN as usize;
@@ -207,7 +209,7 @@ impl SlaNet {
             return None;
         }
         let data = TensorData::new(input.chw.clone(), [1, 3, side, side]);
-        let x = Tensor::<Cpu, 4>::from_data(data, &self.device);
+        let x = Tensor::<B, 4>::from_data(data, &self.device);
         let fea = self.inner.backbone.forward_sequence(x); // [1, T, 96]
         fea.into_data().into_vec::<f32>().ok()
     }
@@ -224,7 +226,7 @@ impl SlaNet {
             return None;
         }
         let data = TensorData::new(input.chw.clone(), [1, 3, side, side]);
-        let x = Tensor::<Cpu, 4>::from_data(data, &self.device);
+        let x = Tensor::<B, 4>::from_data(data, &self.device);
         let fea = self.inner.backbone.forward_sequence(x);
         Some(self.inner.head.debug_steps(fea, steps))
     }
@@ -246,7 +248,7 @@ impl SlaNet {
             return None;
         }
         let data = TensorData::new(input.chw.clone(), [1, 3, side, side]);
-        let x = Tensor::<Cpu, 4>::from_data(data, &self.device);
+        let x = Tensor::<B, 4>::from_data(data, &self.device);
         let fea = self.inner.backbone.forward_sequence(x);
         let end_idx = build_vocab().end_idx;
         let out = self.inner.head.forward(fea, MAX_STEPS, end_idx);
@@ -282,7 +284,7 @@ mod tests {
 
     #[test]
     fn unweighted_model_reports_unavailable() {
-        let m = SlaNet::new();
+        let m = SlaNet::<mineru_burn_common::backend::Cpu>::new();
         let pre = super::super::preprocess::preprocess(&image::RgbImage::new(64, 64));
         assert!(matches!(
             m.forward(&pre),

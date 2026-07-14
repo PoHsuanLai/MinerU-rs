@@ -115,7 +115,7 @@ fn slanet_matches_onnx_reference() {
     assert_eq!(ref_loc.len(), ref_len * LOC_DIM, "ref loc must be [L,8]");
     assert_eq!(ref_len, ORT_ARGMAX.len(), "reference should be 26 steps");
 
-    let model = SlaNet::load(&onnx).expect("SlaNet::load should succeed");
+    let model = SlaNet::<mineru_burn_common::backend::Cpu>::load(&onnx).expect("SlaNet::load should succeed");
     let img = synthetic_table(488, 488);
     let pre = preprocess(&img);
 

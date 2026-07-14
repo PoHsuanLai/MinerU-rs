@@ -142,32 +142,26 @@ pub fn head(logits: &[f32]) -> Result<Classification> {
 
 /// Classifies a table crop as wired or wireless.
 ///
-/// Runs the real generated LCNet forward. The model's `.bpk` weights are fetched
-/// from the release and cached on first use (see [`crate::weights`]); a fetch or
-/// load failure surfaces as a typed [`Error`]. Pre-processing and the argmax head
-/// are also unit-tested independently.
-pub fn classify(img: &RgbImage) -> Result<Classification> {
+/// Runs the real generated LCNet forward on the Burn backend `B`. The model's
+/// `.bpk` weights are fetched from the release and cached on first use (see
+/// [`crate::weights`]); a fetch or load failure surfaces as a typed [`Error`].
+/// Pre-processing and the argmax head are also unit-tested independently.
+pub fn classify<B: burn::prelude::Backend>(img: &RgbImage) -> Result<Classification> {
     let input = preprocess(img)?;
-    let out = debug_forward(input)?;
+    let out = debug_forward::<B>(input)?;
     head(&out)
 }
-
-/// The Burn CPU backend the vendored generated LCNet compiles against.
-///
-/// The crate depends on `burn` with the `ndarray` feature, so the NdArray backend
-/// is the one available here.
-type Backend = burn::backend::NdArray<f32>;
 
 /// Loads the generated LCNet model with runtime-fetched weights, panic-free.
 ///
 /// Unlike the vendored `Model::from_bytes` (which `.expect()`s), this drives the
 /// [`burn_store::BurnpackStore`] directly and maps every failure to a typed
 /// [`Error`]. Used by the process-lifetime cache in [`debug_forward`].
-fn load_lcnet(device: &burn::backend::ndarray::NdArrayDevice) -> Result<generated::Model<Backend>> {
+fn load_lcnet<B: burn::prelude::Backend>(device: &B::Device) -> Result<generated::Model<B>> {
     use burn_store::{BurnpackStore, ModuleSnapshot};
 
     let path = crate::weights::weight_path(crate::weights::TableWeight::Lcnet)?;
-    let mut model = generated::Model::<Backend>::new(device);
+    let mut model = generated::Model::<B>::new(device);
     let mut store = BurnpackStore::from_file(&path);
     let result = model
         .load_from(&mut store)
@@ -184,7 +178,7 @@ fn load_lcnet(device: &burn::backend::ndarray::NdArrayDevice) -> Result<generate
 }
 
 /// Runs the generated LCNet forward over an already-preprocessed CHW buffer and
-/// returns the raw 2-wide output vector.
+/// returns the raw 2-wide output vector, on the Burn backend `B`.
 ///
 /// The output is post-*softmax* probabilities, not raw logits: the ONNX graph
 /// (and therefore the generated forward) ends in a `Softmax`. This is a
@@ -193,36 +187,25 @@ fn load_lcnet(device: &burn::backend::ndarray::NdArrayDevice) -> Result<generate
 /// against the committed reference dump. Not part of the public API.
 ///
 /// The whole CNN + its weights are expensive to build, so the loaded model is
-/// cached for the process lifetime; repeated calls only pay for the forward
-/// pass. The weights come from the runtime-fetched cached `.bpk`
-/// ([`crate::weights`]); a fetch/load failure is returned as a typed [`Error`].
+/// cached for the process lifetime (keyed by backend type — see
+/// [`crate::model_cache`]); repeated calls only pay for the forward pass. The
+/// weights come from the runtime-fetched cached `.bpk` ([`crate::weights`]); a
+/// fetch/load failure is returned as a typed [`Error`].
 #[doc(hidden)]
-pub fn debug_forward(input: Vec<f32>) -> Result<Vec<f32>> {
+pub fn debug_forward<B: burn::prelude::Backend>(input: Vec<f32>) -> Result<Vec<f32>> {
     use burn::tensor::{Tensor, TensorData};
-    use std::sync::OnceLock;
 
-    // Cache the (weight-load-failable) model for the process lifetime. The first
-    // successful load wins; a failed load is not cached, so a later call can
-    // retry (e.g. after the network recovers).
-    static MODEL: OnceLock<generated::Model<Backend>> = OnceLock::new();
-
-    let device = burn::backend::ndarray::NdArrayDevice::default();
-    let model = match MODEL.get() {
-        Some(m) => m,
-        None => {
-            let m = load_lcnet(&device)?;
-            // Ignore the race loser; both loads produce an equivalent model.
-            let _ = MODEL.set(m);
-            MODEL.get().ok_or_else(|| {
-                Error::WeightLoad("LCNet model cache unexpectedly empty".to_string())
-            })?
-        }
-    };
+    // Cache the (weight-load-failable) model for the process lifetime, per backend
+    // type. The first successful load wins; a failed load is not cached, so a later
+    // call can retry (e.g. after the network recovers).
+    let device = B::Device::default();
+    let model: std::sync::Arc<generated::Model<B>> =
+        crate::model_cache::get_or_try_init(|| load_lcnet::<B>(&device))?;
 
     // CHW `Vec<f32>` -> `[1, 3, 224, 224]` NCHW tensor.
     let side = CROP as usize;
     let data = TensorData::new(input, [1, 3, side, side]);
-    let x = Tensor::<Backend, 4>::from_data(data, &device);
+    let x = Tensor::<B, 4>::from_data(data, &device);
     model
         .forward(x)
         .into_data()

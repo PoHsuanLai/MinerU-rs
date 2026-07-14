@@ -18,6 +18,9 @@
 //!   runs the full wired-table segmentation → recovery → HTML path (see
 //!   [`super::recover_and_render`]).
 
+use std::marker::PhantomData;
+
+use burn::prelude::Backend;
 use image::RgbImage;
 
 use crate::error::{Error, Result};
@@ -27,12 +30,6 @@ use super::recover::Poly;
 
 /// UNet fixed input side (Python `inp_height = inp_width = 1024`).
 pub const INPUT_SIDE: u32 = 1024;
-
-/// The Burn CPU backend the vendored generated UNet compiles against.
-///
-/// The crate depends on `burn` with the `ndarray` feature, so the NdArray backend
-/// is the one available here.
-type Backend = burn::backend::NdArray<f32>;
 
 /// A segmentation mask: per-pixel class indices (`0` background, `1` horizontal
 /// line, `2` vertical line) laid out row-major over `height * width`.
@@ -47,19 +44,38 @@ pub struct SegMask {
 }
 
 /// The wired-table line-segmentation model.
-#[derive(Debug, Default)]
-pub struct UnetModel {
+///
+/// Generic over the Burn backend `B`; in practice the pipeline instantiates it on
+/// [`Cpu`](mineru_burn_common::backend::Cpu). The handle itself carries no
+/// parameters (the loaded network is cached for the process lifetime, keyed by `B`
+/// — see [`crate::model_cache`]); the `B` type only selects which cached instance
+/// the forward pass uses.
+#[derive(Debug)]
+pub struct UnetModel<B: Backend> {
     /// Whether this handle is expected to run inference. A `new()` handle reports
     /// [`Error::ModelUnavailable`] rather than trigger a weight fetch, matching
     /// the previous behaviour; `loaded()` handles run the real forward.
     ready: bool,
+    _backend: PhantomData<B>,
 }
 
-impl UnetModel {
+// `#[derive(Default)]` would require `B: Default`; `PhantomData<B>` is `Default`
+// for any `B`, so a hand-written impl over any backend is both correct and less
+// constrained.
+impl<B: Backend> Default for UnetModel<B> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<B: Backend> UnetModel<B> {
     /// Creates a handle that reports the model unavailable; use [`Self::loaded`]
     /// to run inference.
     pub fn new() -> Self {
-        Self { ready: false }
+        Self {
+            ready: false,
+            _backend: PhantomData,
+        }
     }
 
     /// Creates a handle that runs the real UNet forward.
@@ -67,7 +83,10 @@ impl UnetModel {
     /// The generated network is loaded with runtime-fetched weights on first use
     /// (cached for the process lifetime by [`Self::segment_mask`]).
     pub fn loaded() -> Self {
-        Self { ready: true }
+        Self {
+            ready: true,
+            _backend: PhantomData,
+        }
     }
 
     /// Runs segmentation and returns recovered cell quadrilaterals.
@@ -147,13 +166,11 @@ impl UnetModel {
     /// Unlike the vendored `Model::from_bytes` (which `.expect()`s), this drives
     /// the [`burn_store::BurnpackStore`] directly and maps every failure to a
     /// typed [`Error`].
-    fn load_unet(
-        device: &burn::backend::ndarray::NdArrayDevice,
-    ) -> Result<generated::Model<Backend>> {
+    fn load_unet(device: &B::Device) -> Result<generated::Model<B>> {
         use burn_store::{BurnpackStore, ModuleSnapshot};
 
         let path = crate::weights::weight_path(crate::weights::TableWeight::Unet)?;
-        let mut model = generated::Model::<Backend>::new(device);
+        let mut model = generated::Model::<B>::new(device);
         let mut store = BurnpackStore::from_file(&path);
         let result = model
             .load_from(&mut store)
@@ -174,27 +191,17 @@ impl UnetModel {
     /// lifetime; repeated calls only pay for the forward pass.
     fn run_mask(input: Vec<f32>) -> Result<SegMask> {
         use burn::tensor::{Tensor, TensorData};
-        use std::sync::OnceLock;
 
-        // Cache the (weight-load-failable) model for the process lifetime. A
-        // failed load is not cached, so a later call can retry.
-        static MODEL: OnceLock<generated::Model<Backend>> = OnceLock::new();
-
-        let device = burn::backend::ndarray::NdArrayDevice::default();
-        let model = match MODEL.get() {
-            Some(m) => m,
-            None => {
-                let m = Self::load_unet(&device)?;
-                let _ = MODEL.set(m);
-                MODEL.get().ok_or_else(|| {
-                    Error::WeightLoad("UNet model cache unexpectedly empty".to_string())
-                })?
-            }
-        };
+        // Cache the (weight-load-failable) model for the process lifetime, per
+        // backend type (see [`crate::model_cache`]). A failed load is not cached,
+        // so a later call can retry.
+        let device = B::Device::default();
+        let model: std::sync::Arc<generated::Model<B>> =
+            crate::model_cache::get_or_try_init(|| Self::load_unet(&device))?;
 
         let sz = INPUT_SIDE as usize;
         let data = TensorData::new(input, [1, 3, sz, sz]);
-        let x = Tensor::<Backend, 4>::from_data(data, &device);
+        let x = Tensor::<B, 4>::from_data(data, &device);
 
         // The generated top-level `forward` already argmaxes to an int class mask
         // of shape `[1, N, H, W]`.
@@ -219,7 +226,7 @@ mod tests {
 
     #[test]
     fn unweighted_reports_unavailable() {
-        let m = UnetModel::new();
+        let m = UnetModel::<mineru_burn_common::backend::Cpu>::new();
         assert!(matches!(
             m.segment_cells(&RgbImage::new(32, 32)),
             Err(Error::ModelUnavailable("unet"))

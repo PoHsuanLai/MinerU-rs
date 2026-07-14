@@ -35,7 +35,7 @@ fn classify_runs_real_lcnet_forward() {
     use mineru_table::cls::classify;
 
     let img = synthetic_table(300, 300);
-    let res = classify(&img);
+    let res = classify::<mineru_burn_common::backend::Cpu>(&img);
 
     // Must NOT be ModelUnavailable — the real forward pass must run.
     let c = res.expect("classify should return Ok with the generated model wired");
@@ -67,7 +67,7 @@ fn unet_forward_produces_mask() {
     use mineru_table::unet::model::UnetModel;
 
     let img = synthetic_table(256, 256);
-    let model = UnetModel::loaded();
+    let model = UnetModel::<mineru_burn_common::backend::Cpu>::loaded();
     let mask = model
         .segment_mask(&img)
         .expect("segment_mask should run the real UNet forward");
@@ -108,7 +108,7 @@ fn unet_segment_cells_recovers_grid_html() {
 
     // A clear 4x4 ruled grid so the segmenter has strong, unambiguous rulings.
     let img = synthetic_table(1024, 1024);
-    let model = UnetModel::loaded();
+    let model = UnetModel::<mineru_burn_common::backend::Cpu>::loaded();
     let polys = model
         .segment_cells(&img)
         .expect("segment_cells should run end-to-end with the generated model");

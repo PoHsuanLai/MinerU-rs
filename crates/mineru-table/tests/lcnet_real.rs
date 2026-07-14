@@ -108,7 +108,8 @@ fn lcnet_matches_onnx_reference() {
     let img = synthetic_table(300, 300);
     let input = mineru_table::cls::preprocess(&img).expect("preprocess should succeed");
 
-    let out = mineru_table::cls::debug_forward(input).expect("LCNet forward must run with real weights");
+    let out = mineru_table::cls::debug_forward::<mineru_burn_common::backend::Cpu>(input)
+        .expect("LCNet forward must run with real weights");
     assert_eq!(out.len(), NUM_CLASSES, "forward must yield a 2-class vector");
     println!("rust lcnet output = {out:?}");
     println!("onnx reference    = {reference:?}");

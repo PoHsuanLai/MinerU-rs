@@ -84,11 +84,13 @@ impl ModelPaths {
 ///
 /// The neural stages (layout, OCR det/rec, formula) are generic over the Burn
 /// backend `B` (default [`Cpu`]) so the whole pipeline can run on the GPU. The
-/// **table** stages ([`SlaNet`], [`UnetModel`]) are the burn-onnx-generated and
-/// SLANet types, which are hard-pinned to the CPU (`NdArray`) backend; they always
-/// run on CPU. A GPU pipeline is therefore a *hybrid*: layout/OCR/formula on the
-/// GPU, tables on CPU — which is fine, as tables are a small fraction of most
-/// documents and the generated ONNX graphs are not backend-generic.
+/// **table** stages ([`SlaNet`], [`UnetModel`]) are *themselves* backend-generic
+/// (there is no hardcoded CPU inside `mineru-table`), but this pipeline wires them
+/// on [`Cpu`] specifically: tables are a tiny fraction of wall-clock, so there is
+/// no reason to GPU-port them, and pinning them here keeps a single
+/// `PipelineModels<B>` from having to mix two backends. A GPU pipeline is therefore
+/// a *hybrid*: layout/OCR/formula on the GPU, tables on CPU — a deliberate wiring
+/// choice, not a limitation of the table types.
 pub struct PipelineModels<B: Backend = Cpu> {
     /// Layout detector; drives every downstream stage.
     pub layout: Option<LayoutModel<B>>,
@@ -98,10 +100,10 @@ pub struct PipelineModels<B: Backend = Cpu> {
     pub ocr_rec: Option<TextRecognizer<B>>,
     /// Formula recognizer.
     pub formula: Option<FormulaRecognizer<B>>,
-    /// Wireless-table structure recognizer (CPU-only; see the struct docs).
-    pub table_wireless: Option<SlaNet>,
-    /// Wired-table line-segmentation recognizer (CPU-only; see the struct docs).
-    pub table_wired: Option<UnetModel>,
+    /// Wireless-table structure recognizer (wired on [`Cpu`]; see the struct docs).
+    pub table_wireless: Option<SlaNet<Cpu>>,
+    /// Wired-table line-segmentation recognizer (wired on [`Cpu`]; see the struct docs).
+    pub table_wired: Option<UnetModel<Cpu>>,
 }
 
 // `#[derive(Default)]` would require `B: Default`; the fields are all `Option`/
@@ -167,7 +169,9 @@ impl<B: Backend> PipelineModels<B> {
             .map_err(Into::into)
         });
 
-        // Table stages are CPU-pinned (generated ONNX + SLANet types).
+        // Table stages: the mineru-table types are backend-generic, but this
+        // pipeline wires them on Cpu (see the struct docs). The `Option<SlaNet<Cpu>>`
+        // field type pins the backend here.
         let table_wireless = load_stage("table-wireless", || {
             SlaNet::load(&paths.table_wireless).map_err(Into::into)
         });

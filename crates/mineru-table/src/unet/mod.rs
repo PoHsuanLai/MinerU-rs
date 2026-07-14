@@ -64,7 +64,11 @@ pub fn recover_and_render(
 /// Requires a loaded [`model::UnetModel`]; without weights it returns
 /// [`crate::error::Error::ModelUnavailable`]. The recovery and rendering steps it
 /// would call are exercised directly via [`recover_and_render`] in tests.
-pub fn recognize_wired(model: &model::UnetModel, img: &RgbImage, spans: &[OcrSpan]) -> Result<Html> {
+pub fn recognize_wired<B: burn::prelude::Backend>(
+    model: &model::UnetModel<B>,
+    img: &RgbImage,
+    spans: &[OcrSpan],
+) -> Result<Html> {
     let polygons = model.segment_cells(img)?;
     // Match OCR spans onto recovered cells (axis-aligned overlap), then render.
     let text_map = match_spans_to_cells(&polygons, spans);

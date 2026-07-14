@@ -41,6 +41,7 @@
 
 use image::{Rgb, RgbImage};
 
+use mineru_burn_common::backend::Cpu;
 use mineru_table::unet::model::UnetModel;
 
 /// The synthetic-image side (a clean square grid, upscaled to 1024 by preprocess).
@@ -109,7 +110,7 @@ fn unet_matches_onnx_reference() {
 
     // Always (re)dump the exact preprocessed tensor so the Python dumper can feed
     // onnxruntime the identical bytes the Burn forward sees.
-    let input = UnetModel::debug_preprocess(&img);
+    let input = UnetModel::<Cpu>::debug_preprocess(&img);
     let side = mineru_table::unet::model::INPUT_SIDE as usize;
     assert_eq!(input.len(), 3 * side * side, "preprocess must be [3,1024,1024]");
     dump_f32("unet_input", &input, &[1, 3, side, side]);
@@ -127,7 +128,7 @@ fn unet_matches_onnx_reference() {
         }
     };
 
-    let model = UnetModel::loaded();
+    let model = UnetModel::<Cpu>::loaded();
     let mask = model
         .debug_segment_from_input(input)
         .expect("UNet forward must run with real weights");
