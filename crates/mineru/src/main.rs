@@ -25,17 +25,17 @@ async fn main() -> anyhow::Result<()> {
 
     let args = cli.parse;
     let input = args
-        .input
-        .as_deref()
-        .context("no input given; pass -p/--path <PDF>")?;
+        .input()
+        .context("no input given; pass a PDF path (e.g. `mineru paper.pdf`)")?
+        .to_path_buf();
     let opts = args.parse_options()?;
-    let mode = args.mode.into();
+    let mode = args.make_mode();
     let vlm = VlmOverrides {
         url: args.vlm_url.clone(),
         model: args.vlm_model.clone(),
     };
-    let backend = build_backend(args.backend, &config, &vlm)?;
-    let (md, json) = run::run_parse(backend.as_ref(), input, &args.output, &opts, mode).await?;
+    let backend = build_backend(args.backend, args.gpu, &config, &vlm)?;
+    let (md, json) = run::run_parse(backend.as_ref(), &input, &args.output, &opts, mode).await?;
     println!("wrote {}", md.display());
     println!("wrote {}", json.display());
     Ok(())
