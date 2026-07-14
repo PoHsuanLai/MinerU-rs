@@ -1,8 +1,10 @@
 //! PDF input for MinerU.
 //!
-//! Opens PDF bytes, reports page metadata, and rasterizes pages to RGB images via
-//! the PDFium native library (bound at runtime). Native-text extraction (the
-//! `pdftext`-style span grouping) is stubbed and lands in a later phase.
+//! Opens PDF bytes, reports page metadata, rasterizes pages to RGB images, and
+//! extracts the native (embedded) text layer via the PDFium native library (bound
+//! at runtime). Native-text extraction (the `pdftext`-style span/line grouping and
+//! span back-fill) lives in [`text`]; see that module for the algorithm and the
+//! PDF→top-left coordinate transform.
 //!
 //! # PDFium library resolution
 //!
@@ -20,6 +22,7 @@
 //! higher layers process documents sequentially for exactly this reason.
 
 pub mod error;
+pub mod text;
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -28,6 +31,7 @@ use image::RgbImage;
 use pdfium_render::prelude::{PdfRenderConfig, Pdfium};
 
 pub use error::{Error, Result};
+pub use text::{FilledRegion, Font, PageText, TextChar, TextLine, TextSpan};
 use mineru_types::PageSize;
 
 /// Process-global PDFium binding, bound lazily exactly once.
@@ -83,14 +87,6 @@ impl PageImage {
     pub fn into_inner(self) -> RgbImage {
         self.image
     }
-}
-
-/// Placeholder for a page's native (embedded) text.
-///
-/// Populated once the `pdftext`-style span-grouping is implemented.
-#[derive(Debug, Clone, Default)]
-pub struct PageText {
-    pub spans: Vec<()>,
 }
 
 /// A handle to the loaded PDFium native library.
@@ -201,12 +197,16 @@ impl PdfDocument<'_> {
             .collect()
     }
 
-    /// Extracts native (embedded) text from a page.
+    /// Extracts the native (embedded) text layer of one page.
     ///
-    /// Currently a stub returning no spans.
-    // TODO(phase-native-text): reimplement pdftext-style word/line/span grouping.
-    pub fn extract_text(&self, _index: usize) -> Result<Vec<PageText>> {
-        Ok(Vec::new())
+    /// Reads every glyph from the PDFium text page, deduplicates near-identical and
+    /// shadow-offset duplicates, and groups the glyphs into spans and lines the way
+    /// MinerU's `pdftext` path does. Returns an empty [`PageText`] for a page with
+    /// no embedded text (a scanned page). See [`text`] for the algorithm and
+    /// coordinate transform.
+    pub fn extract_text(&self, index: usize) -> Result<PageText> {
+        let page = self.page(index)?;
+        text::extract_page_text(&page, index)
     }
 
     /// Fetches a page by index with a bounds check.
@@ -314,5 +314,69 @@ mod tests {
             doc.page_size(n),
             Err(Error::PageIndexOutOfRange { .. })
         ));
+    }
+
+    /// Native-text extraction against a real digital (text-native) demo PDF.
+    ///
+    /// `demo1.pdf` has an embedded text layer; page 0 must extract non-empty text
+    /// whose lines, read in order, contain the document's title/opening words.
+    #[test]
+    #[ignore = "requires a matching libpdfium native library at runtime"]
+    fn extracts_native_text_from_digital_demo() {
+        let _guard = PDFIUM_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let bytes = std::fs::read(DEMO_PDF).expect("demo pdf present");
+        let lib = PdfiumLibrary::load().expect("load pdfium");
+        let doc = lib.open(&bytes).expect("open demo pdf");
+
+        let page = doc.extract_text(0).expect("extract page 0 text");
+        assert!(!page.chars.is_empty(), "digital PDF page 0 should have chars");
+        assert!(page.supports_native_fill(), "upright digital page");
+        assert!(!page.lines.is_empty(), "chars should group into lines");
+
+        // Reading-order text of the page.
+        let full: String = page
+            .lines
+            .iter()
+            .map(|l| l.text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Print the first lines so a human can eyeball the real output.
+        for line in page.lines.iter().take(8) {
+            println!("LINE: {:?}", line.text());
+        }
+        // demo1.pdf is the paper "The response of flow duration curves to
+        // afforestation"; assert its title words survive extraction, and that
+        // "flow" precedes "afforestation" (reading order is preserved).
+        let lower = full.to_lowercase();
+        assert!(
+            lower.contains("flow duration curves"),
+            "expected title words; got: {}",
+            &full.chars().take(400).collect::<String>()
+        );
+        assert!(lower.contains("afforestation"), "expected 'afforestation'");
+        let flow_pos = lower.find("flow").expect("flow present");
+        let affor_pos = lower.find("afforestation").expect("afforestation present");
+        assert!(flow_pos < affor_pos, "reading order: 'flow' before 'afforestation'");
+    }
+
+    /// Probe helper: prints per-PDF char counts so we know which demo is digital.
+    #[test]
+    #[ignore = "diagnostic; requires libpdfium"]
+    fn probe_which_demos_are_digital() {
+        let _guard = PDFIUM_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let lib = PdfiumLibrary::load().expect("load pdfium");
+        for name in ["demo1.pdf", "demo2.pdf", "demo3.pdf", "small_ocr.pdf"] {
+            let path = format!("/Users/pohsuanlai/Documents/mineru/mineru/demo/pdfs/{name}");
+            let bytes = std::fs::read(&path).expect("demo pdf present");
+            let doc = lib.open(&bytes).expect("open demo pdf");
+            let page = doc.extract_text(0).expect("extract text");
+            println!(
+                "{name}: pages={} page0_chars={} page0_lines={} fillable={}",
+                doc.page_count(),
+                page.chars.len(),
+                page.lines.len(),
+                page.supports_native_fill(),
+            );
+        }
     }
 }

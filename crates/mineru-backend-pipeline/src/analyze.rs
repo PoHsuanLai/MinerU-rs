@@ -1,11 +1,22 @@
 //! Orchestration: PDF bytes → [`Document`] (the `pipeline_analyze.py` analogue).
 //!
 //! [`PipelineBackend`] opens the PDF, iterates pages **serially** (PDFium is not
-//! concurrency-safe — see [`mineru_pdf`]), rasterizes each at 200 DPI, runs layout
-//! detection, then per-region recognition (OCR / formula / table), and hands the
-//! raw regions to the [`PageAssembler`](crate::assemble::PageAssembler) which builds
-//! the typed [`Block`] tree. A light [`para`](crate::para) pass merges adjacent
-//! paragraphs.
+//! concurrency-safe — see [`mineru_pdf`]), rasterizes each at 200 DPI, extracts the
+//! native (embedded) text layer, runs layout detection, then per-region recognition
+//! (native text-fill / OCR / formula / table), and hands the raw regions to the
+//! [`PageAssembler`](crate::assemble::PageAssembler) which builds the typed
+//! [`Block`] tree. A light [`para`](crate::para) pass merges adjacent paragraphs.
+//!
+//! # Native text vs OCR (the digital/scanned split)
+//!
+//! For each text region we first try to fill it from the page's embedded text layer
+//! ([`mineru_pdf::PdfDocument::extract_text`], grouped by the ported `pdftext`
+//! heuristics). Digital PDFs read their text layer directly — fast and exact — and
+//! only regions the native layer cannot fill (a scanned page has *no* embedded text,
+//! so every region is unfillable) fall through to the OCR det+rec path, which behaves
+//! exactly as before. This is a per-region simplification of Python's document-level
+//! `pdf_classify` (auto/txt/ocr): rather than classifying the whole doc, each region
+//! is filled-or-OCR'd on its own. Scanned PDFs therefore still OCR every line.
 //!
 //! Recognition is *best-effort per stage*: a region whose model is unloaded (see
 //! [`PipelineModels`](crate::PipelineModels)) still produces a block, just without
@@ -15,7 +26,7 @@ use async_trait::async_trait;
 use image::{imageops::crop_imm, RgbImage};
 
 use mineru_layout::LayoutDet;
-use mineru_pdf::{PdfiumLibrary, RenderOptions};
+use mineru_pdf::{PageText, PdfiumLibrary, RenderOptions};
 use mineru_types::{
     Backend, BackendError, BBox, DocInput, Document, ImageRef, Page, PageSize, ParseOptions,
 };
@@ -68,7 +79,13 @@ impl PipelineBackend {
         for index in start..end {
             let size = doc.page_size(index)?;
             let image = doc.render_page(index, &render)?.into_inner();
-            let page = self.analyze_page(index, size, &image);
+            // Native text layer for this page (empty for scanned pages). A read
+            // failure is non-fatal: fall back to OCR for the whole page.
+            let page_text = doc.extract_text(index).unwrap_or_else(|e| {
+                tracing::warn!(page = index, error = %e, "native text extraction failed");
+                PageText::default()
+            });
+            let page = self.analyze_page(index, size, &image, &page_text);
             pages.push(page);
         }
 
@@ -76,7 +93,13 @@ impl PipelineBackend {
     }
 
     /// Runs layout + recognition + assembly for one already-rasterized page.
-    fn analyze_page(&self, index: usize, size: PageSize, image: &RgbImage) -> Page {
+    fn analyze_page(
+        &self,
+        index: usize,
+        size: PageSize,
+        image: &RgbImage,
+        page_text: &PageText,
+    ) -> Page {
         let scale = self.scale();
 
         // Layout is the driver; with no layout model the page is empty.
@@ -90,7 +113,7 @@ impl PipelineBackend {
 
         let regions: Vec<Region> = dets
             .into_iter()
-            .map(|det| self.recognize_region(index, det, image, scale))
+            .map(|det| self.recognize_region(index, det, image, scale, page_text))
             .collect();
 
         let assembled = PageAssembler.assemble(regions);
@@ -113,13 +136,18 @@ impl PipelineBackend {
         det: LayoutDet,
         image: &RgbImage,
         scale: f32,
+        page_text: &PageText,
     ) -> Region {
         let pixel_bbox = det.bbox;
+        // Detection box in page points (the space native text lives in).
+        let point_bbox = scale_bbox(pixel_bbox, 1.0 / scale);
         let content = match RegionKind::classify(det.label) {
             RegionKind::Text(_) | RegionKind::Caption | RegionKind::Footnote => {
-                self.recognize_text(&pixel_bbox, image, scale)
+                self.recognize_text(&pixel_bbox, &point_bbox, image, scale, page_text)
             }
-            RegionKind::Discarded(_) => self.recognize_text(&pixel_bbox, image, scale),
+            RegionKind::Discarded(_) => {
+                self.recognize_text(&pixel_bbox, &point_bbox, image, scale, page_text)
+            }
             RegionKind::Equation => self.recognize_formula(&pixel_bbox, image),
             RegionKind::Table => self.recognize_table(&pixel_bbox, image),
             RegionKind::Image | RegionKind::Chart => self.crop_image(page, &det, image),
@@ -129,16 +157,51 @@ impl PipelineBackend {
         // Rescale the detection box to page points for the assembled Document.
         Region {
             det: LayoutDet {
-                bbox: scale_bbox(pixel_bbox, 1.0 / scale),
+                bbox: point_bbox,
                 ..det
             },
             content,
         }
     }
 
-    /// OCR: detect text lines in the region crop, recognize each, returning lines
-    /// in page-point coordinates. Missing det/rec models yield no lines.
-    fn recognize_text(&self, pixel_bbox: &BBox, image: &RgbImage, scale: f32) -> RegionContent {
+    /// Recognizes a text region: native text-fill first, OCR as the fallback.
+    ///
+    /// If the page's embedded text layer can fill this region's box
+    /// ([`PageText::fill_regions`]), the native text is used as a single recognized
+    /// line (exact, no model needed). Otherwise — no embedded text (scanned page),
+    /// or a box the native layer cannot fill — we fall through to [`Self::ocr_text`],
+    /// preserving the previous OCR behavior for scanned PDFs.
+    fn recognize_text(
+        &self,
+        pixel_bbox: &BBox,
+        point_bbox: &BBox,
+        image: &RgbImage,
+        scale: f32,
+        page_text: &PageText,
+    ) -> RegionContent {
+        if page_text.supports_native_fill() {
+            if let [Some(filled)] = page_text.fill_regions(&[*point_bbox]).as_slice() {
+                if !filled.text.is_empty() {
+                    // Native text fills the whole region as one line; score 1.0
+                    // marks it as exact (not a model confidence).
+                    return RegionContent {
+                        text_lines: vec![RecognizedLine {
+                            bbox: *point_bbox,
+                            text: filled.text.clone(),
+                            score: 1.0,
+                        }],
+                        ..Default::default()
+                    };
+                }
+            }
+        }
+        self.ocr_text(pixel_bbox, image, scale)
+    }
+
+    /// OCR fallback: detect text lines in the region crop, recognize each, returning
+    /// lines in page-point coordinates. Missing det/rec models yield no lines. Used
+    /// for scanned pages and any region the native text layer could not fill.
+    fn ocr_text(&self, pixel_bbox: &BBox, image: &RgbImage, scale: f32) -> RegionContent {
         let (Some(det), Some(rec)) = (&self.models.ocr_det, &self.models.ocr_rec) else {
             return RegionContent::default();
         };

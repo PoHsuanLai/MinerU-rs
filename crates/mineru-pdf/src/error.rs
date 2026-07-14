@@ -38,6 +38,15 @@ pub enum Error {
         /// The underlying Pdfium error message.
         message: String,
     },
+
+    /// A page's native text layer could not be read.
+    #[error("failed to read text on page {page}: {message}")]
+    Text {
+        /// Zero-based index of the page that failed.
+        page: usize,
+        /// The underlying Pdfium error message.
+        message: String,
+    },
 }
 
 /// Convenience alias used throughout the crate.
