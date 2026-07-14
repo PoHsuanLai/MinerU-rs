@@ -88,6 +88,19 @@ pub struct ParseArgs {
     #[arg(long)]
     pub no_images: bool,
 
+    /// Also write `<stem>_document.json`: the full parsed document tree.
+    ///
+    /// This is the complete intermediate structure — every page, block, line and
+    /// span with its bounding box — behind the Markdown and content list. It is
+    /// large and off by default; pass this when debugging a parse or building on
+    /// the structured output.
+    ///
+    /// Note this is MinerU-rs's own document model, *not* Python MinerU's
+    /// `middle.json`: the shape is our typed tree (see `mineru_types::Document`),
+    /// so existing `middle.json` consumers will not read it as-is.
+    #[arg(long)]
+    pub debug_output: bool,
+
     /// Override the VLM server base URL (vlm backend only). Falls back to the
     /// config's `vlm_server_url`, then the client default.
     #[arg(long)]
@@ -216,6 +229,7 @@ mod tests {
             no_table: false,
             pages: None,
             no_images: false,
+            debug_output: false,
             vlm_url: None,
             vlm_model: None,
         };

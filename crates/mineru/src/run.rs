@@ -15,10 +15,12 @@ use mineru_types::{Backend, DocInput, ParseOptions};
 /// references resolve against it — matching the Python output layout.
 const IMAGE_DIR: &str = "images";
 
-/// Runs the full parse and writes outputs, returning the two written paths.
+/// Runs the full parse and writes the outputs.
 ///
 /// Reads `input`, parses it with `backend`, and writes `<stem>.md` and
-/// `<stem>_content_list.json` under `output_dir`.
+/// `<stem>_content_list.json` under `output_dir` — plus `<stem>_document.json`
+/// (the full parsed tree) when `debug_output` is set. Written paths are reported
+/// via `tracing`.
 ///
 /// # Errors
 /// Propagates I/O errors and any backend/analysis error.
@@ -28,7 +30,8 @@ pub async fn run_parse(
     output_dir: &Path,
     opts: &ParseOptions,
     mode: MakeMode,
-) -> anyhow::Result<(std::path::PathBuf, std::path::PathBuf)> {
+    debug_output: bool,
+) -> anyhow::Result<()> {
     let bytes = std::fs::read(input)
         .with_context(|| format!("reading input PDF {}", input.display()))?;
 
@@ -75,5 +78,16 @@ pub async fn run_parse(
         .with_context(|| format!("writing content list {}", json_path.display()))?;
 
     tracing::info!(markdown = %md_path.display(), content_list = %json_path.display(), "wrote outputs");
-    Ok((md_path, json_path))
+
+    // The full document tree, opt-in via `--debug-output`: it is large, and most
+    // runs only want the Markdown and content list.
+    if debug_output {
+        let doc_json = serde_json::to_string_pretty(&doc).context("serializing document tree")?;
+        let doc_path = output_dir.join(format!("{stem}_document.json"));
+        std::fs::write(&doc_path, doc_json)
+            .with_context(|| format!("writing document tree {}", doc_path.display()))?;
+        tracing::info!(document = %doc_path.display(), "wrote document tree");
+    }
+
+    Ok(())
 }
