@@ -5,10 +5,11 @@
 //! [`FormulaRecognizer`] owns a `UniMerNet`, the tokenizer, and the config, and
 //! exposes [`FormulaRecognizer::predict`]: image → LaTeX.
 //!
-//! The generation strategy is the non-cached greedy loop in [`crate::generate`].
-//! We bridge to it by encoding the image **once** and then, for each decode step,
-//! running the decoder over the current prefix and returning the last position's
-//! logits (a [`DecodeStep`] impl).
+//! The generation strategy is the KV-cached greedy loop in [`crate::generate`].
+//! We bridge to it by encoding the image **once**, precomputing the decoder's
+//! cross-attention K/V from that fixed encoder grid, and then, for each decode step,
+//! running the decoder over just the one new token (reusing cached K/V) and
+//! returning that position's logits (a [`DecodeStep`] impl).
 
 use burn::module::Module;
 use burn::tensor::backend::Backend;
@@ -22,7 +23,7 @@ use crate::config::UniMerNetConfig;
 use crate::error::{Error, Result};
 use crate::generate::{greedy_decode, DecodeStep};
 use crate::latex_cleanup::latex_rm_whitespace;
-use crate::mbart::MBartDecoder;
+use crate::mbart::{DecoderCache, MBartDecoder};
 use crate::preprocess::{self, PreprocessedImage};
 use crate::swin::SwinEncoder;
 use crate::tokenizer::LatexTokenizer;
@@ -55,6 +56,9 @@ impl<B: Backend> UniMerNet<B> {
 
     /// Runs the decoder over `input_ids` `[B, T]` given the encoder grid,
     /// returning logits `[B, T, vocab]`.
+    ///
+    /// This is the non-cached path (recomputes the full prefix). For autoregressive
+    /// generation use [`UniMerNet::init_decode_cache`] + [`UniMerNet::decode_step`].
     pub fn decode(
         &self,
         input_ids: Tensor<B, 2, Int>,
@@ -62,29 +66,46 @@ impl<B: Backend> UniMerNet<B> {
     ) -> Tensor<B, 3> {
         self.decoder.forward(input_ids, encoder_hidden)
     }
+
+    /// Precomputes the decoder KV cache (fixed cross-attention K/V) from the encoder
+    /// grid. Call once before the greedy loop; see [`UniMerNet::decode_step`].
+    pub fn init_decode_cache(&self, encoder_hidden: Tensor<B, 3>) -> DecoderCache<B> {
+        self.decoder.init_cache(encoder_hidden)
+    }
+
+    /// Runs one incremental decode step for a single new `token` at `position`,
+    /// advancing `cache`. Returns logits `[B, vocab]` for the next token.
+    pub fn decode_step(
+        &self,
+        token: Tensor<B, 2, Int>,
+        position: usize,
+        cache: &mut DecoderCache<B>,
+    ) -> Tensor<B, 2> {
+        self.decoder.step(token, position, cache)
+    }
 }
 
-/// A [`DecodeStep`] that holds the encoded image and re-runs the decoder per step.
+/// A [`DecodeStep`] that holds the encoded image plus a running decoder KV cache and
+/// advances one token per step.
 ///
-/// Non-cached: at step `t` it runs the decoder over the full length-`t` prefix and
-/// returns the logits at the last position. See [`crate::generate`] for the
-/// KV-cache TODO.
+/// KV-cached: the cross-attention K/V (encoder-derived, fixed) are computed once at
+/// construction; each [`DecodeStep::step`] feeds only the one new token, appends its
+/// self-attention K/V, and returns the logits at that single position. This is the
+/// `O(T)` path that replaced the old `O(T²)` non-cached loop — see [`crate::mbart`].
 struct ModelStep<'a, B: Backend> {
     model: &'a UniMerNet<B>,
-    encoder_hidden: Tensor<B, 3>,
+    cache: DecoderCache<B>,
     device: B::Device,
     vocab_size: usize,
 }
 
 impl<B: Backend> DecodeStep for ModelStep<'_, B> {
-    fn step(&mut self, ids: &[u32]) -> u32 {
-        let t = ids.len();
-        let data: Vec<i64> = ids.iter().map(|&x| x as i64).collect();
+    fn step(&mut self, token: u32, position: usize) -> u32 {
         let input_ids: Tensor<B, 2, Int> =
-            Tensor::from_data(TensorData::new(data, [1, t]), &self.device);
-        let logits = self.model.decode(input_ids, self.encoder_hidden.clone()); // [1, T, vocab]
-        // Take the last position's logits `[vocab]`.
-        let last = logits.narrow(1, t - 1, 1).reshape([self.vocab_size]);
+            Tensor::from_data(TensorData::new(vec![token as i64], [1, 1]), &self.device);
+        // [1, vocab] logits for the next token, computed incrementally.
+        let logits = self.model.decode_step(input_ids, position, &mut self.cache);
+        let last = logits.reshape([self.vocab_size]);
         // Argmax ON-DEVICE: only the single chosen id crosses to the host, not the
         // whole `vocab`-wide row — avoids a per-token device→host copy that would
         // stall the decode loop on GPU backends. Burn's `argmax` breaks ties toward
@@ -146,9 +167,12 @@ impl<B: Backend> FormulaRecognizer<B> {
 
         let start = self.config.decoder.bos_token_id as u32;
         let eos = self.config.decoder.eos_token_id as u32;
+        // Precompute the fixed cross-attention K/V once from the encoder grid; each
+        // step then reuses it and extends only the self-attention cache.
+        let cache = self.model.init_decode_cache(encoder_hidden);
         let mut step = ModelStep {
             model: &self.model,
-            encoder_hidden,
+            cache,
             device: self.device.clone(),
             vocab_size: self.config.decoder.vocab_size,
         };
@@ -157,6 +181,75 @@ impl<B: Backend> FormulaRecognizer<B> {
         let raw = self.tokenizer.decode(&decoded.tokens)?;
         let cleaned = latex_rm_whitespace(&raw);
         Ok(Latex(cleaned))
+    }
+
+    /// Parity hook: the raw generated token ids from the cached greedy decode.
+    ///
+    /// Exactly what [`FormulaRecognizer::predict`] produces before tokenizer decode
+    /// (BOS dropped, EOS excluded). The KV-cache parity test compares this against a
+    /// slow non-cached reference decode to prove the sequences are byte-identical.
+    ///
+    /// # Errors
+    /// Returns [`Error::Image`] on an empty/undecodable image.
+    #[doc(hidden)]
+    pub fn predict_token_ids(&self, image: &image::RgbImage) -> Result<Vec<u32>> {
+        let pre = preprocess::preprocess(image, preprocess::DEFAULT_TARGET)?;
+        let pixel_values = self.to_pixel_values(&pre);
+        let encoder_hidden = self.model.encode(pixel_values);
+
+        let start = self.config.decoder.bos_token_id as u32;
+        let eos = self.config.decoder.eos_token_id as u32;
+        let cache = self.model.init_decode_cache(encoder_hidden);
+        let mut step = ModelStep {
+            model: &self.model,
+            cache,
+            device: self.device.clone(),
+            vocab_size: self.config.decoder.vocab_size,
+        };
+        Ok(greedy_decode(&mut step, start, eos, self.config.max_new_tokens).tokens)
+    }
+
+    /// Parity oracle: greedy decode via the **non-cached** full-prefix decoder.
+    ///
+    /// A deliberately slow (`O(T²)`) reference — at each step it re-runs the whole
+    /// decoder over the growing prefix and argmaxes the last position. Kept only as
+    /// the correctness oracle for the KV-cache parity test; production uses the cached
+    /// [`FormulaRecognizer::predict_token_ids`]. The two must return byte-identical
+    /// token sequences.
+    ///
+    /// # Errors
+    /// Returns [`Error::Image`] on an empty/undecodable image.
+    #[doc(hidden)]
+    pub fn reference_token_ids_noncache(&self, image: &image::RgbImage) -> Result<Vec<u32>> {
+        let pre = preprocess::preprocess(image, preprocess::DEFAULT_TARGET)?;
+        let pixel_values = self.to_pixel_values(&pre);
+        let encoder_hidden = self.model.encode(pixel_values);
+
+        let start = self.config.decoder.bos_token_id as u32;
+        let eos = self.config.decoder.eos_token_id as u32;
+        let vocab = self.config.decoder.vocab_size;
+
+        let mut ids: Vec<u32> = vec![start];
+        let mut out: Vec<u32> = Vec::new();
+        for _ in 0..self.config.max_new_tokens {
+            let t = ids.len();
+            let data: Vec<i64> = ids.iter().map(|&x| x as i64).collect();
+            let input_ids: Tensor<B, 2, Int> =
+                Tensor::from_data(TensorData::new(data, [1, t]), &self.device);
+            let logits = self.model.decode(input_ids, encoder_hidden.clone()); // [1, T, vocab]
+            let last = logits.narrow(1, t - 1, 1).reshape([vocab]);
+            let idx = last.argmax(0);
+            let next = mineru_burn_common::int_to_vec_i64(idx)
+                .first()
+                .copied()
+                .unwrap_or(0) as u32;
+            if next == eos {
+                break;
+            }
+            out.push(next);
+            ids.push(next);
+        }
+        Ok(out)
     }
 
     /// Parity hook: run preprocessing and return the `[1, 3, H, W]` pixel tensor.

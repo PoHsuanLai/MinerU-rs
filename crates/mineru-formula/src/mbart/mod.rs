@@ -18,6 +18,16 @@
 //! h = layer_norm(h)                              # final norm (MBart post-norm on output)
 //! logits = lm_head(h)
 //! ```
+//!
+//! # Incremental (KV-cached) decode
+//! [`MBartDecoder::forward`] is the reference path: it recomputes the whole prefix
+//! every call (`O(T²)` across a greedy decode). For autoregressive generation
+//! [`MBartDecoder::init_cache`] + [`MBartDecoder::step`] give the `O(T)` path: the
+//! cross-attention K/V (encoder-derived, fixed) are computed once into a
+//! [`DecoderCache`], and each step embeds only the one new token at its position,
+//! attends over the cached self- and cross-K/V, and emits logits for that single
+//! position. The output is arithmetically identical to slicing the last position out
+//! of the non-cached forward — the parity gate in [`crate::generate`] pins this.
 
 pub mod attention;
 pub mod layer;
@@ -30,7 +40,7 @@ use burn::tensor::{Int, Tensor, TensorData};
 use mineru_burn_common::nn::{PtLayerNorm, PtLinear};
 
 use crate::config::MBartConfig;
-use layer::MBartDecoderLayer;
+use layer::{LayerCache, MBartDecoderLayer};
 
 /// The MBart decoder with an LM head.
 #[derive(Module, Debug)]
@@ -108,6 +118,75 @@ impl<B: Backend> MBartDecoder<B> {
 
         self.lm_head.forward(hidden)
     }
+
+    /// Builds the incremental-decode cache: precomputes every layer's cross-attention
+    /// K/V from the fixed encoder grid and seeds empty self-attention caches.
+    ///
+    /// Call once per image before the greedy loop; then drive [`MBartDecoder::step`]
+    /// once per generated token, feeding the same [`DecoderCache`] back in each time.
+    pub fn init_cache(&self, encoder_hidden: Tensor<B, 3>) -> DecoderCache<B> {
+        let layers = self
+            .layers
+            .iter()
+            .map(|l| LayerCache::new(l.cross_kv(encoder_hidden.clone())))
+            .collect();
+        DecoderCache { layers }
+    }
+
+    /// Runs one incremental decode step for a single new token.
+    ///
+    /// - `token`: the id emitted at the previous step (or BOS for the first step).
+    /// - `position`: this token's 0-based position in the sequence (the running step
+    ///   count); the learned positional embedding is looked up at `position + OFFSET`.
+    /// - `cache`: the [`DecoderCache`] from [`MBartDecoder::init_cache`], extended in
+    ///   place.
+    ///
+    /// Returns logits `[B, vocab]` for the next token — the same row the non-cached
+    /// [`MBartDecoder::forward`] produces at the last position, but computed in `O(1)`
+    /// decoder work for this step instead of `O(T)`.
+    pub fn step(
+        &self,
+        token: Tensor<B, 2, Int>,
+        position: usize,
+        cache: &mut DecoderCache<B>,
+    ) -> Tensor<B, 2> {
+        let device = token.device();
+        let [b, _one] = token.dims();
+
+        // Scaled word embedding for the single new token: [B, 1, d].
+        let mut hidden = self.embed_tokens.forward(token).mul_scalar(self.embed_scale);
+
+        // Learned positional embedding at this one position (offset by 2).
+        let pos_ids: Tensor<B, 2, Int> = Tensor::from_data(
+            TensorData::new(vec![(position + self.position_offset) as i64], [1, 1]),
+            &device,
+        )
+        .repeat_dim(0, b);
+        hidden = hidden + self.embed_positions.forward(pos_ids);
+
+        hidden = self.layernorm_embedding.forward(hidden);
+
+        for (l, lc) in self.layers.iter().zip(cache.layers.iter_mut()) {
+            hidden = l.step(hidden, lc);
+        }
+        hidden = self.layer_norm.forward(hidden);
+
+        // [B, 1, vocab] -> [B, vocab].
+        let logits = self.lm_head.forward(hidden);
+        let vocab = logits.dims()[2];
+        logits.reshape([b, vocab])
+    }
+}
+
+/// Cross-step state for KV-cached decoding: one [`LayerCache`] per decoder layer.
+///
+/// Created by [`MBartDecoder::init_cache`] and advanced by [`MBartDecoder::step`].
+/// Holding the growing self-attention K/V and the fixed cross-attention K/V here is
+/// what turns the `O(T²)` non-cached loop into an `O(T)` one.
+#[derive(Debug, Clone)]
+pub struct DecoderCache<B: Backend> {
+    /// Per-layer caches, in decoder-layer order.
+    layers: Vec<LayerCache<B>>,
 }
 
 /// Builds an additive causal mask `[t, t]`: `0` on/below the diagonal, a large

@@ -16,10 +16,14 @@
 //!
 //! This crate is a faithful *architecture* translation of the Python reference at
 //! `mineru/model/mfr/unimernet/`. See the crate README-in-code notes and each
-//! module's docs for exactly what is COMPLETE, STUBBED, or UNCERTAIN — in
-//! particular, [`generate`] currently runs the correct **non-cached** loop
-//! (KV-cache is a noted optimization), and real weight loading is exercised only
-//! behind `#[ignore]`d tests because the checkpoint is a multi-hundred-MB download.
+//! module's docs for exactly what is COMPLETE, STUBBED, or UNCERTAIN. Generation
+//! runs the **KV-cached** `O(T)` greedy loop ([`generate`]): the decoder's
+//! cross-attention K/V (encoder-derived, fixed) are computed once and each step
+//! decodes only the one new token, reusing cached self-/cross-attention K/V. The
+//! single-shot [`mbart::MBartDecoder::forward`] survives as the reference/parity
+//! path (it anchors the cross-language check against the Python reference). Real
+//! weight loading is exercised only behind `#[ignore]`d tests because the checkpoint
+//! is a multi-hundred-MB download.
 //!
 //! [Burn]: https://burn.dev
 //!

@@ -7,34 +7,49 @@
 //!
 //! # What is faithful vs simplified
 //! - **Greedy** selection matches the Python default (`do_sample=False`, no beam).
-//! - This loop is **non-cached**: each step re-runs the decoder over the growing
-//!   prefix, which is `O(T²)` in decoder work. HF uses a KV cache for `O(T)`.
-//!   Correctness is identical; only speed differs. Adding a cache is the single
-//!   biggest performance TODO (see the crate notes).
+//! - This loop is **KV-cached** (`O(T)` decoder work): each step feeds only the one
+//!   new token, and the [`DecodeStep`] impl reuses cached self-/cross-attention K/V
+//!   from prior steps (see [`crate::mbart::DecoderCache`]). HF's reference does the
+//!   same. The generated token sequence is byte-identical to the earlier non-cached
+//!   loop — the cache changes only *how* each step's logits are computed, not their
+//!   value. Only the last position's logits are ever needed for greedy argmax, which
+//!   is exactly what the cached step returns.
 //! - `forced_eos_token_id` at `max_length` is honored by simply stopping; we do
 //!   not overwrite the final token, which only matters at the exact cap.
 //!
 //! The loop is generic over a [`DecodeStep`] so it can be unit-tested against a
-//! mock that returns canned logits without any weights (see the tests).
+//! mock that returns canned tokens without any weights (see the tests).
 
 use crate::config::MBartConfig;
 
-/// A single decode step: given the token ids produced so far, return the logits
-/// for the **next** token (a `vocab`-length row).
+/// A single incremental decode step: given the **one** token emitted at the previous
+/// step and its position, return the greedy next-token id.
 ///
-/// The real implementation runs the Swin encoder once and the MBart decoder over
-/// the prefix; the encoder output is captured by the closure/impl. Abstracting it
-/// lets [`greedy_decode`] be tested with a pure-logic mock.
+/// The real implementation runs the Swin encoder once (before the loop) and, per
+/// step, runs the MBart decoder over just the new token, reusing cached
+/// self-/cross-attention K/V from prior steps ([`crate::mbart::DecoderCache`]). The
+/// impl owns that mutable cache, which is why [`DecodeStep::step`] takes `&mut self`.
+/// Abstracting it lets [`greedy_decode`] be tested with a pure-logic mock.
+///
+/// # Contract
+/// [`greedy_decode`] calls [`DecodeStep::step`] with `position = 0` for the
+/// decoder-start (BOS) token, then `1, 2, …`, each time passing the token the
+/// previous call returned. Implementations must be driven in this strict order:
+/// each step appends exactly one token's K/V to its cache.
 pub trait DecodeStep {
-    /// Returns the greedy next-token id for the given prefix `ids`.
+    /// Advances the decode by one token.
     ///
-    /// The argmax is taken by the implementor — on the tensor backend where the
-    /// logits live — so only the single chosen id crosses to the host, not the
-    /// whole vocab-length row. This matters on GPU backends (e.g. wgpu), where a
-    /// per-token `vocab`-wide device→host copy would stall the decode loop. Ties
-    /// must break toward the **lower** index to match `torch.argmax` (see
-    /// [`argmax`]).
-    fn step(&mut self, ids: &[u32]) -> u32;
+    /// - `token`: the id to feed this step (BOS on the first call, else the id the
+    ///   previous call returned).
+    /// - `position`: the 0-based position of `token` in the sequence.
+    ///
+    /// Returns the greedy next-token id. The argmax is taken by the implementor — on
+    /// the tensor backend where the logits live — so only the single chosen id
+    /// crosses to the host, not the whole vocab-length row. This matters on GPU
+    /// backends (e.g. wgpu), where a per-token `vocab`-wide device→host copy would
+    /// stall the decode loop. Ties must break toward the **lower** index to match
+    /// `torch.argmax` (see [`argmax`]).
+    fn step(&mut self, token: u32, position: usize) -> u32;
 }
 
 /// Result of a greedy decode: the generated token ids **excluding** the initial
@@ -60,18 +75,21 @@ pub fn greedy_decode<S: DecodeStep>(
     eos_token: u32,
     max_new_tokens: usize,
 ) -> Decoded {
-    let mut ids = vec![start_token];
     let mut out = Vec::new();
     let mut hit_eos = false;
 
-    for _ in 0..max_new_tokens {
-        let next = step.step(&ids);
+    // Feed the BOS token at position 0, then each emitted token at the next position.
+    // The [`DecodeStep`] impl appends exactly one token's K/V to its cache per call,
+    // so the driving order here is part of the contract.
+    let mut token = start_token;
+    for position in 0..max_new_tokens {
+        let next = step.step(token, position);
         if next == eos_token {
             hit_eos = true;
             break;
         }
         out.push(next);
-        ids.push(next);
+        token = next;
     }
 
     Decoded {
@@ -121,7 +139,7 @@ mod tests {
     }
 
     impl DecodeStep for MockSteps {
-        fn step(&mut self, _ids: &[u32]) -> u32 {
+        fn step(&mut self, _token: u32, _position: usize) -> u32 {
             // Mirror the real impl: argmax the row (the implementor's job now),
             // so the tests still exercise the lower-index tie-break via `argmax`.
             let row = &self.rows[self.idx.min(self.rows.len() - 1)];
