@@ -4103,6 +4103,8 @@ dependencies = [
  "base64 0.22.1",
  "image",
  "mineru-types",
+ "once_cell",
+ "regex",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

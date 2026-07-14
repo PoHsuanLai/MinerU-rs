@@ -4,45 +4,85 @@
 //! rather than JSON:
 //!
 //! ```text
-//! <|box_start|>x1 y1 x2 y2<|box_end|><|ref_start|>type<|ref_end|>[<|rotate_up|>]
+//! <|box_start|>x1 y1 x2 y2<|box_end|><|ref_start|>type<|ref_end|>[<|rotate_up|>]<tail>
 //! ```
 //!
-//! Coordinates are integers in `0..=1000`; this module validates and rescales them
-//! to normalized `0.0..=1.0` and yields [`VlmBlock`]s ready for assembly.
+//! This is a direct port of the reference `mineru_vl_utils` regex
+//! (`parse_layout_output`): one pattern matched repeatedly over the whole string,
+//! with capture groups for the four box coordinates, the ref type, an optional
+//! rotate token, and the trailing text up to the next block. Coordinates are
+//! integers in `0..=1000`, validated/corner-ordered and rescaled to normalized
+//! `0.0..=1.0`. Matching Python exactly here matters: the hand-split predecessor
+//! could silently drop a block when anything sat between the box and its ref.
+
+use once_cell::sync::Lazy;
+use regex::Regex;
 
 use crate::raw::VlmBlock;
 
-const BOX_START: &str = "<|box_start|>";
-const BOX_END: &str = "<|box_end|>";
-const REF_START: &str = "<|ref_start|>";
-const REF_END: &str = "<|ref_end|>";
+/// The layout-block pattern: `<|box_start|>(d) (d) (d) (d)<|box_end|>`
+/// `<|ref_start|>(type)<|ref_end|>(rotate?)`.
+///
+/// This mirrors the reference `_layout_re` for the parts we consume — the four
+/// box ints, the ref type, and the optional rotate token. The reference has a
+/// trailing `(.*?)(?=<|box_start|>|$)` group that captures inter-block text for a
+/// `merge_prev` flag we don't use; the Rust `regex` crate has no look-around, and
+/// dropping that group is equivalent for our purposes: [`Regex::captures_iter`]
+/// resumes after each match and finds the next block regardless of the prose
+/// between them. Matching each block independently is what fixes the predecessor's
+/// bug (it dropped a block when anything sat between the box and its ref).
+static LAYOUT_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(concat!(
+        r"<\|box_start\|>(\d+)\s+(\d+)\s+(\d+)\s+(\d+)",
+        r"<\|box_end\|><\|ref_start\|>(\w+?)<\|ref_end\|>",
+        r"(?:(<\|rotate_(?:up|right|down|left)\|>))?",
+    ))
+    // The pattern is a compile-time constant and known valid; on the impossible
+    // event of a build-time regex-syntax error, fall back to a never-matching
+    // pattern rather than panicking in library code.
+    .unwrap_or_else(|_| Regex::new("$.^").expect("trivial never-match regex is valid"))
+});
 
 /// Parses a full layout response into blocks, skipping malformed entries.
 ///
-/// The `angle` of each block is read from a trailing `<|rotate_*|>` marker when
-/// present (`up`=0, `right`=90, `down`=180, `left`=270), defaulting to 0.
+/// Mirrors the reference `parse_layout_output`: for each regex match, converts the
+/// box, lower-cases the ref type, remaps `unknown` → `image`, drops
+/// `inline_formula` (folded elsewhere), and reads the angle from the optional
+/// rotate token. Blocks with an out-of-range or degenerate box are skipped.
 pub fn parse_layout(response: &str) -> Vec<VlmBlock> {
     let mut blocks = Vec::new();
-    let mut rest = response;
 
-    while let Some(start) = rest.find(BOX_START) {
-        rest = &rest[start + BOX_START.len()..];
-        let Some(box_end) = rest.find(BOX_END) else {
-            break;
+    for caps in LAYOUT_RE.captures_iter(response) {
+        // Groups 1..=4 are the box ints; the pattern only matches on `\d+`, so a
+        // parse failure here is impossible, but stay panic-free regardless.
+        let coords: Option<[i32; 4]> = (|| {
+            Some([
+                caps.get(1)?.as_str().parse().ok()?,
+                caps.get(2)?.as_str().parse().ok()?,
+                caps.get(3)?.as_str().parse().ok()?,
+                caps.get(4)?.as_str().parse().ok()?,
+            ])
+        })();
+        let Some(coords) = coords else { continue };
+        let Some(bbox) = convert_bbox(coords) else {
+            continue; // out of range or degenerate — skip (matches Python).
         };
-        let coords_str = &rest[..box_end];
-        rest = &rest[box_end + BOX_END.len()..];
 
-        // The ref (type) should immediately follow the box.
-        let Some((label, after_ref)) = parse_ref(rest) else {
+        let Some(ref_raw) = caps.get(5) else { continue };
+        let mut label = ref_raw.as_str().to_ascii_lowercase();
+        // Python: `unknown` -> `image`; `inline_formula` blocks are dropped here
+        // (they are folded into surrounding text downstream, not laid out).
+        if label == "unknown" {
+            label = "image".to_owned();
+        }
+        if label == "inline_formula" {
             continue;
-        };
-        rest = after_ref;
+        }
 
-        let Some(bbox) = parse_bbox(coords_str) else {
-            continue;
-        };
-        let angle = parse_leading_angle(rest);
+        let angle = caps
+            .get(6)
+            .map(|m| angle_from_token(m.as_str()))
+            .unwrap_or(0);
 
         blocks.push(VlmBlock {
             bbox,
@@ -56,24 +96,9 @@ pub fn parse_layout(response: &str) -> Vec<VlmBlock> {
     blocks
 }
 
-/// Parses `<|ref_start|>type<|ref_end|>` at the start of `s` (after optional
-/// whitespace), returning the type and the remainder.
-fn parse_ref(s: &str) -> Option<(String, &str)> {
-    let s = s.trim_start();
-    let after_start = s.strip_prefix(REF_START)?;
-    let end = after_start.find(REF_END)?;
-    let label = after_start[..end].trim().to_owned();
-    Some((label, &after_start[end + REF_END.len()..]))
-}
-
-/// Parses four whitespace-separated integers in `0..=1000` into a normalized,
-/// corner-ordered `[x0, y0, x1, y1]`. Returns `None` for out-of-range or
-/// degenerate boxes (matching the Python `_convert_bbox`).
-fn parse_bbox(s: &str) -> Option<[f32; 4]> {
-    let nums: Vec<i32> = s.split_whitespace().filter_map(|t| t.parse().ok()).collect();
-    let [a, b, c, d] = nums[..] else {
-        return None;
-    };
+/// Ports `_convert_bbox`: reject any coord outside `0..=1000`, corner-order the
+/// box, reject degenerate (zero-area) boxes, and rescale to normalized `0.0..=1.0`.
+fn convert_bbox([a, b, c, d]: [i32; 4]) -> Option<[f32; 4]> {
     if [a, b, c, d].iter().any(|&n| !(0..=1000).contains(&n)) {
         return None;
     }
@@ -90,20 +115,15 @@ fn parse_bbox(s: &str) -> Option<[f32; 4]> {
     ])
 }
 
-/// Reads a leading `<|rotate_*|>` marker into an angle, defaulting to 0.
-fn parse_leading_angle(s: &str) -> i32 {
-    let s = s.trim_start();
-    for (marker, angle) in [
-        ("<|rotate_up|>", 0),
-        ("<|rotate_right|>", 90),
-        ("<|rotate_down|>", 180),
-        ("<|rotate_left|>", 270),
-    ] {
-        if s.starts_with(marker) {
-            return angle;
-        }
+/// Maps a `<|rotate_*|>` token to its angle (`up`=0, `right`=90, `down`=180,
+/// `left`=270), matching `ANGLE_MAPPING`.
+fn angle_from_token(token: &str) -> i32 {
+    match token {
+        "<|rotate_right|>" => 90,
+        "<|rotate_down|>" => 180,
+        "<|rotate_left|>" => 270,
+        _ => 0, // includes `<|rotate_up|>`
     }
-    0
 }
 
 #[cfg(test)]
@@ -143,5 +163,30 @@ mod tests {
     fn orders_swapped_corners() {
         let blocks = parse_layout("<|box_start|>500 800 100 200<|box_end|><|ref_start|>text<|ref_end|>");
         assert_eq!(blocks[0].bbox, [0.1, 0.2, 0.5, 0.8]);
+    }
+
+    #[test]
+    fn skips_inter_block_text_and_multiline_tails() {
+        // Real responses interleave prose/newlines between blocks; the DOTALL tail
+        // must consume it so the next block still matches (the hand-split parser's
+        // failure mode was dropping blocks after any inter-block text).
+        let resp = "<|box_start|>0 0 500 100<|box_end|><|ref_start|>title<|ref_end|>\n\
+                    some trailing description across\nmultiple lines\n\
+                    <|box_start|>0 200 500 900<|box_end|><|ref_start|>text<|ref_end|>";
+        let blocks = parse_layout(resp);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].label, "title");
+        assert_eq!(blocks[1].label, "text");
+    }
+
+    #[test]
+    fn remaps_unknown_to_image_and_drops_inline_formula() {
+        let resp = "<|box_start|>0 0 500 100<|box_end|><|ref_start|>unknown<|ref_end|>\
+                    <|box_start|>0 200 500 300<|box_end|><|ref_start|>inline_formula<|ref_end|>\
+                    <|box_start|>0 400 500 500<|box_end|><|ref_start|>Text<|ref_end|>";
+        let blocks = parse_layout(resp);
+        assert_eq!(blocks.len(), 2, "inline_formula dropped, unknown kept");
+        assert_eq!(blocks[0].label, "image", "unknown remapped to image");
+        assert_eq!(blocks[1].label, "text", "ref type lower-cased");
     }
 }

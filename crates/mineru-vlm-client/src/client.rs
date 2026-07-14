@@ -16,6 +16,12 @@ use crate::parse::parse_layout;
 use crate::prompts::{self, Sampling};
 use crate::raw::{VlmBlock, VlmPage};
 
+/// Fixed square size (px) the page is resized to for the layout-detection pass.
+///
+/// MinerU2.5's layout model is trained at this resolution; sending any other size
+/// yields degenerate output. Mirrors the reference `layout_image_size = (1036, 1036)`.
+const LAYOUT_IMAGE_SIZE: u32 = 1036;
+
 /// Configuration for connecting to the VLM server.
 #[derive(Debug, Clone)]
 pub struct VlmClientConfig {
@@ -66,9 +72,20 @@ impl VlmClient {
     pub async fn extract_page(&self, page: &RgbImage, image_analysis: bool) -> Result<VlmPage> {
         let (w, h) = (page.width() as f32, page.height() as f32);
 
-        // Step 1: layout over the full page.
+        // Step 1: layout over the full page. The model is trained on a FIXED
+        // layout-input size and produces garbage (a run of `!` tokens) for any
+        // other resolution — so the page is resized to `LAYOUT_IMAGE_SIZE` with
+        // bicubic resampling first, matching the reference `prepare_for_layout`.
+        // The returned boxes are normalized `0..1`, so this resize does not affect
+        // downstream coordinates.
+        let layout_input = image::imageops::resize(
+            page,
+            LAYOUT_IMAGE_SIZE,
+            LAYOUT_IMAGE_SIZE,
+            image::imageops::FilterType::CatmullRom,
+        );
         let layout_text = self
-            .complete(page, prompts::LAYOUT, Sampling::default())
+            .complete(&layout_input, prompts::LAYOUT, Sampling::default())
             .await?;
         let mut blocks = parse_layout(&layout_text);
 
