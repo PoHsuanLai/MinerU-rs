@@ -77,17 +77,24 @@ struct ModelStep<'a, B: Backend> {
 }
 
 impl<B: Backend> DecodeStep for ModelStep<'_, B> {
-    fn step(&mut self, ids: &[u32]) -> Vec<f32> {
+    fn step(&mut self, ids: &[u32]) -> u32 {
         let t = ids.len();
         let data: Vec<i64> = ids.iter().map(|&x| x as i64).collect();
         let input_ids: Tensor<B, 2, Int> =
             Tensor::from_data(TensorData::new(data, [1, t]), &self.device);
         let logits = self.model.decode(input_ids, self.encoder_hidden.clone()); // [1, T, vocab]
-        // Take the last position's logits.
+        // Take the last position's logits `[vocab]`.
         let last = logits.narrow(1, t - 1, 1).reshape([self.vocab_size]);
-        // Backend-portable host read: coerce to f32 regardless of the backend's
-        // float storage dtype (see `mineru_burn_common::float_to_vec_f32`).
-        mineru_burn_common::float_to_vec_f32(last)
+        // Argmax ON-DEVICE: only the single chosen id crosses to the host, not the
+        // whole `vocab`-wide row — avoids a per-token device→host copy that would
+        // stall the decode loop on GPU backends. Burn's `argmax` breaks ties toward
+        // the lower index, matching the host `argmax`/`torch.argmax` (verified by the
+        // formula parity gate producing byte-identical LaTeX after this change).
+        let idx = last.argmax(0); // [1], Int
+        mineru_burn_common::int_to_vec_i64(idx)
+            .first()
+            .copied()
+            .unwrap_or(0) as u32
     }
 }
 

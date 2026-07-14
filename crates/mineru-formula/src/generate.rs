@@ -26,8 +26,15 @@ use crate::config::MBartConfig;
 /// the prefix; the encoder output is captured by the closure/impl. Abstracting it
 /// lets [`greedy_decode`] be tested with a pure-logic mock.
 pub trait DecodeStep {
-    /// Returns next-token logits for the given prefix `ids`.
-    fn step(&mut self, ids: &[u32]) -> Vec<f32>;
+    /// Returns the greedy next-token id for the given prefix `ids`.
+    ///
+    /// The argmax is taken by the implementor — on the tensor backend where the
+    /// logits live — so only the single chosen id crosses to the host, not the
+    /// whole vocab-length row. This matters on GPU backends (e.g. wgpu), where a
+    /// per-token `vocab`-wide device→host copy would stall the decode loop. Ties
+    /// must break toward the **lower** index to match `torch.argmax` (see
+    /// [`argmax`]).
+    fn step(&mut self, ids: &[u32]) -> u32;
 }
 
 /// Result of a greedy decode: the generated token ids **excluding** the initial
@@ -58,8 +65,7 @@ pub fn greedy_decode<S: DecodeStep>(
     let mut hit_eos = false;
 
     for _ in 0..max_new_tokens {
-        let logits = step.step(&ids);
-        let next = argmax(&logits);
+        let next = step.step(&ids);
         if next == eos_token {
             hit_eos = true;
             break;
@@ -88,23 +94,24 @@ pub fn greedy_decode_with_config<S: DecodeStep>(
     )
 }
 
-/// Returns the index of the maximum logit (ties broken toward the lower index),
-/// matching `torch.argmax`.
-fn argmax(logits: &[f32]) -> u32 {
-    let mut best = 0usize;
-    let mut best_v = f32::NEG_INFINITY;
-    for (i, &v) in logits.iter().enumerate() {
-        if v > best_v {
-            best_v = v;
-            best = i;
-        }
-    }
-    best as u32
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Host argmax (ties toward the lower index, matching `torch.argmax` and the
+    /// on-device `Tensor::argmax` the real [`DecodeStep`] impls use). Test-only: the
+    /// production path argmaxes on the tensor backend, not the host.
+    fn argmax(logits: &[f32]) -> u32 {
+        let mut best = 0usize;
+        let mut best_v = f32::NEG_INFINITY;
+        for (i, &v) in logits.iter().enumerate() {
+            if v > best_v {
+                best_v = v;
+                best = i;
+            }
+        }
+        best as u32
+    }
 
     /// A mock that plays back a fixed logits sequence, one row per step. The vocab
     /// is tiny; each row is the argmax target one-hot-ish.
@@ -114,10 +121,13 @@ mod tests {
     }
 
     impl DecodeStep for MockSteps {
-        fn step(&mut self, _ids: &[u32]) -> Vec<f32> {
-            let row = self.rows[self.idx.min(self.rows.len() - 1)].clone();
+        fn step(&mut self, _ids: &[u32]) -> u32 {
+            // Mirror the real impl: argmax the row (the implementor's job now),
+            // so the tests still exercise the lower-index tie-break via `argmax`.
+            let row = &self.rows[self.idx.min(self.rows.len() - 1)];
+            let next = argmax(row);
             self.idx += 1;
-            row
+            next
         }
     }
 

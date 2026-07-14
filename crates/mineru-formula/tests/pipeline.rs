@@ -79,18 +79,14 @@ fn greedy_loop_runs_end_to_end_with_random_weights() {
         vocab: usize,
     }
     impl DecodeStep for Step<'_> {
-        fn step(&mut self, ids: &[u32]) -> Vec<f32> {
+        fn step(&mut self, ids: &[u32]) -> u32 {
             let t = ids.len();
             let data: Vec<i64> = ids.iter().map(|&x| x as i64).collect();
             let input: Tensor<Cpu, 2, Int> =
                 Tensor::from_data(TensorData::new(data, [1, t]), &self.device);
             let logits = self.model.decode(input, self.enc.clone());
-            logits
-                .narrow(1, t - 1, 1)
-                .reshape([self.vocab])
-                .into_data()
-                .to_vec()
-                .expect("logits to vec")
+            let idx = logits.narrow(1, t - 1, 1).reshape([self.vocab]).argmax(0);
+            idx.into_data().to_vec::<i64>().expect("argmax to vec")[0] as u32
         }
     }
 
