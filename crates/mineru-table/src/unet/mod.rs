@@ -12,13 +12,15 @@
 //!   and imports cleanly via `burn-onnx` codegen behind the `onnx-import`
 //!   feature; [`UnetModel`] wraps the generated segmentation network and reports
 //!   [`crate::error::Error::ModelUnavailable`] when built without it.
-//! - The mask → polygon line-extraction stage (OpenCV morphology, 8-connectivity
-//!   labeling, min-area-rect) is not yet ported; it is orthogonal to the tested
-//!   logic and is the remaining model-side work.
+//! - The mask → polygon line-extraction stage (morphology, 8-connectivity
+//!   labeling, min-area-rect) is ported in [`extract`]; it reuses the hoisted
+//!   `cv2.minAreaRect` port and hand-rolls only the anisotropic 1-D line-kernel
+//!   close that isotropic `imageproc` morphology cannot express.
 //! - [`recover`] (grid inference) and [`plot_html_table`] (HTML assembly) are
 //!   fully ported and unit-tested, and [`recover_and_render`] runs them together
 //!   given cell polygons + matched text — the whole post-segmentation pipeline.
 
+pub mod extract;
 pub mod model;
 pub mod postprocess;
 pub mod recover;

@@ -42,6 +42,9 @@ pub struct SegMask {
 /// The wired-table line-segmentation model.
 #[derive(Debug, Default)]
 pub struct UnetModel {
+    // Only read on the `unet_generated` path (where weights exist); without the
+    // feature every `segment_cells` call short-circuits to `ModelUnavailable`.
+    #[cfg_attr(not(unet_generated), allow(dead_code))]
     ready: bool,
 }
 
@@ -63,19 +66,31 @@ impl UnetModel {
 
     /// Runs segmentation and returns recovered cell quadrilaterals.
     ///
-    /// The neural forward pass is wired (see [`UnetModel::segment_mask`]), but the
-    /// mask → polygon extraction stage (morphology + connected components +
-    /// min-area rect) is not yet ported, so this returns
-    /// [`Error::ModelUnavailable`] rather than fabricate cells.
-    pub fn segment_cells(&self, _img: &RgbImage) -> Result<Vec<Poly>> {
+    /// Under `onnx-import` this runs the neural forward pass
+    /// ([`UnetModel::segment_mask`]) and then the classical mask → polygon
+    /// extraction ([`super::extract::extract_cell_polygons`]). Without the feature
+    /// (or without weights) it returns [`Error::ModelUnavailable`] rather than
+    /// fabricate cells.
+    #[cfg(unet_generated)]
+    pub fn segment_cells(&self, img: &RgbImage) -> Result<Vec<Poly>> {
         if !self.ready {
             return Err(Error::ModelUnavailable("unet"));
         }
-        // The forward pass produces a mask, but turning it into cell polygons
-        // (OpenCV morphology / connected components / min-area rect) is unported.
-        Err(Error::ModelUnavailable(
-            "unet (mask→cell extraction not yet ported)",
+        let mask = self.segment_mask(img)?;
+        Ok(super::extract::extract_cell_polygons(
+            &mask.classes,
+            mask.width,
+            mask.height,
         ))
+    }
+
+    /// Runs segmentation and returns recovered cell quadrilaterals.
+    ///
+    /// Built without the `onnx-import` feature there are no weights compiled in, so
+    /// this always reports the model unavailable.
+    #[cfg(not(unet_generated))]
+    pub fn segment_cells(&self, _img: &RgbImage) -> Result<Vec<Poly>> {
+        Err(Error::ModelUnavailable("unet"))
     }
 }
 

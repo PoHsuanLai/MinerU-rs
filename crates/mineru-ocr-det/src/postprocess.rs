@@ -21,6 +21,7 @@ use clipper2::{EndType, JoinType, Paths};
 use image::GrayImage;
 use imageproc::contours::find_contours;
 use imageproc::point::Point;
+use mineru_burn_common::geometry::min_area_rectangle;
 
 /// A detected text-line quadrilateral: four corner points in source-image pixels,
 /// plus the mean-probability score that passed `box_thresh`.
@@ -181,106 +182,6 @@ fn get_mini_boxes(points: &[Point<f64>]) -> Option<([(f32, f32); 4], f32)> {
     let (idx2, idx3) = if pts[3].1 > pts[2].1 { (2, 3) } else { (3, 2) };
     let ordered = [pts[idx1], pts[idx2], pts[idx3], pts[idx4]];
     Some((ordered, sside as f32))
-}
-
-/// Minimum-area bounding rectangle via convex hull + rotating calipers.
-///
-/// A self-contained port of `cv2.minAreaRect` semantics (imageproc's version panics
-/// on the degenerate/collinear hulls that axis-aligned text boxes routinely produce
-/// under Rust's total-order-checked sort). Returns the four rectangle corners and the
-/// length of its shorter side, or [`None`] if fewer than one unique point exists.
-fn min_area_rectangle(points: &[(f64, f64)]) -> Option<([(f64, f64); 4], f64)> {
-    let hull = convex_hull(points);
-    if hull.is_empty() {
-        return None;
-    }
-    if hull.len() < 3 {
-        // A point or a segment: return a degenerate rect with shorter side 0.
-        let p = hull[0];
-        let q = *hull.last().unwrap_or(&p);
-        return Some(([p, q, q, p], 0.0));
-    }
-
-    let mut best_area = f64::MAX;
-    let mut best_rect = [(0.0, 0.0); 4];
-    let mut best_sside = 0.0;
-
-    let n = hull.len();
-    for i in 0..n {
-        let a = hull[i];
-        let b = hull[(i + 1) % n];
-        // Edge direction (unit vector); skip zero-length edges.
-        let (ex, ey) = (b.0 - a.0, b.1 - a.1);
-        let len = (ex * ex + ey * ey).sqrt();
-        if len < 1e-9 {
-            continue;
-        }
-        let (ux, uy) = (ex / len, ey / len);
-        // Perpendicular unit vector.
-        let (px, py) = (-uy, ux);
-
-        // Project every hull point onto (u, p) to get the rotated bbox extents.
-        let (mut min_u, mut max_u, mut min_v, mut max_v) =
-            (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
-        for &(x, y) in &hull {
-            let proj_u = x * ux + y * uy;
-            let proj_v = x * px + y * py;
-            min_u = min_u.min(proj_u);
-            max_u = max_u.max(proj_u);
-            min_v = min_v.min(proj_v);
-            max_v = max_v.max(proj_v);
-        }
-        let w = max_u - min_u;
-        let h = max_v - min_v;
-        let area = w * h;
-        if area < best_area {
-            best_area = area;
-            best_sside = w.min(h);
-            // Reconstruct the four corners in (u, v) space, map back to (x, y).
-            let to_xy = |cu: f64, cv: f64| (cu * ux + cv * px, cu * uy + cv * py);
-            best_rect = [
-                to_xy(min_u, min_v),
-                to_xy(max_u, min_v),
-                to_xy(max_u, max_v),
-                to_xy(min_u, max_v),
-            ];
-        }
-    }
-    Some((best_rect, best_sside))
-}
-
-/// Andrew's monotone-chain convex hull, counter-clockwise, no repeated endpoint.
-fn convex_hull(points: &[(f64, f64)]) -> Vec<(f64, f64)> {
-    let mut pts: Vec<(f64, f64)> = points.to_vec();
-    pts.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
-    pts.dedup();
-    let n = pts.len();
-    if n < 3 {
-        return pts;
-    }
-
-    let cross = |o: (f64, f64), a: (f64, f64), b: (f64, f64)| {
-        (a.0 - o.0) * (b.1 - o.1) - (a.1 - o.1) * (b.0 - o.0)
-    };
-
-    let mut lower: Vec<(f64, f64)> = Vec::new();
-    for &p in &pts {
-        while lower.len() >= 2 && cross(lower[lower.len() - 2], lower[lower.len() - 1], p) <= 0.0 {
-            lower.pop();
-        }
-        lower.push(p);
-    }
-    let mut upper: Vec<(f64, f64)> = Vec::new();
-    for &p in pts.iter().rev() {
-        while upper.len() >= 2 && cross(upper[upper.len() - 2], upper[upper.len() - 1], p) <= 0.0 {
-            upper.pop();
-        }
-        upper.push(p);
-    }
-    lower.pop();
-    upper.pop();
-    lower.extend(upper);
-    lower
 }
 
 /// Euclidean distance between two points.

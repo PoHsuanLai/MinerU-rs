@@ -62,9 +62,7 @@ fn classify_runs_real_lcnet_forward() {
     );
 }
 
-/// Exercises the UNet forward pass directly (the mask → cell-polygon extraction
-/// is not yet ported, so we assert the neural forward runs and yields a sane
-/// 3-class mask rather than a full cell recovery).
+/// Exercises the UNet forward pass directly and asserts a sane 3-class mask.
 #[cfg(unet_generated)]
 #[test]
 #[ignore = "requires onnx-import feature + MINERU_MODELS_DIR; slow ndarray forward"]
@@ -90,4 +88,58 @@ fn unet_forward_produces_mask() {
         mask.classes.iter().all(|&c| (0..=2).contains(&c)),
         "mask classes must be in 0..=2"
     );
+    let (h_px, v_px) = mask.classes.iter().fold((0usize, 0usize), |(h, v), &c| match c {
+        1 => (h + 1, v),
+        2 => (h, v + 1),
+        _ => (h, v),
+    });
+    println!("mask line pixels: horizontal={h_px} vertical={v_px}");
+}
+
+/// Full wired-table path against the real UNet: `segment_cells` (forward pass +
+/// mask → polygon extraction) → grid recovery → HTML. Asserts a plausible cell
+/// count and a well-formed `<table>` with a sane rough row/col count.
+#[cfg(unet_generated)]
+#[test]
+#[ignore = "requires onnx-import feature + MINERU_MODELS_DIR; slow ndarray forward"]
+fn unet_segment_cells_recovers_grid_html() {
+    use mineru_table::unet::model::UnetModel;
+    use mineru_table::unet::{plot_html_table, recover, COL_THRESHOLD, ROW_THRESHOLD};
+    use std::collections::HashMap;
+
+    // A clear 4x4 ruled grid so the segmenter has strong, unambiguous rulings.
+    let img = synthetic_table(1024, 1024);
+    let model = UnetModel::loaded();
+    let polys = model
+        .segment_cells(&img)
+        .expect("segment_cells should run end-to-end with the generated model");
+
+    println!("segment_cells produced {} cell polygons", polys.len());
+    for (i, p) in polys.iter().take(8).enumerate() {
+        println!("  cell {i}: {p:?}");
+    }
+    // A ruled grid must yield at least a handful of cells (not zero, not absurd).
+    assert!(
+        (1..=400).contains(&polys.len()),
+        "implausible cell count {}",
+        polys.len()
+    );
+
+    let logic = recover(&polys, ROW_THRESHOLD, COL_THRESHOLD);
+    assert_eq!(logic.len(), polys.len());
+    let max_row = logic.iter().map(|l| l.row_end).max().unwrap_or(0) + 1;
+    let max_col = logic.iter().map(|l| l.col_end).max().unwrap_or(0) + 1;
+    println!("recovered grid: {max_row} rows x {max_col} cols");
+
+    let text: HashMap<usize, Vec<String>> = HashMap::new();
+    let html = plot_html_table(&logic, &text);
+    println!(
+        "html (first 400 chars): {}",
+        &html[..html.len().min(400)]
+    );
+    assert!(html.starts_with("<html>"), "html: {html}");
+    assert!(html.contains("<table>"));
+    assert!(html.contains("</table>"));
+    // A grid should recover more than a single 1x1 cell.
+    assert!(max_row >= 2 || max_col >= 2, "grid collapsed to a single cell");
 }

@@ -13,6 +13,8 @@
 //! - **Preprocessing** ([`preprocess`]): one parameterised `image::RgbImage` →
 //!   `[1, 3, H, W]` tensor pipeline reused by every vision model.
 //! - **CTC decoding** ([`ctc`]): greedy best-path decode for OCR recognition.
+//! - **Geometry** ([`geometry`]): a robust `cv2.minAreaRect` port + convex hull,
+//!   shared by the detection and table post-processors.
 //! - **A uniform [`model::Model`] trait** and common [`nn`] blocks.
 //!
 //! All backends default to CPU (`ndarray`), so the crate and its tests build and
@@ -21,6 +23,7 @@
 pub mod backend;
 pub mod ctc;
 pub mod error;
+pub mod geometry;
 pub mod model;
 pub mod nn;
 pub mod preprocess;
@@ -28,6 +31,7 @@ pub mod weights;
 
 pub use backend::{Cpu, cpu_device};
 pub use ctc::{ctc_greedy_decode, ctc_greedy_decode_slice};
+pub use geometry::{convex_hull, min_area_rectangle};
 pub use error::{Error, Result};
 pub use model::Model;
 pub use nn::{ConvBnRelu, ConvBnReluConfig, FrozenBatchNorm2d, PtLayerNorm, PtLinear, tensor_from_vec};
