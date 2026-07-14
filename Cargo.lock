@@ -4044,10 +4044,15 @@ dependencies = [
 name = "mineru-pdf"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "image",
  "mineru-types",
  "pdfium-render",
+ "tar",
  "thiserror 2.0.18",
+ "tracing",
+ "ureq",
+ "zip 8.6.0",
 ]
 
 [[package]]

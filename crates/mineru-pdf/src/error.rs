@@ -47,6 +47,26 @@ pub enum Error {
         /// The underlying Pdfium error message.
         message: String,
     },
+
+    /// The running platform/architecture has no known prebuilt PDFium asset, so
+    /// the auto-download fallback cannot pick a binary to fetch.
+    #[error("unsupported platform for PDFium auto-download: {0}")]
+    UnsupportedPlatform(String),
+
+    /// Downloading the prebuilt PDFium archive failed (network error, non-success
+    /// HTTP status, or an empty body).
+    #[error("failed to download PDFium: {0}")]
+    Download(String),
+
+    /// Extracting the native library out of the downloaded archive failed, or the
+    /// expected library entry was absent.
+    #[error("failed to unpack PDFium archive: {0}")]
+    Unpack(String),
+
+    /// No writable cache directory could be resolved, or a filesystem operation on
+    /// the cache/target path failed.
+    #[error("PDFium cache error: {0}")]
+    Cache(String),
 }
 
 /// Convenience alias used throughout the crate.

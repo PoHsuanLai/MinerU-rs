@@ -1,0 +1,165 @@
+# MinerU-rs
+
+A Rust port of [MinerU](https://github.com/opendatalab/MinerU) — a document-parsing
+engine that turns PDFs into structured Markdown and JSON. The deep-learning models are
+reimplemented on the [Burn](https://burn.dev) framework (no ONNX Runtime, no Python at
+inference time); non-ML pieces reuse mature Rust crates.
+
+The workspace is a set of **thin, independently-importable crates** (one per model,
+one per concern) plus a single `mineru` binary. A downstream Rust project can depend on
+just the umbrella `mineru` crate (feature-gated) or on an individual model crate.
+
+> **Status:** offline pipeline is functional end-to-end. Every neural model is
+> numerically parity-checked against a PyTorch/ONNX reference (see each crate's
+> `tests/`). This is a research port — treat output as verified per-model, not yet
+> hardened for production.
+
+## Backends
+
+| Backend | Flag | What it needs |
+|---|---|---|
+| **pipeline** | `-b pipeline` | Fully local Burn models on disk. No network at inference (weights fetched once). |
+| **vlm** | `-b vlm` | An external OpenAI-compatible VLM server (e.g. Qwen2-VL via vLLM / mistral.rs). |
+| **hybrid** | *(library only)* | Pipeline layout + per-region VLM extraction. `effort` medium/high. |
+
+Office formats (docx/pptx/xlsx) are deferred (a future `mineru-office` crate).
+
+## Quick start (pipeline backend, fully local)
+
+```sh
+# 1. Build the CLI.
+cargo build --release -p mineru --bin mineru
+
+# 2. Point at a model directory (the opendatalab PDF-Extract-Kit release layout).
+export MINERU_MODELS_DIR=/path/to/PDF-Extract-Kit-1.0/models
+
+# 3. Run.
+./target/release/mineru -p paper.pdf -o out -b pipeline
+# writes out/paper.md and out/paper_content_list.json
+```
+
+On first run the table-model weights are downloaded automatically from this repo's
+GitHub release and cached under the model directory; nothing else touches the network.
+
+### Native PDFium library
+
+PDF rasterization and native-text extraction use the PDFium native library, loaded at
+runtime (none is bundled). Resolution order:
+
+1. `MINERU_PDFIUM_LIB_PATH` — an explicit path to the library.
+2. Common system locations (`/opt/homebrew/lib`, `/usr/local/lib`) and the platform default.
+3. Auto-download of a matching prebuilt binary, cached under the model/cache directory.
+
+The resolved path (and any download) is logged at info level. To use a specific build,
+set `MINERU_PDFIUM_LIB_PATH=/path/to/libpdfium.dylib` (`.so` on Linux, `pdfium.dll` on
+Windows).
+
+## Model directory layout
+
+`MINERU_MODELS_DIR` should point at the `models/` directory of the opendatalab release:
+
+```
+models/
+  Layout/PP-DocLayoutV2/model.safetensors          # layout detector (RT-DETR)
+  OCR/paddleocr_torch/
+    ch_PP-OCRv6_small_det_infer.safetensors         # text-line detector (DBNet)
+    ch_PP-OCRv6_small_rec_infer.safetensors         # text recognizer (SVTR+CTC)
+  MFR/unimernet_hf_small_2503/                       # formula recognizer (UniMerNet)
+    model.safetensors
+    tokenizer.json
+  TabRec/SlanetPlus/slanet-plus.onnx                # wireless-table structure (SLANet)
+```
+
+The OCR character dictionary is embedded in the binary. The two table CNNs (LCNet
+classifier, UNet wired-table segmenter) are compiled from committed Burn source; their
+weights auto-download from this repo's release.
+
+## Environment variables
+
+| Variable | Purpose |
+|---|---|
+| `MINERU_MODELS_DIR` | Root of the local model weights (pipeline backend). |
+| `MINERU_PDFIUM_LIB_PATH` | Explicit path to the PDFium native library. |
+| `MINERU_TABLE_WEIGHTS_BASE` | Override the base URL for the table `.bpk` weight download. |
+| `MINERU_PDFIUM_DOWNLOAD_BASE` | Override the base URL for the PDFium auto-download. |
+| `MINERU_VLM_URL` | Base URL of the OpenAI-compatible VLM server (vlm backend). |
+| `MINERU_TOOLS_CONFIG_JSON` | Path to a JSON config file (falls back to `~/.mineru.json`). |
+
+Per-model weight overrides (`MINERU_LAYOUT_WEIGHTS`, `MINERU_OCR_DET_WEIGHTS`,
+`MINERU_OCR_REC_WEIGHTS`, `MINERU_FORMULA_WEIGHTS`, `MINERU_FORMULA_MODEL_DIR`) point a
+single stage at a specific file, bypassing the `MINERU_MODELS_DIR` layout.
+
+## CLI
+
+```
+mineru [OPTIONS]
+
+  -p, --path <INPUT>       Input PDF path
+  -o, --output <OUTPUT>    Output directory (default: output)
+  -b, --backend <BACKEND>  pipeline | vlm  (default: pipeline)
+      --lang <LANG>        OCR language hint (e.g. ch, en); omit to auto-detect
+      --no-formula         Disable formula recognition
+      --no-table           Disable table recognition
+      --pages <PAGES>      Page range START or START:END (0-based, END exclusive)
+  -v, --verbose            Debug-level logging
+      --config <CONFIG>    Path to a JSON config file
+```
+
+## Using the crates as a library
+
+The umbrella `mineru` crate re-exports the workspace behind cargo features, so you pull
+only what you need:
+
+```toml
+[dependencies]
+# Just the layout model:
+mineru = { git = "https://github.com/PoHsuanLai/MinerU-rs", default-features = false, features = ["layout"] }
+```
+
+```rust
+use mineru::layout::LayoutModel;   // re-exported from mineru-layout
+use mineru::types::BBox;           // shared geometry from mineru-types
+```
+
+Features: `pipeline`, `vlm`, `hybrid`, and per-model `ocr` / `layout` / `table` /
+`formula` / `burn-common`. `cli` (default) builds the binary. Each model crate
+(`mineru-layout`, `mineru-ocr-rec`, …) is also publishable/importable on its own.
+
+## Workspace layout
+
+```
+mineru-types           domain model (Document/Block/Span enums) + the Backend trait
+mineru-config          serde config (device, model source, paths)
+mineru-io              filesystem I/O + hf-hub download helper
+mineru-pdf             PDFium rasterize + native-text extraction
+mineru-render          blocks → Markdown + content_list JSON
+mineru-burn-common     shared Burn harness: weight loading, NN blocks, geometry
+mineru-ocr-det         DBNet text detection            (Burn)
+mineru-ocr-rec         SVTR + CTC text recognition     (Burn)
+mineru-layout          RT-DETR layout detection        (Burn)
+mineru-formula         UniMerNet formula recognition   (Burn)
+mineru-table           LCNet cls + UNet seg + SLANet    (Burn)
+mineru-vlm-client      OpenAI-compatible VLM client (no Burn)
+mineru-backend-*       pipeline / vlm / hybrid, each impl Backend
+mineru                 umbrella library + CLI binary
+```
+
+## Development
+
+```sh
+cargo build --workspace
+cargo test  --workspace                     # fast, offline; heavy tests are #[ignore]d
+cargo clippy --workspace --all-targets
+
+# Per-model numeric parity gates (need weights on disk; slow CPU forward):
+MINERU_MODELS_DIR=... cargo test -p mineru-table --release --test slanet_real -- --ignored
+```
+
+## License
+
+See [`LICENSE`](LICENSE).
+
+## Acknowledgements
+
+Ports [opendatalab/MinerU](https://github.com/opendatalab/MinerU). Model weights are the
+original authors'.

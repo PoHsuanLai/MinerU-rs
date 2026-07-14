@@ -8,10 +8,21 @@
 //!
 //! # PDFium library resolution
 //!
-//! PDFium is loaded dynamically at runtime. [`PdfiumLibrary::load`] searches, in
-//! order: the `MINERU_PDFIUM_LIB_PATH` environment variable, a set of common
-//! system locations, and finally the platform's default lookup. No native library
-//! is bundled, keeping the crate small.
+//! PDFium is loaded dynamically at runtime. [`PdfiumLibrary::load`] resolves the
+//! native library in this order, logging (at INFO) which branch wins:
+//!
+//! 1. **`MINERU_PDFIUM_LIB_PATH` set:** if the file exists there, bind it. If it
+//!    does not exist, auto-download a matching prebuilt PDFium to that exact path
+//!    (creating parent dirs) and bind it.
+//! 2. **`MINERU_PDFIUM_LIB_PATH` unset:** try common system locations
+//!    (`/opt/homebrew/lib`, `/usr/local/lib`) and the platform default first; if
+//!    none bind, auto-download to a per-user cache
+//!    (`<MINERU_MODELS_DIR | $XDG_CACHE_HOME/mineru | $HOME/.cache/mineru>/pdfium/`)
+//!    and bind from there, reusing the cached copy on later runs.
+//!
+//! No native library is bundled, keeping the crate small. The auto-download always
+//! fetches the *latest* prebuilt build (see [`download`]) because the crate selects
+//! pdfium-render's `pdfium_latest` feature and an ABI mismatch aborts the process.
 //!
 //! # Threading
 //!
@@ -21,10 +32,11 @@
 //! operations — parse one document at a time, or guard access with a mutex. The
 //! higher layers process documents sequentially for exactly this reason.
 
+pub mod download;
 pub mod error;
 pub mod text;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use image::RgbImage;
@@ -101,8 +113,10 @@ impl PdfiumLibrary {
     /// Returns the process-global PDFium binding, loading it on first use.
     ///
     /// PDFium must be bound only once per process, so every caller shares one
-    /// instance. Search order for the native library: `MINERU_PDFIUM_LIB_PATH`,
-    /// common system paths, then the platform default.
+    /// instance. The native library is resolved (and, if absent, auto-downloaded)
+    /// as documented at the crate root. All of that — including any download —
+    /// happens inside a single `get_or_init` under a lock, so the library is bound
+    /// exactly once and never downloaded twice concurrently.
     pub fn load() -> Result<&'static Self> {
         // Fast path: already bound.
         if let Some(slot) = LIBRARY.get() {
@@ -117,20 +131,76 @@ impl PdfiumLibrary {
         slot.as_ref().map_err(|e| Error::Bind(e.clone()))
     }
 
-    /// Binds the native library from the first location that resolves.
+    /// Binds the native library, resolving (and if needed auto-downloading) it per
+    /// the crate-root order.
+    ///
+    /// Runs entirely inside `load`'s single `get_or_init` (under a lock), so any
+    /// download happens exactly once and the process binds exactly once.
     fn bind() -> Result<Self> {
-        for candidate in candidate_library_paths() {
+        // 1. Explicit path via MINERU_PDFIUM_LIB_PATH.
+        if let Some(explicit) = std::env::var_os("MINERU_PDFIUM_LIB_PATH") {
+            let path = PathBuf::from(explicit);
+            if path.exists() {
+                tracing::info!(
+                    path = %path.display(),
+                    "using PDFium from MINERU_PDFIUM_LIB_PATH"
+                );
+            } else {
+                tracing::info!(
+                    path = %path.display(),
+                    "MINERU_PDFIUM_LIB_PATH does not exist; auto-downloading PDFium there"
+                );
+                let url = download::download_pdfium_to(&path)?;
+                tracing::info!(
+                    url = %url,
+                    path = %path.display(),
+                    "downloaded PDFium to MINERU_PDFIUM_LIB_PATH"
+                );
+            }
+            return Self::bind_path(&path);
+        }
+
+        // 2. No explicit path: try generic system locations, then the platform
+        //    default, before falling back to a cached auto-download.
+        for candidate in system_library_paths() {
             if let Ok(bindings) = Pdfium::bind_to_library(&candidate) {
+                tracing::info!(path = %candidate.display(), "using PDFium from system location");
                 return Ok(Self {
                     pdfium: Pdfium::new(bindings),
                 });
             }
         }
-        Pdfium::bind_to_system_library()
+        if let Ok(bindings) = Pdfium::bind_to_system_library() {
+            tracing::info!("using PDFium from the platform default library search path");
+            return Ok(Self {
+                pdfium: Pdfium::new(bindings),
+            });
+        }
+
+        // 3. Nothing resolved: auto-download into the per-user cache (reusing a
+        //    prior download if present).
+        let cached = cache_library_path()?;
+        if cached.exists() {
+            tracing::info!(path = %cached.display(), "using cached auto-downloaded PDFium");
+        } else {
+            tracing::info!(
+                path = %cached.display(),
+                "no PDFium found; auto-downloading to cache"
+            );
+            let url = download::download_pdfium_to(&cached)?;
+            tracing::info!(url = %url, path = %cached.display(), "downloaded PDFium to cache");
+        }
+        Self::bind_path(&cached)
+    }
+
+    /// Binds PDFium from a concrete file path, mapping bind failure to
+    /// [`Error::Bind`].
+    fn bind_path(path: &Path) -> Result<Self> {
+        Pdfium::bind_to_library(path)
             .map(|bindings| Self {
                 pdfium: Pdfium::new(bindings),
             })
-            .map_err(|e| Error::Bind(e.to_string()))
+            .map_err(|e| Error::Bind(format!("binding {} failed: {e}", path.display())))
     }
 
     /// Opens a PDF from in-memory bytes.
@@ -222,18 +292,37 @@ impl PdfDocument<'_> {
     }
 }
 
-/// Candidate PDFium library paths, most-specific first.
-fn candidate_library_paths() -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    if let Ok(explicit) = std::env::var("MINERU_PDFIUM_LIB_PATH") {
-        paths.push(PathBuf::from(explicit));
-    }
-    // Generic cross-machine system locations. Anything machine-specific must
-    // come through MINERU_PDFIUM_LIB_PATH above, not a baked-in path.
-    for dir in ["/opt/homebrew/lib", "/usr/local/lib"] {
-        paths.push(PathBuf::from(format!("{dir}/libpdfium.dylib")));
-    }
-    paths
+/// Generic cross-machine system locations to probe before auto-downloading.
+///
+/// Anything machine-specific must come through `MINERU_PDFIUM_LIB_PATH`, not a
+/// baked-in path.
+fn system_library_paths() -> Vec<PathBuf> {
+    ["/opt/homebrew/lib", "/usr/local/lib"]
+        .into_iter()
+        .map(|dir| PathBuf::from(format!("{dir}/libpdfium.dylib")))
+        .collect()
+}
+
+/// The per-user cache path an auto-downloaded PDFium is stored at.
+///
+/// Mirrors the cache-root convention used elsewhere in the workspace (see
+/// `mineru-table`'s `weights.rs`): `MINERU_MODELS_DIR`, else
+/// `$XDG_CACHE_HOME/mineru`, else `$HOME/.cache/mineru`. The library lives under
+/// `<cache>/pdfium/<platform-specific filename>`.
+fn cache_library_path() -> Result<PathBuf> {
+    let root = if let Some(dir) = std::env::var_os("MINERU_MODELS_DIR") {
+        PathBuf::from(dir)
+    } else if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
+        PathBuf::from(xdg).join("mineru")
+    } else if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+        PathBuf::from(home).join(".cache").join("mineru")
+    } else {
+        return Err(Error::Cache(
+            "no writable cache directory: set MINERU_MODELS_DIR (or HOME)".to_string(),
+        ));
+    };
+    let filename = download::current_asset()?.local_filename;
+    Ok(root.join("pdfium").join(filename))
 }
 
 #[cfg(test)]

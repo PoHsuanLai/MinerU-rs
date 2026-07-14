@@ -10,5 +10,21 @@ description = "PDF input for MinerU: rasterize pages, page metadata, and (later)
 [dependencies]
 mineru-types.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 image = { version = "0.25", default-features = false }
 pdfium-render = { version = "0.9", default-features = false, features = ["image_025", "thread_safe", "pdfium_latest"] }
+# Pure-Rust synchronous HTTP client, used by `src/download.rs` to fetch a prebuilt
+# PDFium binary from bblanchon/pdfium-binaries on first use. Same 2.x line already
+# in the workspace (mineru-table, hf-hub -> ureq).
+ureq = "2.12"
+# gzip + tar to extract the native library out of the `.tgz` release assets
+# (mac/linux). Both already in the workspace lockfile via burn (flate2) and
+# burn-store (tar), so this adds no new crate to the tree.
+flate2 = "1.1"
+tar = "0.4"
+
+# Windows release assets are `.zip`, so the `zip` reader is only needed there.
+# Scoped to Windows so non-Windows builds don't pull it. Pinned to the 8.x line
+# already present in the lockfile (via burn-store).
+[target.'cfg(windows)'.dependencies]
+zip = { version = "8", default-features = false, features = ["deflate"] }
