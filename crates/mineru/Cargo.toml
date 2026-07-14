@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "The MinerU command-line tool: parses a PDF with a selectable backend (local pipeline or external VLM server) and writes Markdown + content_list.json, with an optional minimal HTTP server."
+description = "The MinerU command-line tool: parses a PDF with a selectable backend (local pipeline or external VLM server) and writes Markdown + content_list.json."
 
 [[bin]]
 name = "mineru"
@@ -26,4 +26,3 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde_json = { workspace = true }
-axum = { workspace = true }

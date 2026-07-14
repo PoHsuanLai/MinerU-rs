@@ -4,11 +4,11 @@
 //! flow consumes: a [`Backend`](mineru_types::Backend) selection, a
 //! [`ParseOptions`](mineru_types::ParseOptions), and an output
 //! [`MakeMode`](mineru_render::MakeMode). Keeping the parsing here means
-//! [`crate::run`] and [`crate::serve`] work in domain terms, not raw flags.
+//! [`crate::run`] works in domain terms, not raw flags.
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, ValueEnum};
 use mineru_render::MakeMode;
 use mineru_types::{Lang, ParseOptions};
 
@@ -18,31 +18,19 @@ use mineru_types::{Lang, ParseOptions};
 pub struct Cli {
     /// Path to a JSON config file. Falls back to `MINERU_TOOLS_CONFIG_JSON` /
     /// `~/.mineru.json` and then built-in defaults when omitted.
-    #[arg(long, global = true)]
+    #[arg(long)]
     pub config: Option<PathBuf>,
 
     /// Enable verbose (debug-level) logging.
-    #[arg(short, long, global = true)]
+    #[arg(short, long)]
     pub verbose: bool,
 
-    /// Optional subcommand; with none, the tool runs a one-shot parse (see the
-    /// top-level flags).
-    #[command(subcommand)]
-    pub command: Option<Command>,
-
-    /// The one-shot parse arguments, used when no subcommand is given.
+    /// The parse arguments.
     #[command(flatten)]
     pub parse: ParseArgs,
 }
 
-/// Subcommands beyond the default one-shot parse.
-#[derive(Debug, Subcommand)]
-pub enum Command {
-    /// Run a minimal HTTP server exposing the parser over one POST route.
-    Serve(ServeArgs),
-}
-
-/// Arguments for the default one-shot parse.
+/// Arguments for the one-shot parse.
 #[derive(Debug, clap::Args)]
 pub struct ParseArgs {
     /// Input PDF path.
@@ -80,26 +68,6 @@ pub struct ParseArgs {
 
     /// Override the VLM server base URL (vlm backend only). Falls back to the
     /// config's `vlm_server_url`, then the client default.
-    #[arg(long)]
-    pub vlm_url: Option<String>,
-
-    /// Override the VLM served model name (vlm backend only).
-    #[arg(long)]
-    pub vlm_model: Option<String>,
-}
-
-/// Arguments for the `serve` subcommand.
-#[derive(Debug, clap::Args)]
-pub struct ServeArgs {
-    /// Address to bind, e.g. `127.0.0.1:8000`.
-    #[arg(long, default_value = "127.0.0.1:8000")]
-    pub bind: String,
-
-    /// Which parsing backend the server uses for every request.
-    #[arg(short = 'b', long = "backend", value_enum, default_value_t = BackendKind::Pipeline)]
-    pub backend: BackendKind,
-
-    /// Override the VLM server base URL (vlm backend only).
     #[arg(long)]
     pub vlm_url: Option<String>,
 

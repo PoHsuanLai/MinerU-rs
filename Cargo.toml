@@ -35,7 +35,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 anyhow = "1"
-axum = "0.7"
 burn = { version = "0.21", default-features = false }
 # burn-store: PyTorch/safetensors/burnpack readers + key remapping. Used directly
 # by mineru-burn-common (weight loading) and by mineru-table's burn-onnx-generated

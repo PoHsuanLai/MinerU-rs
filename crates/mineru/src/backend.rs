@@ -1,9 +1,9 @@
 //! Backend selection: builds the requested `Box<dyn Backend>`.
 //!
-//! Both the one-shot flow ([`crate::run`]) and the server ([`crate::serve`]) hold
-//! their engine as a `Box<dyn Backend>`, so construction lives here in one place.
-//! The pipeline backend loads model weights best-effort from the config's
-//! `models_dir`; the VLM backend wires an HTTP client to an external server.
+//! The one-shot flow ([`crate::run`]) holds its engine as a `Box<dyn Backend>`, so
+//! construction lives here in one place. The pipeline backend loads model weights
+//! best-effort from the config's `models_dir`; the VLM backend wires an HTTP client
+//! to an external server.
 
 use mineru_backend_pipeline::{PipelineBackend, PipelineModels};
 use mineru_backend_vlm::VlmBackend;
