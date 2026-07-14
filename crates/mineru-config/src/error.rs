@@ -22,6 +22,16 @@ pub enum Error {
     /// A model-source string (from a file or `MINERU_MODEL_SOURCE`) could not be parsed.
     #[error("invalid model source: {0:?}")]
     InvalidModelSource(String),
+
+    /// Downloading a model weight file failed (network error, non-success HTTP
+    /// status, or an empty body). See [`crate::download`].
+    #[error("failed to download model weights: {0}")]
+    Download(String),
+
+    /// A filesystem operation on the models cache/target path failed, or no
+    /// writable directory could be resolved. See [`crate::download`].
+    #[error("model cache error: {0}")]
+    Cache(String),
 }
 
 /// Convenience alias used throughout the crate.

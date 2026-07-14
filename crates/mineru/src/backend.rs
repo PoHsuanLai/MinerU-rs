@@ -5,7 +5,7 @@
 //! best-effort from the config's `models_dir`; the VLM backend wires an HTTP client
 //! to an external server.
 
-use anyhow::{bail, Context};
+use anyhow::Context;
 use mineru_backend_pipeline::{PipelineBackend, PipelineModels};
 use mineru_backend_vlm::VlmBackend;
 use mineru_config::Config;
@@ -28,12 +28,13 @@ pub struct VlmOverrides {
 
 /// Builds the selected backend as a `Box<dyn Backend>`.
 ///
-/// The pipeline path requires a models directory: it errors clearly if
-/// `config.models_dir` is unset (there is no baked-in machine default — set
-/// `MINERU_MODELS_DIR` or `models_dir` in the config file). Once a directory is
-/// given, missing individual weights degrade to skipped stages per
-/// [`PipelineModels::load`]. The VLM path only wires a client and cannot fail
-/// here — a bad URL surfaces on the first request.
+/// The pipeline path resolves a models directory (never empty — `mineru-config`
+/// supplies a default cache dir), auto-downloads any missing weight files into it,
+/// and then loads the models. A fully-provisioned dir does not hit the network.
+/// Missing *individual* weights that fail to load degrade to skipped stages per
+/// [`PipelineModels::load`]; a genuine download failure surfaces as an error. The
+/// VLM path only wires a client and cannot fail here — a bad URL surfaces on the
+/// first request.
 pub fn build_backend(
     kind: BackendKind,
     config: &Config,
@@ -41,16 +42,28 @@ pub fn build_backend(
 ) -> anyhow::Result<Box<dyn Backend>> {
     match kind {
         BackendKind::Pipeline => {
-            if config.models_dir.as_os_str().is_empty() {
-                bail!(
-                    "no model directory configured for the pipeline backend: set \
-                     MINERU_MODELS_DIR (or `models_dir` in the config file) to the \
-                     directory containing the model weights"
+            tracing::info!(
+                "pipeline models dir: {}",
+                config.models_dir.display()
+            );
+            // Best-effort: fetch any MISSING weights before loading. A fully-present
+            // dir does no network access. Per-file download failures (404, host not
+            // up, offline) are logged and skipped inside this call — they are NOT
+            // fatal, matching the pipeline loader, which already warns on and skips
+            // missing stages and errors only if nothing loads. So we intentionally
+            // do not treat this as a hard failure of the run.
+            let _ = mineru_config::download_missing_models(&config.models_dir);
+            // Ensure the models root exists so `canonicalize` succeeds even when no
+            // weights could be fetched (the loader then skips absent stages).
+            if let Err(e) = std::fs::create_dir_all(&config.models_dir) {
+                tracing::warn!(
+                    "could not create models dir {}: {e}",
+                    config.models_dir.display()
                 );
             }
             let models_dir = config.models_dir.canonicalize().with_context(|| {
                 format!(
-                    "model directory {} does not exist (set MINERU_MODELS_DIR to a valid path)",
+                    "model directory {} could not be resolved",
                     config.models_dir.display()
                 )
             })?;

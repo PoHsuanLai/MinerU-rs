@@ -53,6 +53,11 @@ impl ModelPaths {
     /// weights are subpaths of it *except* the OCR character dictionary, which
     /// ships with the application rather than the model download — see
     /// [`ocr_rec_dict`](Self::ocr_rec_dict).
+    ///
+    /// **The relative paths below must stay in sync with
+    /// `mineru_config::REQUIRED_MODEL_FILES`**, which drives the auto-download of
+    /// missing weights. That list lives in `mineru-config` (foundational, must not
+    /// depend on this crate) and is duplicated there with a reciprocal note.
     pub fn under(models_dir: impl AsRef<Path>) -> Self {
         let root = models_dir.as_ref();
         Self {
