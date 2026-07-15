@@ -28,10 +28,17 @@ default = []
 # Opt-in GPU backend. Enabling this pulls in the wgpu backend and exposes the
 # `gpu` backend alias; it is never required for CPU inference or the test suite.
 gpu = ["burn/wgpu"]
-# Opt-in Apple AMX matmul kernels for the CPU backend. Replaces the old
+# Opt-in Apple AMX matmul kernels, via `burn-flex` -> `gemm`. Replaces the old
 # `accelerate` feature, which drove `burn-ndarray`'s BLAS hook and became
-# meaningless when matmul moved to flex's `gemm`. Upstream marks this
-# experimental, so it is not a default. Apple Silicon only.
+# meaningless when matmul moved to flex's `gemm`.
+#
+# **A no-op on M4 and newer.** `gemm`'s runtime probe hardcodes a model list —
+# `matches!(mx, Some("M1" | "M2" | "M3"))`, gemm-common-0.19.0/src/cache.rs:53 —
+# so on an M4 it parses the brand string, fails the match, and dispatches NEON
+# regardless. Enabling this compiles the AMX kernels in and never calls them:
+# measured 60.3 vs 59.0 ms/token on an M4 Pro, i.e. nothing beyond run-to-run
+# noise. Kept because it is correct on M1-M3 and costs nothing when unused, but
+# do not expect it to do anything here until gemm's probe learns newer chips.
 apple-amx = ["burn-flex/apple-amx"]
 
 [dev-dependencies]
