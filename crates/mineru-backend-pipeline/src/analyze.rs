@@ -598,7 +598,7 @@ impl<B: BurnBackend> PipelineBackend<B> {
         profile.add(&profile.table_ocr, t.elapsed());
         let t = Instant::now();
         let html = match classified {
-            Ok(cls) => self.recognize_table_class(cls.class, &crop, &spans),
+            Ok(cls) => self.recognize_classified(&cls, &crop, &spans),
             // No classifier (model unavailable): try wireless as a default.
             Err(_) => self.recognize_wireless(&crop, &spans),
         };
@@ -619,22 +619,66 @@ impl<B: BurnBackend> PipelineBackend<B> {
         }
     }
 
-    /// Dispatches to the wired/wireless recognizer for a classified table.
+    /// Recognizes a classified table, running *both* engines when the
+    /// classification is not decisive and keeping the better result.
+    ///
+    /// The classifier judges a 224x224 view of the whole crop, which is a weak
+    /// signal for the thing that actually matters here: whether the wired engine
+    /// can find the rules. A table with faint or partial ruling reads as
+    /// borderless to it while the wired engine still recovers the grid, and a
+    /// confidently-wireless call can still be wrong. So a `Wired` call — or a
+    /// `Wireless` one under
+    /// [`WIRELESS_TRUST_THRESHOLD`](mineru_table::WIRELESS_TRUST_THRESHOLD) —
+    /// runs both and lets [`mineru_table::select`] compare what they produced,
+    /// mirroring `batch_analyze.py:666-670` + `unet_table/main.py:337-357`.
+    ///
+    /// Only a confidently-wireless table skips the wired engine, which is the
+    /// cost side of this: everything else pays a UNet forward.
     ///
     /// `spans` are the crop-local OCR detections both recognizers match onto the
     /// structure they predict; see [`table_spans`](Self::table_spans).
-    fn recognize_table_class(
+    fn recognize_classified(
         &self,
-        class: mineru_table::TableClass,
+        cls: &mineru_table::Classification,
         crop: &RgbImage,
         spans: &[OcrSpan],
     ) -> Option<mineru_types::Html> {
-        match class {
-            mineru_table::TableClass::Wireless => self.recognize_wireless(crop, spans),
-            mineru_table::TableClass::Wired => self.models.table_wired.as_ref().and_then(|m| {
-                warn_on_err("wired", mineru_table::recognize_wired(m, crop, spans))
-            }),
+        use mineru_table::{Choice, TableClass, WIRELESS_TRUST_THRESHOLD};
+
+        let confident_wireless =
+            cls.class == TableClass::Wireless && cls.score >= WIRELESS_TRUST_THRESHOLD;
+        if confident_wireless {
+            return self.recognize_wireless(crop, spans);
         }
+
+        // Both engines, then decide on their output rather than on the score.
+        let wireless = self.recognize_wireless(crop, spans);
+        let wired = self.recognize_wired(crop, spans);
+        match (wired, wireless) {
+            (Some(wired), Some(wireless)) => {
+                let choice = mineru_table::select(&wired.0, &wireless.0, spans);
+                tracing::debug!(
+                    ?choice,
+                    class = ?cls.class,
+                    score = cls.score,
+                    "picked a table engine by comparing both recognitions"
+                );
+                Some(match choice {
+                    Choice::Wired => wired,
+                    Choice::Wireless => wireless,
+                })
+            }
+            // One engine failed or is unavailable: the other is the only answer.
+            (wired, wireless) => wired.or(wireless),
+        }
+    }
+
+    /// Wired-table recognition, guarded on the loaded UNet model.
+    fn recognize_wired(&self, crop: &RgbImage, spans: &[OcrSpan]) -> Option<mineru_types::Html> {
+        self.models
+            .table_wired
+            .as_ref()
+            .and_then(|m| warn_on_err("wired", mineru_table::recognize_wired(m, crop, spans)))
     }
 
     /// Wireless-table recognition, guarded on the loaded SLANet model.

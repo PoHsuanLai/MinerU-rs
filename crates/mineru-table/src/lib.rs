@@ -39,6 +39,7 @@ pub mod matching;
 mod model_cache;
 pub mod ocr;
 pub mod orientation;
+pub mod select;
 pub mod slanet;
 pub mod unet;
 pub mod weights;
@@ -55,5 +56,6 @@ pub use inline::{assign_to_tables, mask_boxes, Assignment, PageFormula, TableFor
 pub use matching::{decode_logic_points, LogicPoint, TableMatch};
 pub use ocr::OcrSpan;
 pub use orientation::{is_rotation_candidate, sample_boxes, select_rotation, OrientationScore, Rotation};
+pub use select::{select, Choice, WIRELESS_TRUST_THRESHOLD};
 pub use slanet::recognize_wireless;
 pub use unet::recognize_wired;
