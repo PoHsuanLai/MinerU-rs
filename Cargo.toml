@@ -6,8 +6,12 @@ members = ["crates/*"]
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
+# Inherited from upstream MinerU (Apache-2.0 plus additional terms), which this
+# is a port of. See LICENSE.md in opendatalab/MinerU for the full text.
 license = "LicenseRef-MinerU-Open-Source-License"
-repository = "https://github.com/opendatalab/MinerU"
+# This port's own repository. Upstream MinerU lives at opendatalab/MinerU and is
+# credited in the README.
+repository = "https://github.com/PoHsuanLai/MinerU-rs"
 
 [workspace.dependencies]
 # Internal crates

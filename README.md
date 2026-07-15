@@ -39,19 +39,26 @@ Office formats (docx/pptx/xlsx) are deferred (a future `mineru-office` crate).
 ## Quick start (pipeline backend, fully local)
 
 ```sh
-# 1. Build the CLI.
+# 1. Build the CLI. No model files are needed to build.
 cargo build --release -p mineru --bin mineru
 
-# 2. Point at a model directory (the opendatalab PDF-Extract-Kit release layout).
-export MINERU_MODELS_DIR=/path/to/PDF-Extract-Kit-1.0/models
-
-# 3. Run.
-./target/release/mineru -p paper.pdf -o out -b pipeline
-# writes out/paper.md and out/paper_content_list.json
+# 2. Run. That's it.
+./target/release/mineru paper.pdf -o out
+# writes out/paper.md, out/paper_content_list.json, and out/images/
 ```
 
-On first run the table-model weights are downloaded automatically from this repo's
-GitHub release and cached under the model directory; nothing else touches the network.
+On first run the model weights (~1 GB) auto-download from the upstream Hugging Face
+repo and are cached; later runs do no network I/O. To keep them somewhere specific —
+a large-storage volume, say — set `MINERU_MODELS_DIR` first:
+
+```sh
+export MINERU_MODELS_DIR=/path/to/PDF-Extract-Kit-1.0/models
+```
+
+The GPU is used automatically when a usable adapter is present, falling back to CPU;
+`--cpu` forces the exact, reproducible CPU path. See the table-recognition note under
+[Model directory layout](#model-directory-layout) for the one stage that still needs
+manual weights.
 
 ### Native PDFium library
 
@@ -68,7 +75,14 @@ Windows).
 
 ## Model directory layout
 
-`MINERU_MODELS_DIR` should point at the `models/` directory of the opendatalab release:
+Weights **auto-download on first run** from the upstream
+[`opendatalab/PDF-Extract-Kit-1.0`](https://huggingface.co/opendatalab/PDF-Extract-Kit-1.0)
+Hugging Face repo (pinned to a commit, ~1 GB), landing in `MINERU_MODELS_DIR` — or a
+per-user cache dir when that is unset. Nothing needs provisioning by hand; files already
+present are never re-fetched, so a fully-populated dir does no network I/O.
+
+Set `MINERU_MODELS_DIR` to control where they land (e.g. a large-storage volume). It
+should point at the `models/` directory of the opendatalab release:
 
 ```
 models/
@@ -82,17 +96,26 @@ models/
   TabRec/SlanetPlus/slanet-plus.onnx                # wireless-table structure (SLANet)
 ```
 
-The OCR character dictionary is embedded in the binary. The two table CNNs (LCNet
-classifier, UNet wired-table segmenter) are compiled from committed Burn source; their
-weights auto-download from this repo's release.
+The OCR character dictionary is embedded in the binary.
+
+> **Table recognition is currently unavailable on a fresh install.** Both table stages
+> need weights converted into Burn's formats — the LCNet classifier and UNet segmenter
+> as `.bpk`, SLANet as a `.safetensors` sibling of its `.onnx` — and neither exists in
+> any upstream repo. They are derivatives of PDF-Extract-Kit-1.0, which is AGPL-3.0 at
+> the repo level, so re-hosting them is on hold pending a licensing answer from
+> opendatalab. Everything else (layout, OCR, formula, image extraction, and the VLM and
+> hybrid backends) works out of the box. Point `MINERU_TABLE_WEIGHTS_BASE` at your own
+> host, or drop the files into `<MINERU_MODELS_DIR>/table-weights-v1/`, to enable them
+> meanwhile; a table-model failure warns and emits no table rather than failing the run.
 
 ## Environment variables
 
 | Variable | Purpose |
 |---|---|
-| `MINERU_MODELS_DIR` | Root of the local model weights (pipeline backend). |
+| `MINERU_MODELS_DIR` | Root of the local model weights (pipeline backend), and where auto-download writes them. |
+| `MINERU_MODELS_BASE` | Override the base URL pipeline weights auto-download from (default: the pinned upstream Hugging Face revision). |
 | `MINERU_PDFIUM_LIB_PATH` | Explicit path to the PDFium native library. |
-| `MINERU_TABLE_WEIGHTS_BASE` | Override the base URL for the table `.bpk` weight download. |
+| `MINERU_TABLE_WEIGHTS_BASE` | Override the base URL for the table `.bpk` weight download (see the note above — the default is currently unpublished). |
 | `MINERU_PDFIUM_DOWNLOAD_BASE` | Override the base URL for the PDFium auto-download. |
 | `MINERU_VLM_URL` | Base URL of the OpenAI-compatible VLM server (vlm backend). |
 | `MINERU_TOOLS_CONFIG_JSON` | Path to a JSON config file (falls back to `~/.mineru.json`). |
