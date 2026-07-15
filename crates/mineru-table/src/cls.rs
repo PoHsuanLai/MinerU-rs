@@ -17,6 +17,7 @@
 use image::RgbImage;
 
 use crate::error::{Error, Result};
+use crate::resample::bilinear_taps;
 use crate::generated::lcnet as generated;
 
 /// Shortest-side resize target before the center crop.
@@ -125,20 +126,6 @@ pub fn preprocess(img: &RgbImage) -> Result<Vec<f32>> {
         }
     }
     Ok(chw)
-}
-
-/// Resolves a continuous source coordinate to its two bilinear taps and the
-/// interpolation weight, clamping at the edges (OpenCV's `BORDER_REPLICATE`).
-///
-/// Returns `(low, high, weight)` where the sample is
-/// `pixel[low] * (1 - weight) + pixel[high] * weight`.
-fn bilinear_taps(src: f32, extent: u32) -> (u32, u32, f32) {
-    let max = extent.saturating_sub(1);
-    let clamped = src.clamp(0.0, max as f32);
-    let low = clamped.floor();
-    let weight = clamped - low;
-    let low = low as u32;
-    (low, (low + 1).min(max), weight)
 }
 
 /// Picks the winning class from a 2-logit output vector.

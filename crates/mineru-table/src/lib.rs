@@ -39,6 +39,7 @@ pub mod matching;
 mod model_cache;
 pub mod ocr;
 pub mod orientation;
+pub mod resample;
 pub mod select;
 pub mod slanet;
 pub mod unet;
