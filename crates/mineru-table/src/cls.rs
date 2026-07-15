@@ -99,24 +99,46 @@ pub fn preprocess(img: &RgbImage) -> Result<Vec<f32>> {
     let side = CROP as usize;
     let mut chw = vec![0.0f32; 3 * side * side];
     for cy in 0..CROP {
-        // Map crop pixel -> resized pixel -> source pixel (nearest).
+        // Map crop pixel -> resized pixel -> continuous source coordinate, using
+        // OpenCV's half-pixel convention. The resize is BILINEAR to match Python's
+        // `cv2.resize(..., interpolation=1)` (`paddle_table_cls.py:34`): nearest
+        // sampling here inverts the wired/wireless argmax on borderline crops,
+        // because the aliased ruling lines it produces read as a borderless table.
         let ry = y1 + cy;
-        let sy = ((ry as f32 + 0.5) / scale - 0.5)
-            .round()
-            .clamp(0.0, (h - 1) as f32) as u32;
+        let (sy0, sy1, wy) = bilinear_taps((ry as f32 + 0.5) / scale - 0.5, h);
         for cx in 0..CROP {
             let rx = x1 + cx;
-            let sx = ((rx as f32 + 0.5) / scale - 0.5)
-                .round()
-                .clamp(0.0, (w - 1) as f32) as u32;
-            let px = img.get_pixel(sx, sy);
+            let (sx0, sx1, wx) = bilinear_taps((rx as f32 + 0.5) / scale - 0.5, w);
+
+            let p00 = img.get_pixel(sx0, sy0);
+            let p01 = img.get_pixel(sx1, sy0);
+            let p10 = img.get_pixel(sx0, sy1);
+            let p11 = img.get_pixel(sx1, sy1);
+
             for c in 0..3 {
-                let v = px[c] as f32 * (SCALE / STD[c]) - MEAN[c] / STD[c];
+                let top = p00[c] as f32 * (1.0 - wx) + p01[c] as f32 * wx;
+                let bot = p10[c] as f32 * (1.0 - wx) + p11[c] as f32 * wx;
+                let s = top * (1.0 - wy) + bot * wy;
+                let v = s * (SCALE / STD[c]) - MEAN[c] / STD[c];
                 chw[c * side * side + (cy as usize) * side + (cx as usize)] = v;
             }
         }
     }
     Ok(chw)
+}
+
+/// Resolves a continuous source coordinate to its two bilinear taps and the
+/// interpolation weight, clamping at the edges (OpenCV's `BORDER_REPLICATE`).
+///
+/// Returns `(low, high, weight)` where the sample is
+/// `pixel[low] * (1 - weight) + pixel[high] * weight`.
+fn bilinear_taps(src: f32, extent: u32) -> (u32, u32, f32) {
+    let max = extent.saturating_sub(1);
+    let clamped = src.clamp(0.0, max as f32);
+    let low = clamped.floor();
+    let weight = clamped - low;
+    let low = low as u32;
+    (low, (low + 1).min(max), weight)
 }
 
 /// Picks the winning class from a 2-logit output vector.
@@ -245,6 +267,66 @@ mod tests {
         let img = RgbImage::new(300, 300);
         let buf = preprocess(&img).unwrap();
         assert_eq!(buf.len(), 3 * 224 * 224);
+    }
+
+    #[test]
+    fn bilinear_taps_interpolate_between_neighbours() {
+        // Exactly on a pixel centre: no blend, weight 0.
+        assert_eq!(bilinear_taps(3.0, 10), (3, 4, 0.0));
+        // Halfway: both taps weighted equally.
+        assert_eq!(bilinear_taps(3.5, 10), (3, 4, 0.5));
+        // Clamps at both edges (BORDER_REPLICATE), never sampling out of bounds.
+        assert_eq!(bilinear_taps(-2.0, 10), (0, 1, 0.0));
+        assert_eq!(bilinear_taps(99.0, 10), (9, 9, 0.0));
+    }
+
+    /// The resize must be BILINEAR, matching `cv2.resize(..., interpolation=1)`.
+    ///
+    /// Nearest sampling inverts the wired/wireless argmax on real borderline
+    /// crops (verified: feeding nearest into the reference ONNX classifier flips
+    /// p8 from wired=0.93 to wired=0.36). Pixel-exact assertions here would be a
+    /// false-green trap, so this asserts the property that separates the two
+    /// filters: on a horizontal gradient, downsampling by a non-integer factor
+    /// must produce values that are NOT all exact source-pixel values — a blend
+    /// only bilinear can create.
+    #[test]
+    fn preprocess_resamples_bilinearly_not_nearest() {
+        // 512² downscales by exactly 2, so every sampled x lands on a .5 midpoint
+        // between two adjacent source columns. Adjacent columns must therefore
+        // differ for the blend to be observable: step by 8 per column, so a
+        // midpoint averages to an odd multiple of 4 that no source pixel takes.
+        let (w, h) = (512u32, 512u32);
+        let mut img = RgbImage::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let v = (x * 8 % 256) as u8;
+                img.put_pixel(x, y, image::Rgb([v, v, v]));
+            }
+        }
+
+        let buf = preprocess(&img).expect("gradient image preprocesses");
+
+        // Invert the normalization back to raw 0..255 for channel 0.
+        let side = CROP as usize;
+        let raw: Vec<f32> = buf[..side * side]
+            .iter()
+            .map(|v| (v + MEAN[0] / STD[0]) / (SCALE / STD[0]))
+            .collect();
+
+        // Bilinear blending must produce at least one value strictly between two
+        // adjacent source levels (i.e. not a multiple of 8). Nearest sampling can
+        // only ever emit exact source levels, so it produces none and fails here.
+        let blended = raw
+            .iter()
+            .filter(|v| {
+                let r = v.rem_euclid(8.0);
+                r > 0.5 && r < 7.5
+            })
+            .count();
+        assert!(
+            blended > 0,
+            "no interpolated samples found — resize is nearest, not bilinear"
+        );
     }
 
     #[test]

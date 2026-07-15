@@ -39,4 +39,6 @@ default = []
 gpu = ["burn/wgpu"]
 
 [dev-dependencies]
-image = { version = "0.25", default-features = false }
+# `png` is dev-only: the diagnostic probes decode real page crops from disk.
+# The library dependency above stays decoder-free.
+image = { version = "0.25", default-features = false, features = ["png"] }
