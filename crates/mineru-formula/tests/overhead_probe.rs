@@ -1,28 +1,38 @@
 //! Diagnostic probe: why is a batch-1 decode step ~48 ms when its arithmetic is
 //! worth ~12 ms?
 //!
-//! **The answer these probes found: neither compute nor dispatch — weight traffic.**
-//! A decode step reads ~418 MB of decoder weights (8 layers x 33 MB + a 154 MB
-//! `lm_head`, fp32) to produce *one* token. At batch 1 every weight byte is used
-//! exactly once, so there is no arithmetic to hide the load latency behind. 418 MB
-//! at the 8.6 GB/s we actually achieve is 49 ms — the measured step is 48.35 ms.
-//! The model is not computing; it is reading itself into cache, per token.
+//! **The answer: our matmul kernel is ~9x slower than PyTorch's at this shape.**
+//! Not the hardware, not dispatch, not the shape workarounds.
 //!
-//! Two hypotheses died here, which is why the probes are kept:
+//! The decode is *shaped* like a memory-bound problem — a step streams ~418 MB of
+//! decoder weights (8 layers x 33 MB + a 154 MB `lm_head`, fp32) to emit one
+//! token, and at batch 1 each byte is used once, so nothing hides the load
+//! latency. That framing explains why batching and flex won and why `apple-amx`
+//! did nothing. But it does **not** explain the absolute cost, and it should not
+//! be mistaken for a wall:
 //!
-//! - **Per-op dispatch overhead.** [`per_op_floor`] puts the floor at 1.24 us for a
-//!   `[1,1]` add, so a ~150-op step pays ~0.2 ms of dispatch — 0.4% of the step,
-//!   not the missing 75%.
-//! - **Compute bound.** [`matmul_is_bandwidth_bound`] shows batch 1 -> 4 costs
-//!   *less* wall-clock (86 -> 76 us) while doing 4x the flops. Cost tracks the
-//!   weights read, not the work done.
+//! | | `[1,768]@[768,768]` | streaming 380 MB of distinct weights |
+//! |---|---|---|
+//! | torch | 4.15 us (286 Gflop/s) | 2.59 ms (147 GB/s) |
+//! | ours | ~37 us (26 Gflop/s) | 48.35 ms (8.6 GB/s) |
 //!
-//! The corollary that matters: a faster multiplier cannot fix batch-1 decode. That
-//! is why `apple-amx` changed nothing, and why the wins that did land (batching,
-//! flex) both worked by amortizing weight reads across more rows.
+//! Torch reaches ~54% of the M4 Pro's ~273 GB/s on the same weight-streaming
+//! problem; we reach ~3%. It does it **single-threaded** (1-thread and 8-thread
+//! are both 4.1 us) while we burn ~2.8 cores. So neither DRAM bandwidth nor
+//! threading is the limit — the per-core kernel is.
 //!
-//! We are at ~3% of the M4 Pro's ~273 GB/s, so this is *not* a hardware wall —
-//! gemm simply does not reach it at skinny shapes. The headroom is real.
+//! Hypotheses these probes killed, which is why they are kept:
+//!
+//! - **Per-op dispatch overhead.** [`per_op_floor`]: a `[1,1]` add costs 1.24 us,
+//!   so a ~150-op step pays ~0.2 ms — 0.4% of the step, not the missing 75%.
+//! - **Harness contamination.** `clone` is 0.03 us and `into_data` 0.19 us; the
+//!   37 us is the kernel itself, not the measurement around it.
+//! - **gemm is broken.** It beats a naive scalar loop 7.55x, so it is genuinely
+//!   vectorizing — just not competitively at skinny shapes.
+//!
+//! Beware: these numbers carry real variance (the same matmul measured 91.67 us
+//! on a contended run and 37 us clean). Re-measure before trusting a delta
+//! smaller than ~2x.
 //!
 //! ```text
 //! cargo test -p mineru-formula --release --test overhead_probe -- --ignored --nocapture
