@@ -32,7 +32,7 @@ use image::{imageops::crop_imm, RgbImage};
 use mineru_burn_common::backend::Cpu;
 use mineru_layout::LayoutDet;
 use mineru_pdf::{PageText, PdfiumLibrary, RenderOptions};
-use mineru_table::OcrSpan;
+use mineru_table::{orientation::Rotation, OcrSpan};
 use mineru_types::{
     Backend, BackendError, BBox, DocInput, Document, ImageRef, ImageWriter, Page, PageSize,
     ParseOptions,
@@ -241,6 +241,12 @@ impl<B: BurnBackend> PipelineBackend<B> {
         self.fill_formulas(&mut regions, image, scale);
         profile.add(&profile.formula, t.elapsed());
 
+        // Tables run last: a formula printed inside one is detected as a page
+        // formula, so its LaTeX only exists once `fill_formulas` has run, and the
+        // table needs it to fill the cell the formula sits in.
+        let claimed = self.fill_tables(index, &mut regions, image, scale, sink, profile);
+        drop_regions(&mut regions, &claimed);
+
         let assembled = PageAssembler.assemble(regions);
         let blocks = merge_paragraphs(assembled.blocks);
 
@@ -286,7 +292,9 @@ impl<B: BurnBackend> PipelineBackend<B> {
             // whole page is mapped, so every crop on the page decodes in one batched
             // pass instead of one model call each.
             RegionKind::Equation | RegionKind::InlineFormula => RegionContent::default(),
-            RegionKind::Table => self.recognize_table(page, &det, &pixel_bbox, image, sink, profile),
+            // Filled by `fill_tables` once formulas are recognized; a table may
+            // need their LaTeX for its own cells.
+            RegionKind::Table => RegionContent::default(),
             RegionKind::Image | RegionKind::Chart => {
                 self.crop_image(page, &det, &pixel_bbox, image, sink)
             }
@@ -441,27 +449,133 @@ impl<B: BurnBackend> PipelineBackend<B> {
         }
     }
 
+    /// Recognizes every table on the page, routing the page's formulas into the
+    /// tables that contain them, and returns the region indices whose formulas were
+    /// consumed by a table.
+    ///
+    /// A formula printed inside a table is never seen by the table path: the page
+    /// layout model detects it as an ordinary page formula, and [`fill_formulas`]
+    /// has already turned it into LaTeX by the time this runs. Left alone, that
+    /// LaTeX is emitted as a block beside the table while the table's own cell
+    /// holds whatever OCR made of the formula's glyphs. So each table claims the
+    /// formulas whose centers fall inside it, masks their pixels out of its crop,
+    /// and hands their LaTeX to the structure matcher as ordinary spans — the
+    /// reference's design (`_extract_table_inline_objects`), and the reason
+    /// [`mineru_table::inline`] needs no formula model of its own.
+    ///
+    /// [`fill_formulas`]: Self::fill_formulas
+    fn fill_tables(
+        &self,
+        page: usize,
+        regions: &mut [Region],
+        image: &RgbImage,
+        scale: f32,
+        sink: Option<&dyn ImageWriter>,
+        profile: &Profile,
+    ) -> Vec<usize> {
+        use mineru_table::inline::PageFormula;
+
+        // Region bboxes are page points by now; formulas and table boxes are
+        // compared in the pixel space the crops come from.
+        let mut formulas: Vec<PageFormula> = Vec::new();
+        let mut formula_regions: Vec<usize> = Vec::new();
+        for (i, region) in regions.iter().enumerate() {
+            let latex = match RegionKind::classify(region.det.label) {
+                RegionKind::Equation => region.content.latex.as_ref(),
+                RegionKind::InlineFormula => region.content.inline_latex.as_ref(),
+                _ => None,
+            };
+            if let Some(latex) = latex {
+                formulas.push(PageFormula {
+                    bbox: scale_bbox(region.det.bbox, scale),
+                    latex: latex.0.clone(),
+                });
+                formula_regions.push(i);
+            }
+        }
+
+        // The three stay index-aligned: a table that cannot be cropped is skipped
+        // in all of them, and `table_boxes` is what `assign_to_tables` indexes.
+        let mut table_regions: Vec<usize> = Vec::new();
+        let mut table_boxes: Vec<Option<BBox>> = Vec::new();
+        let mut crops: Vec<RgbImage> = Vec::new();
+        for (i, region) in regions.iter().enumerate() {
+            if !matches!(RegionKind::classify(region.det.label), RegionKind::Table) {
+                continue;
+            }
+            let pixel_bbox = scale_bbox(region.det.bbox, scale);
+            let Some((crop, _, _)) = crop_region(image, &pixel_bbox) else {
+                continue;
+            };
+            let t = Instant::now();
+            let (crop, rotation) = self.deskew_table(crop);
+            profile.add(&profile.table_orient, t.elapsed());
+
+            table_regions.push(i);
+            // A rotated crop has moved its pixels out from under the page-space
+            // box, so this table opts out of formulas (as the reference does).
+            table_boxes.push((rotation == Rotation::None).then_some(pixel_bbox));
+            crops.push(crop);
+        }
+
+        let assignment = mineru_table::assign_to_tables(&table_boxes, &formulas);
+
+        for (slot, (&region_index, crop)) in table_regions.iter().zip(crops).enumerate() {
+            // Resolve each assigned formula to the span text and box the matcher
+            // needs, so the table path never sees the formula types at all.
+            let inline: Vec<OcrSpan> = assignment
+                .per_table
+                .get(slot)
+                .map_or(&[][..], |v| &v[..])
+                .iter()
+                .filter_map(|f| {
+                    let latex = &formulas.get(f.formula)?.latex;
+                    // Delimiters go on here rather than at render time: the matcher
+                    // splices span text into cells verbatim, and by the time the
+                    // HTML exists a formula cell is indistinguishable from a text
+                    // one. Score 1.0 marks it exact — a model output, not an OCR
+                    // read.
+                    Some(OcrSpan::new(f.crop_bbox, format!("${latex}$"), 1.0))
+                })
+                .collect();
+            let order = match regions.get(region_index) {
+                Some(region) => region.det.order,
+                None => continue,
+            };
+            let content = self.recognize_table(page, order, crop, &inline, sink, profile);
+            if let Some(region) = regions.get_mut(region_index) {
+                region.content = content;
+            }
+        }
+
+        // Map claimed formula indices back to the regions they came from.
+        assignment
+            .claimed
+            .iter()
+            .filter_map(|&f| formula_regions.get(f).copied())
+            .collect()
+    }
+
     /// Table: classify wired/wireless and recognize into HTML.
     ///
-    /// A sideways-typeset table is rotated upright first (see
-    /// [`deskew_table`](Self::deskew_table)); everything downstream — the
-    /// wired/wireless classifier, the structure model, the cell OCR — then sees
-    /// an upright crop. Any missing model leaves `table_html` empty.
+    /// `crop` arrives already deskewed (see [`deskew_table`](Self::deskew_table)),
+    /// so the classifier, structure model and cell OCR all see an upright table.
+    /// Any missing model leaves `table_html` empty.
+    ///
+    /// `inline` carries the spans for formulas printed inside this table, in
+    /// crop-local pixels, already carrying their delimiters —
+    /// [`fill_tables`](Self::fill_tables) resolves those and is the only caller
+    /// that has the page context to do so. They are masked out of the crop before
+    /// OCR and appended afterwards; see the masking note below.
     fn recognize_table(
         &self,
         page: usize,
-        det: &LayoutDet,
-        pixel_bbox: &BBox,
-        image: &RgbImage,
+        order: usize,
+        crop: RgbImage,
+        inline: &[OcrSpan],
         sink: Option<&dyn ImageWriter>,
         profile: &Profile,
     ) -> RegionContent {
-        let Some((crop, _, _)) = crop_region(image, pixel_bbox) else {
-            return RegionContent::default();
-        };
-        let t = Instant::now();
-        let crop = self.deskew_table(crop);
-        profile.add(&profile.table_orient, t.elapsed());
         let t = Instant::now();
         // Tables are wired on CPU (see `PipelineModels`); classify on the same
         // backend as the recognizers it dispatches to.
@@ -470,7 +584,17 @@ impl<B: BurnBackend> PipelineBackend<B> {
         // Cell text comes from OCR over the crop; without it both recognizers
         // return their predicted grid with every cell empty.
         let t = Instant::now();
-        let spans = self.table_spans(&crop);
+        // OCR reads a formula's glyphs as ordinary text, which would compete with
+        // its LaTeX for the same cell, so the formulas' pixels are painted out
+        // first and their LaTeX added back as spans below.
+        let spans = if inline.is_empty() {
+            self.table_spans(&crop)
+        } else {
+            let masked = mineru_table::mask_boxes(&crop, inline.iter().map(|s| s.bbox));
+            let mut spans = self.table_spans(&masked);
+            spans.extend_from_slice(inline);
+            spans
+        };
         profile.add(&profile.table_ocr, t.elapsed());
         let t = Instant::now();
         let html = match classified {
@@ -484,8 +608,8 @@ impl<B: BurnBackend> PipelineBackend<B> {
         // (unchanged behavior). The assembler forwards `content.image` into
         // `TableBody.image`.
         let image = sink.map(|sink| {
-            let name = format!("p{page}_o{}.png", det.order);
-            write_crop(sink, page, det.order, &name, &crop);
+            let name = format!("p{page}_o{order}.png");
+            write_crop(sink, page, order, &name, &crop);
             ImageRef(name)
         });
         RegionContent {
@@ -523,6 +647,11 @@ impl<B: BurnBackend> PipelineBackend<B> {
     /// Rotates a sideways-typeset table crop upright, returning it unchanged when
     /// it already is (the overwhelmingly common case).
     ///
+    /// The chosen [`Rotation`] is returned alongside the crop because it invalidates
+    /// page-space geometry: anything computed against the unrotated table box (the
+    /// inline formulas of [`fill_table_formulas`](Self::fill_table_formulas)) no
+    /// longer lines up once the pixels move.
+    ///
     /// Wide tables are often printed rotated to fit a portrait page. OCR reads
     /// such a crop as confident nonsense rather than failing — `Forest age
     /// (years)` becomes `20 20 20 20 20` — so nothing downstream can detect it.
@@ -533,18 +662,18 @@ impl<B: BurnBackend> PipelineBackend<B> {
     ///
     /// Without a det/rec model there is nothing to score with, so the crop is
     /// returned as-is.
-    fn deskew_table(&self, crop: RgbImage) -> RgbImage {
+    fn deskew_table(&self, crop: RgbImage) -> (RgbImage, Rotation) {
         use mineru_table::orientation::{
             is_rotation_candidate, select_rotation, OrientationScore, Rotation,
         };
 
         let (Some(det), Some(_)) = (&self.models.ocr_det, &self.models.ocr_rec) else {
-            return crop;
+            return (crop, Rotation::None);
         };
 
         let boxes = det.detect(&crop).unwrap_or_default();
         if !is_rotation_candidate(&boxes) {
-            return crop;
+            return (crop, Rotation::None);
         }
 
         let scores: Vec<(Rotation, OrientationScore)> = Rotation::ALL
@@ -566,7 +695,7 @@ impl<B: BurnBackend> PipelineBackend<B> {
                 "rotated a sideways table crop upright"
             );
         }
-        rotate(&crop, choice)
+        (rotate(&crop, choice), choice)
     }
 
     /// Scores how well OCR reads `view`, over an even sample of its boxes.
@@ -667,6 +796,23 @@ fn warn_on_err(
     }
 }
 
+/// Removes the regions at `indices` (positions in `regions`), ignoring any that
+/// are out of range.
+///
+/// Used to drop formulas a table absorbed into a cell, which would otherwise be
+/// emitted a second time as a standalone block next to that table.
+fn drop_regions(regions: &mut Vec<Region>, indices: &[usize]) {
+    if indices.is_empty() {
+        return;
+    }
+    let mut position = 0usize;
+    regions.retain(|_| {
+        let keep = !indices.contains(&position);
+        position += 1;
+        keep
+    });
+}
+
 /// Writes an already-cropped region PNG through the sink, best-effort. A write
 /// error is logged and swallowed: a failed crop must not abort the parse. `name`
 /// is the ref name the caller mints, so the file written matches the reference.
@@ -757,6 +903,46 @@ fn scale_bbox(bbox: BBox, factor: f32) -> BBox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A region tagged by `order`, so a survivor can be identified after removal.
+    fn region(order: usize) -> Region {
+        Region {
+            det: LayoutDet {
+                bbox: BBox::new(0.0, 0.0, 1.0, 1.0),
+                label: mineru_layout::LayoutLabel::Text,
+                score: 1.0,
+                order,
+            },
+            content: RegionContent::default(),
+        }
+    }
+
+    fn orders(regions: &[Region]) -> Vec<usize> {
+        regions.iter().map(|r| r.det.order).collect()
+    }
+
+    /// Asserts on *which* regions survive, not how many: removing by shifting
+    /// indices is exactly the bug an count-only check would miss.
+    #[test]
+    fn drop_regions_removes_only_the_named_positions() {
+        let mut regions: Vec<Region> = (0..5).map(region).collect();
+        drop_regions(&mut regions, &[1, 3]);
+        assert_eq!(orders(&regions), vec![0, 2, 4]);
+    }
+
+    #[test]
+    fn drop_regions_with_no_indices_keeps_everything() {
+        let mut regions: Vec<Region> = (0..3).map(region).collect();
+        drop_regions(&mut regions, &[]);
+        assert_eq!(orders(&regions), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn drop_regions_ignores_out_of_range_indices() {
+        let mut regions: Vec<Region> = (0..2).map(region).collect();
+        drop_regions(&mut regions, &[0, 99]);
+        assert_eq!(orders(&regions), vec![1]);
+    }
 
     #[test]
     fn page_bounds_none_is_all_pages() {
