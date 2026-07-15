@@ -13,6 +13,9 @@ description = "Shared Burn harness for MinerU model crates: backends, weight loa
 # not needed for inference, so we stay on default-features = false + explicit
 # feature selection to keep the dependency surface small.
 burn = { workspace = true, features = ["ndarray"] }
+# Pulls in `burn-ndarray`'s defaults (simd + multi-threads); see the workspace
+# manifest. `burn/ndarray` alone would enable the same crate with those off.
+burn-ndarray = { workspace = true }
 # burn-store carries the PyTorch / safetensors readers plus key remapping and the
 # ApplyResult report we build the "all keys consumed" assertion on top of.
 burn-store = { workspace = true }
@@ -26,6 +29,11 @@ default = []
 # Opt-in GPU backend. Enabling this pulls in the wgpu backend and exposes the
 # `gpu` backend alias; it is never required for CPU inference or the test suite.
 gpu = ["burn/wgpu"]
+# Opt-in BLAS acceleration for the ndarray CPU backend, via Apple's Accelerate
+# framework. Without it `burn-ndarray` uses its own naive matmul on a single
+# thread; Accelerate dispatches the conv/matmul-heavy stages across cores. macOS
+# only (Accelerate is a system framework), which is why it is not a default.
+accelerate = ["burn/accelerate"]
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false }

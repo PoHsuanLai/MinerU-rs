@@ -42,6 +42,14 @@ clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 anyhow = "1"
 burn = { version = "0.21", default-features = false }
+# The ndarray CPU backend, depended on directly so its own defaults apply:
+# `simd` + `multi-threads` (rayon-parallel conv/matmul). Reaching it only through
+# `burn`'s `ndarray` feature enables the crate with default-features off, which
+# silently drops both — `run_par!`/`iter_par!` compile down to sequential calls
+# and every stage runs on one core. burn exposes a `simd` passthrough but no
+# `multi-threads` one, so the direct dep is the only way to get threading without
+# pulling in burn's full `default` (autodiff, training, …).
+burn-ndarray = { version = "0.21" }
 # burn-store: PyTorch/safetensors/burnpack readers + key remapping. Used directly
 # by mineru-burn-common (weight loading) and by mineru-table's burn-onnx-generated
 # code (which `use burn_store::BurnpackStore`).
