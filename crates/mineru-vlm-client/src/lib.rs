@@ -17,7 +17,7 @@ pub mod prompts;
 pub mod raw;
 
 pub use assemble::assemble_document;
-pub use client::{VlmClient, VlmClientConfig};
+pub use client::{CropSink, VlmClient, VlmClientConfig};
 pub use error::{Error, Result};
 pub use parse::parse_layout;
 pub use raw::{VlmBlock, VlmPage};

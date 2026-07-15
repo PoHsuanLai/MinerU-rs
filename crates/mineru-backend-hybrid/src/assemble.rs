@@ -56,6 +56,10 @@ pub struct ExtractedRegion {
     pub order: usize,
     /// `true` when the source layout label was `seal` (Python `sub_type="seal"`).
     pub is_seal: bool,
+    /// Filename of the crop written for this region (image/chart/table), if a sink
+    /// was present. Forwarded into the visual body's [`ImageRef`]; `None` leaves the
+    /// ref empty (the sink-absent case).
+    pub image_ref: Option<String>,
 }
 
 /// The doc-title boxes (in page pixels) the pipeline layout found on a page, used
@@ -329,17 +333,18 @@ fn min_box_overlap_ratio(a: &BBox, b: &BBox) -> f32 {
 /// Builds the visual [`Block`] for a body region with its nested captions/footnotes.
 fn visual_block(region: &ExtractedRegion, captions: Vec<TextBlock>, footnotes: Vec<TextBlock>) -> Block {
     let bbox = region.bbox;
+    let image_ref = region.image_ref.clone();
     match Role::of(region.vlm_type) {
         Role::Visual(VisualKind::Table) => {
             let html = mineru_types::Html(region.content.clone().unwrap_or_default());
             Block::Table(Captioned {
-                body: TableBody { bbox, html, image: None },
+                body: TableBody { bbox, html, image: image_ref.map(ImageRef) },
                 captions,
                 footnotes,
             })
         }
         Role::Visual(VisualKind::Chart) => Block::Chart(Captioned {
-            body: image_body(bbox),
+            body: image_body(bbox, image_ref),
             captions,
             footnotes,
         }),
@@ -347,18 +352,19 @@ fn visual_block(region: &ExtractedRegion, captions: Vec<TextBlock>, footnotes: V
         // dedicated field in the typed tree (Python only carries it as a passthrough
         // string), so it collapses into a plain image body here.
         _ => Block::Image(Captioned {
-            body: image_body(bbox),
+            body: image_body(bbox, image_ref),
             captions,
             footnotes,
         }),
     }
 }
 
-/// An image body with an empty [`ImageRef`] (the crop-saving stage fills the path).
-fn image_body(bbox: BBox) -> ImageBody {
+/// An image body whose [`ImageRef`] is the written crop filename (empty when no
+/// sink wrote a crop).
+fn image_body(bbox: BBox, image_ref: Option<String>) -> ImageBody {
     ImageBody {
         bbox,
-        image: ImageRef(String::new()),
+        image: ImageRef(image_ref.unwrap_or_default()),
     }
 }
 
@@ -480,6 +486,7 @@ mod tests {
             content: Some(content.to_owned()),
             order,
             is_seal: false,
+            image_ref: None,
         }
     }
 

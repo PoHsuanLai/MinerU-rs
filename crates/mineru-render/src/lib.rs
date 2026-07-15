@@ -23,7 +23,7 @@ pub mod mode;
 mod path;
 mod text;
 
-pub use content_list::{render_content_list, ContentItem};
+pub use content_list::{render_content_list, ContentBody, ContentItem};
 pub use error::{Error, Result};
 pub use markdown::render_markdown;
 pub use mode::MakeMode;
@@ -230,15 +230,83 @@ mod tests {
         );
     }
 
+    /// The regression this guards: `render_content_list` used to walk
+    /// `doc.blocks()`, which flattens pages away — every entry silently lost its
+    /// page number. A single-page fixture cannot catch that (index 0 is the
+    /// default), so this asserts across pages with a non-zero index and a
+    /// differently-sized page.
+    #[test]
+    fn content_list_carries_per_page_index_and_scales_bbox_per_page() {
+        let d = Document {
+            pages: vec![
+                Page {
+                    index: 0,
+                    size: PageSize {
+                        width: 100.0,
+                        height: 100.0,
+                    },
+                    blocks: vec![text_block(TextRole::Body, "first")],
+                    discarded: Vec::new(),
+                },
+                Page {
+                    index: 4,
+                    // Half-width: the same (0,0,10,10) box must scale to twice
+                    // the x extent, proving each page's own size is used.
+                    size: PageSize {
+                        width: 50.0,
+                        height: 100.0,
+                    },
+                    blocks: vec![text_block(TextRole::Body, "second")],
+                    discarded: Vec::new(),
+                },
+            ],
+        };
+        let items = render_content_list(&d, "img");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].page_idx, 0);
+        assert_eq!(items[0].bbox, Some([0, 0, 100, 100]));
+        assert_eq!(items[1].page_idx, 4, "page index must not be flattened away");
+        assert_eq!(items[1].bbox, Some([0, 0, 200, 100]));
+    }
+
+    /// A degenerate page size makes the 0..1000 mapping undefined; Python's
+    /// `_build_bbox` returns `None` and the key is omitted rather than emitting
+    /// an infinity/NaN.
+    #[test]
+    fn content_list_omits_bbox_for_degenerate_page_size() {
+        let d = Document {
+            pages: vec![Page {
+                index: 0,
+                size: PageSize {
+                    width: 0.0,
+                    height: 0.0,
+                },
+                blocks: vec![text_block(TextRole::Body, "x")],
+                discarded: Vec::new(),
+            }],
+        };
+        let json = serde_json::to_value(render_content_list(&d, "img")).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!([{ "type": "text", "text": "x", "page_idx": 0 }]),
+            "no bbox key when the page size is unusable"
+        );
+    }
+
     #[test]
     fn content_list_title_sets_text_level() {
         let d = doc(vec![text_block(TextRole::Title(TitleLevel(3)), "Sec")]);
         let items = render_content_list(&d, "img");
         assert_eq!(
             items,
-            vec![ContentItem::Text {
-                text: "Sec".to_owned(),
-                text_level: Some(3),
+            vec![ContentItem {
+                content: ContentBody::Text {
+                    text: "Sec".to_owned(),
+                    text_level: Some(3),
+                },
+                // `bbox()` is (0,0,10,10) on a 100x100 page -> tenths of the 0..1000 scale.
+                bbox: Some([0, 0, 100, 100]),
+                page_idx: 0,
             }]
         );
     }
@@ -248,7 +316,15 @@ mod tests {
         let d = doc(vec![text_block(TextRole::Title(TitleLevel(0)), "Doc")]);
         let json = serde_json::to_value(render_content_list(&d, "img")).unwrap();
         // No `text_level` key for a level-0 (doc) title.
-        assert_eq!(json, serde_json::json!([{ "type": "text", "text": "Doc" }]));
+        assert_eq!(
+            json,
+            serde_json::json!([{
+                "type": "text",
+                "text": "Doc",
+                "bbox": [0, 0, 100, 100],
+                "page_idx": 0,
+            }])
+        );
     }
 
     #[test]
@@ -261,6 +337,8 @@ mod tests {
                 "type": "image",
                 "img_path": "images/fig1.png",
                 "image_caption": ["Figure 1"],
+                "bbox": [0, 0, 100, 100],
+                "page_idx": 0,
             }])
         );
     }
@@ -278,6 +356,8 @@ mod tests {
                 "type": "equation",
                 "text": "E=mc^2",
                 "text_format": "latex",
+                "bbox": [0, 0, 100, 100],
+                "page_idx": 0,
             }])
         );
     }
@@ -296,6 +376,8 @@ mod tests {
                 "type": "table",
                 "img_path": "img/t.png",
                 "table_body": "<table></table>",
+                "bbox": [0, 0, 100, 100],
+                "page_idx": 0,
             }])
         );
     }

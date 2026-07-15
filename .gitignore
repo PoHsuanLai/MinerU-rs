@@ -11,3 +11,13 @@
 # Regenerable ONNX reference dumps for parity tests (see the .py dumpers)
 crates/mineru-table/tests/reference/*.bin
 crates/mineru-table/tests/reference/*.shape
+
+# Parse output. `mineru -o .` writes these into the repo root; they are generated
+# artifacts and must never be committed.
+/output/
+/paper.md
+/paper_content_list.json
+/paper_document.json
+/*_content_list.json
+/*_document.json
+/images/

@@ -53,6 +53,19 @@ impl ModelPaths {
     /// weights are subpaths of it *except* the OCR character dictionary, which
     /// ships with the application rather than the model download — see
     /// [`ocr_rec_dict`](Self::ocr_rec_dict).
+    ///
+    /// **The relative paths below are the counterpart to
+    /// `mineru_config::REQUIRED_MODEL_FILES`**, which drives the auto-download of
+    /// missing weights. That list lives in `mineru-config` (foundational, must not
+    /// depend on this crate) and carries a reciprocal note.
+    ///
+    /// The two are *deliberately not identical*: this struct names every path the
+    /// loader may read, while the download list names only what upstream actually
+    /// hosts. Three paths here are intentionally absent there — `ocr_rec_dict`
+    /// (embedded in `mineru-ocr-rec`), the SlaNet `.safetensors` sibling
+    /// (generated locally from the `.onnx`), and the UNet weights (`UnetModel::new`
+    /// takes none; `mineru-table` fetches its own `.bpk`). Adding a path here that
+    /// upstream does host means adding it there too.
     pub fn under(models_dir: impl AsRef<Path>) -> Self {
         let root = models_dir.as_ref();
         Self {

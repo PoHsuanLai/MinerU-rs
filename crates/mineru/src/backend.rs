@@ -1,18 +1,17 @@
-//! Backend selection: builds the requested `Box<dyn Backend>`.
+//! Backend selection: translates the CLI choice into a `Box<dyn Backend>`.
 //!
-//! The one-shot flow ([`crate::run`]) holds its engine as a `Box<dyn Backend>`, so
-//! construction lives here in one place. The pipeline backend loads model weights
-//! best-effort from the config's `models_dir`; the VLM backend wires an HTTP client
-//! to an external server.
+//! The one-shot flow ([`crate::run`]) holds its engine as a `Box<dyn Backend>`.
+//! All construction — models-dir resolution, auto-download, CPU/GPU selection, and
+//! VLM client wiring — is delegated to the library facade ([`mineru::Mineru`]), so
+//! the binary and downstream library consumers share exactly one implementation.
+//! This module only maps CLI arguments onto builder calls.
 
-use anyhow::{bail, Context};
-use mineru_backend_pipeline::{PipelineBackend, PipelineModels};
-use mineru_backend_vlm::VlmBackend;
 use mineru_config::Config;
 use mineru_types::Backend;
-use mineru_vlm_client::VlmClientConfig;
 
-use crate::cli::BackendKind;
+use mineru::HybridEffort;
+
+use crate::cli::{BackendKind, EffortArg};
 
 /// Overrides for the VLM client, sourced from CLI flags.
 ///
@@ -26,76 +25,59 @@ pub struct VlmOverrides {
     pub model: Option<String>,
 }
 
-/// Builds the selected backend as a `Box<dyn Backend>`.
+/// Builds the selected backend as a `Box<dyn Backend>` via the library facade.
 ///
-/// The pipeline path requires a models directory: it errors clearly if
-/// `config.models_dir` is unset (there is no baked-in machine default — set
-/// `MINERU_MODELS_DIR` or `models_dir` in the config file). Once a directory is
-/// given, missing individual weights degrade to skipped stages per
-/// [`PipelineModels::load`]. The VLM path only wires a client and cannot fail
-/// here — a bad URL surfaces on the first request.
+/// Every backend is constructed through [`mineru::Mineru::builder`]: the pipeline
+/// path resolves the models directory, auto-downloads any missing weights
+/// (best-effort — a fully-provisioned dir does no network access), and loads on the
+/// GPU or CPU per `try_gpu`; the VLM path wires an HTTP client; hybrid does both
+/// (its local models always load on the CPU). A build error (e.g. the models
+/// directory cannot be resolved) is surfaced with context.
 pub fn build_backend(
     kind: BackendKind,
+    try_gpu: bool,
     config: &Config,
     vlm: &VlmOverrides,
+    effort: Option<EffortArg>,
 ) -> anyhow::Result<Box<dyn Backend>> {
-    match kind {
-        BackendKind::Pipeline => {
-            if config.models_dir.as_os_str().is_empty() {
-                bail!(
-                    "no model directory configured for the pipeline backend: set \
-                     MINERU_MODELS_DIR (or `models_dir` in the config file) to the \
-                     directory containing the model weights"
-                );
-            }
-            let models_dir = config.models_dir.canonicalize().with_context(|| {
-                format!(
-                    "model directory {} does not exist (set MINERU_MODELS_DIR to a valid path)",
-                    config.models_dir.display()
-                )
-            })?;
-            build_pipeline_backend(&models_dir)
-        }
-        BackendKind::Vlm => {
-            let mut client = VlmClientConfig::default();
-            if let Some(url) = vlm.url.clone().or_else(|| config.vlm_server_url.clone()) {
-                client.base_url = url;
-            }
-            if let Some(model) = vlm.model.clone() {
-                client.model = model;
-            }
-            Ok(Box::new(VlmBackend::new(client)))
-        }
+    let mut builder = mineru::Mineru::builder()
+        .config(config.clone())
+        .gpu(try_gpu);
+
+    builder = match kind {
+        BackendKind::Pipeline => builder,
+        BackendKind::Vlm => builder.vlm(vlm.url.clone(), vlm.model.clone()),
+        BackendKind::Hybrid => builder.hybrid(
+            vlm.url.clone(),
+            vlm.model.clone(),
+            effort.map(hybrid_effort),
+        ),
+    };
+
+    let engine = builder
+        .build()
+        .map_err(|e| anyhow::anyhow!("building the {kind:?} backend failed: {e}"))?;
+    Ok(engine.into_backend())
+}
+
+/// Maps the CLI effort onto the facade's.
+fn hybrid_effort(effort: EffortArg) -> HybridEffort {
+    match effort {
+        EffortArg::Medium => HybridEffort::Medium,
+        EffortArg::High => HybridEffort::High,
     }
 }
 
-/// Loads the pipeline models and boxes the backend, selecting the wgpu GPU when
-/// the `gpu` feature is compiled in *and* `MINERU_GPU` is set to a truthy value
-/// (`1`/`true`/`yes`), otherwise the CPU backend.
-///
-/// The neural stages (layout/OCR/formula) run on the selected backend; the table
-/// stages always run on CPU (their generated ONNX / SLANet types are CPU-pinned),
-/// so a GPU run is a hybrid. Selection is a runtime env var rather than a CLI flag
-/// so the same binary serves both without a plumbing change to the arg parser.
-fn build_pipeline_backend(models_dir: &std::path::Path) -> anyhow::Result<Box<dyn Backend>> {
-    #[cfg(feature = "gpu")]
-    {
-        if gpu_requested() {
-            use mineru_burn_common::backend::{gpu_device, Gpu};
-            tracing::info!("pipeline backend: wgpu GPU (neural stages) + CPU tables");
-            let models = PipelineModels::<Gpu>::load_on(models_dir, gpu_device());
-            return Ok(Box::new(PipelineBackend::new(models)));
-        }
-    }
-    tracing::info!("pipeline backend: CPU");
-    let models = PipelineModels::load(models_dir);
-    Ok(Box::new(PipelineBackend::new(models)))
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// Whether `MINERU_GPU` requests the GPU backend (truthy: `1`, `true`, `yes`).
-#[cfg(feature = "gpu")]
-fn gpu_requested() -> bool {
-    std::env::var("MINERU_GPU")
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
+    /// Two parallel two-variant enums are exactly the shape that silently
+    /// inverts: swapping the arms still compiles and every backend still builds,
+    /// but every run would take the other code path.
+    #[test]
+    fn effort_maps_without_inverting() {
+        assert_eq!(hybrid_effort(EffortArg::Medium), HybridEffort::Medium);
+        assert_eq!(hybrid_effort(EffortArg::High), HybridEffort::High);
+    }
 }

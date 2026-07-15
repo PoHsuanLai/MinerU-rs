@@ -20,8 +20,9 @@ pub enum MakeMode {
 impl MakeMode {
     /// Whether this mode keeps image/chart blocks in the output.
     ///
-    /// Only [`MakeMode::NlpMarkdown`] drops them.
-    pub(crate) fn keeps_images(self) -> bool {
+    /// Only [`MakeMode::NlpMarkdown`] drops them. The run flow uses this to decide
+    /// whether to inject an image sink (crop-writing) at all.
+    pub fn keeps_images(self) -> bool {
         !matches!(self, MakeMode::NlpMarkdown)
     }
 }

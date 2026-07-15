@@ -3,10 +3,13 @@
 //! `vlm`, `pipeline`, and `hybrid` backends each `impl Backend`, and the CLI holds
 //! a `Box<dyn Backend>`. Kept small and object-safe on purpose.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 
 use crate::content::Lang;
 use crate::document::Document;
+use crate::image_sink::ImageWriter;
 
 /// Input to a backend: the raw document bytes plus how they should be parsed.
 ///
@@ -38,6 +41,14 @@ pub struct ParseOptions {
     pub table: bool,
     /// Inclusive start / exclusive-ish end page range; `None` means all pages.
     pub page_range: Option<(usize, Option<usize>)>,
+    /// Where to write extracted image/table/chart crops.
+    ///
+    /// `None` (the default) means the backend does not persist crops — it still
+    /// mints the [`ImageRef`](crate::ImageRef) filenames, but writes no bytes. The
+    /// CLI's run flow supplies a disk-backed sink rooted at the output `images/`
+    /// directory when images are being emitted; it leaves this `None` for
+    /// `--no-images` runs so no orphan files are written.
+    pub image_sink: Option<Arc<dyn ImageWriter>>,
 }
 
 impl Default for ParseOptions {
@@ -47,6 +58,7 @@ impl Default for ParseOptions {
             formula: true,
             table: true,
             page_range: None,
+            image_sink: None,
         }
     }
 }

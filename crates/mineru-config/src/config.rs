@@ -31,11 +31,11 @@ pub struct Config {
     pub model_source: ModelSource,
     /// Directory holding (or caching) the model weights.
     ///
-    /// There is no baked-in default machine path: this is resolved from the
-    /// `MINERU_MODELS_DIR` environment variable or the `models_dir` config-file
-    /// key. When neither is set it is empty; callers that need weights should
-    /// check [`Config::models_dir`] and surface a clear "set MINERU_MODELS_DIR"
-    /// error rather than guessing a location.
+    /// Resolved from the `MINERU_MODELS_DIR` environment variable or the
+    /// `models_dir` config-file key. When neither is set it falls back to a
+    /// default cache directory (see [`default_models_dir`]) rather than staying
+    /// empty, so a clean machine can auto-download weights into it. An explicit
+    /// env/config value always wins over the default.
     pub models_dir: PathBuf,
     /// Base URL of an external OpenAI-compatible VLM server, if any.
     pub vlm_server_url: Option<String>,
@@ -46,11 +46,40 @@ impl Default for Config {
         Self {
             device: Device::default(),
             model_source: ModelSource::default(),
-            // No baked-in machine path: resolved from MINERU_MODELS_DIR / the
-            // config file. Empty means "unset" — callers requiring weights error.
-            models_dir: PathBuf::new(),
+            // A default cache dir (rather than empty) so a clean machine can
+            // auto-download weights into it. Explicit env/config values still win
+            // via `apply_env_overrides` / deserialization.
+            models_dir: default_models_dir(),
             vlm_server_url: None,
         }
+    }
+}
+
+/// Resolves the default models cache directory used when neither
+/// `MINERU_MODELS_DIR` nor the config file provides one.
+///
+/// Resolution order:
+/// 1. `dirs::cache_dir()` joined with `mineru/models` — the standard per-user
+///    cache directory (`~/Library/Caches` on macOS, `$XDG_CACHE_HOME` / `~/.cache`
+///    on Linux). This is the only built-in default.
+/// 2. `./mineru-models` (cwd-relative) — last resort when no cache dir resolves.
+///
+/// No machine-specific absolute path is baked into source: a developer who keeps
+/// weights on a custom volume points `MINERU_MODELS_DIR` at it, which overrides
+/// this default (see [`Config::apply_env_overrides`]).
+pub fn default_models_dir() -> PathBuf {
+    resolve_default_models_dir(dirs::cache_dir())
+}
+
+/// Pure core of [`default_models_dir`], split out so both branches are
+/// unit-testable without depending on the host's `dirs` output.
+///
+/// `cache_dir` is the resolved per-user cache root (from `dirs::cache_dir()`), if
+/// any.
+fn resolve_default_models_dir(cache_dir: Option<PathBuf>) -> PathBuf {
+    match cache_dir {
+        Some(dir) => dir.join("mineru").join("models"),
+        None => PathBuf::from("./mineru-models"),
     }
 }
 
@@ -133,10 +162,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_models_dir_is_empty_until_set() {
-        // No baked-in machine path: the default is empty and must be provided
-        // via MINERU_MODELS_DIR or the config file.
-        assert_eq!(Config::default().models_dir, PathBuf::new());
+    fn default_models_dir_is_nonempty_cache_path() {
+        // The default is no longer empty: it resolves to a cache dir so a clean
+        // machine can auto-download weights into it.
+        assert_ne!(Config::default().models_dir, PathBuf::new());
+    }
+
+    #[test]
+    fn resolve_default_uses_cache_dir() {
+        let d = resolve_default_models_dir(Some(PathBuf::from("/some/cache")));
+        assert_eq!(d, PathBuf::from("/some/cache/mineru/models"));
+    }
+
+    #[test]
+    fn resolve_default_falls_back_to_cwd_when_no_cache_dir() {
+        let d = resolve_default_models_dir(None);
+        assert_eq!(d, PathBuf::from("./mineru-models"));
     }
 
     #[test]
@@ -202,8 +243,9 @@ mod tests {
         let json = r#"{ "device": "mps" }"#;
         let c: Config = serde_json::from_str(json).unwrap();
         assert_eq!(c.device, Device::Mps);
-        // Unspecified models_dir stays empty (no baked-in machine default).
-        assert_eq!(c.models_dir, PathBuf::new());
+        // Unspecified models_dir falls back to the default cache dir (via
+        // `#[serde(default)]` → `Config::default().models_dir`), not empty.
+        assert_eq!(c.models_dir, default_models_dir());
         assert_eq!(c.model_source, ModelSource::HuggingFace);
     }
 

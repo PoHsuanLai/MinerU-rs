@@ -16,10 +16,12 @@
 
 pub mod config;
 pub mod device;
+pub mod download;
 pub mod error;
 pub mod model_source;
 
 pub use config::Config;
+pub use download::{download_missing_models, DEFAULT_MODELS_BASE, REQUIRED_MODEL_FILES};
 pub use device::Device;
 pub use error::{Error, Result};
 pub use model_source::ModelSource;

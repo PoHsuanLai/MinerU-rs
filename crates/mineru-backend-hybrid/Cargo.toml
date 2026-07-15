@@ -13,6 +13,7 @@ mineru-vlm-client = { workspace = true }
 mineru-backend-pipeline = { workspace = true }
 mineru-layout = { workspace = true }
 mineru-pdf = { workspace = true }
+mineru-io = { workspace = true }
 
 image = { version = "0.25", default-features = false }
 async-trait = "0.1"

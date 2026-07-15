@@ -12,11 +12,13 @@
 pub mod data;
 pub mod download;
 pub mod error;
+pub mod image_crop;
 pub mod layout;
 
 pub use data::{DataReader, DataWriter, LocalFsReader, LocalFsWriter};
 pub use download::{download_model, ModelSource};
 pub use error::{Error, Result};
+pub use image_crop::{encode_png, write_png, LocalFsImageWriter};
 pub use layout::{prepare_output_dirs, OutputLayout};
 
 #[cfg(test)]

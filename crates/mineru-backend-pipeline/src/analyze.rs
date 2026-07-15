@@ -33,7 +33,8 @@ use mineru_burn_common::backend::Cpu;
 use mineru_layout::LayoutDet;
 use mineru_pdf::{PageText, PdfiumLibrary, RenderOptions};
 use mineru_types::{
-    Backend, BackendError, BBox, DocInput, Document, ImageRef, Page, PageSize, ParseOptions,
+    Backend, BackendError, BBox, DocInput, Document, ImageRef, ImageWriter, Page, PageSize,
+    ParseOptions,
 };
 
 use crate::assemble::{PageAssembler, RecognizedLine, Region, RegionContent, RegionKind};
@@ -181,7 +182,14 @@ impl<B: BurnBackend> PipelineBackend<B> {
                 PageText::default()
             });
             profile.add(&profile.native_text, t.elapsed());
-            let page = self.analyze_page(index, size, &image, &page_text, &profile);
+            let page = self.analyze_page(
+                index,
+                size,
+                &image,
+                &page_text,
+                opts.image_sink.as_deref(),
+                &profile,
+            );
             pages.push(page);
         }
 
@@ -197,6 +205,7 @@ impl<B: BurnBackend> PipelineBackend<B> {
         size: PageSize,
         image: &RgbImage,
         page_text: &PageText,
+        sink: Option<&dyn ImageWriter>,
         profile: &Profile,
     ) -> Page {
         let scale = self.scale();
@@ -214,7 +223,7 @@ impl<B: BurnBackend> PipelineBackend<B> {
 
         let regions: Vec<Region> = dets
             .into_iter()
-            .map(|det| self.recognize_region(index, det, image, scale, page_text, profile))
+            .map(|det| self.recognize_region(index, det, image, scale, page_text, sink, profile))
             .collect();
 
         let assembled = PageAssembler.assemble(regions);
@@ -231,6 +240,7 @@ impl<B: BurnBackend> PipelineBackend<B> {
     /// Runs the recognition model that a region's kind calls for, scaling the
     /// detection box from pixels to page points and returning the region for
     /// assembly.
+    #[allow(clippy::too_many_arguments)]
     fn recognize_region(
         &self,
         page: usize,
@@ -238,6 +248,7 @@ impl<B: BurnBackend> PipelineBackend<B> {
         image: &RgbImage,
         scale: f32,
         page_text: &PageText,
+        sink: Option<&dyn ImageWriter>,
         profile: &Profile,
     ) -> Region {
         let pixel_bbox = det.bbox;
@@ -268,8 +279,10 @@ impl<B: BurnBackend> PipelineBackend<B> {
                 profile.add(&profile.formula, t.elapsed());
                 c
             }
-            RegionKind::Table => self.recognize_table(&pixel_bbox, image, profile),
-            RegionKind::Image | RegionKind::Chart => self.crop_image(page, &det, image),
+            RegionKind::Table => self.recognize_table(page, &det, &pixel_bbox, image, sink, profile),
+            RegionKind::Image | RegionKind::Chart => {
+                self.crop_image(page, &det, &pixel_bbox, image, sink)
+            }
             RegionKind::Ignored => RegionContent::default(),
         };
 
@@ -395,8 +408,11 @@ impl<B: BurnBackend> PipelineBackend<B> {
     /// model leaves `table_html` empty.
     fn recognize_table(
         &self,
+        page: usize,
+        det: &LayoutDet,
         pixel_bbox: &BBox,
         image: &RgbImage,
+        sink: Option<&dyn ImageWriter>,
         profile: &Profile,
     ) -> RegionContent {
         let Some((crop, _, _)) = crop_region(image, pixel_bbox) else {
@@ -414,8 +430,18 @@ impl<B: BurnBackend> PipelineBackend<B> {
             Err(_) => self.recognize_wireless(&crop),
         };
         profile.add(&profile.table_recognize, t.elapsed());
+        // Persist the table crop (best-effort) and mint its ref only when a sink is
+        // present, mirroring `crop_image`; with no sink the image ref stays `None`
+        // (unchanged behavior). The assembler forwards `content.image` into
+        // `TableBody.image`.
+        let image = sink.map(|sink| {
+            let name = format!("p{page}_o{}.png", det.order);
+            write_crop(sink, page, det.order, &name, &crop);
+            ImageRef(name)
+        });
         RegionContent {
             table_html: html,
+            image,
             ..Default::default()
         }
     }
@@ -428,20 +454,17 @@ impl<B: BurnBackend> PipelineBackend<B> {
     ) -> Option<mineru_types::Html> {
         match class {
             mineru_table::TableClass::Wireless => self.recognize_wireless(crop),
-            mineru_table::TableClass::Wired => self
-                .models
-                .table_wired
-                .as_ref()
-                .and_then(|m| mineru_table::recognize_wired(m, crop, &[]).ok()),
+            mineru_table::TableClass::Wired => self.models.table_wired.as_ref().and_then(|m| {
+                warn_on_err("wired", mineru_table::recognize_wired(m, crop, &[]))
+            }),
         }
     }
 
     /// Wireless-table recognition, guarded on the loaded SLANet model.
     fn recognize_wireless(&self, crop: &RgbImage) -> Option<mineru_types::Html> {
-        self.models
-            .table_wireless
-            .as_ref()
-            .and_then(|m| mineru_table::recognize_wireless(m, crop, &[]).ok())
+        self.models.table_wireless.as_ref().and_then(|m| {
+            warn_on_err("wireless", mineru_table::recognize_wireless(m, crop, &[]))
+        })
     }
 
     /// Image/chart: record a stable [`ImageRef`] for the region.
@@ -452,12 +475,55 @@ impl<B: BurnBackend> PipelineBackend<B> {
     /// file name — the renderer joins it under the image directory (mirroring
     /// Python's `f"{img_bucket}/{image}"`), so baking a directory prefix in here
     /// would double it (`images/images/…`).
-    fn crop_image(&self, page: usize, det: &LayoutDet, _image: &RgbImage) -> RegionContent {
+    fn crop_image(
+        &self,
+        page: usize,
+        det: &LayoutDet,
+        pixel_bbox: &BBox,
+        image: &RgbImage,
+        sink: Option<&dyn ImageWriter>,
+    ) -> RegionContent {
+        // Image/chart regions always mint the ref (unchanged behavior). When a
+        // sink is present, also crop the pixel bbox and persist it (best-effort);
+        // the minted name matches what is written.
         let name = format!("p{page}_o{}.png", det.order);
+        if let Some(sink) = sink {
+            if let Some((crop, _, _)) = crop_region(image, pixel_bbox) {
+                write_crop(sink, page, det.order, &name, &crop);
+            }
+        }
         RegionContent {
             image: Some(ImageRef(name)),
             ..Default::default()
         }
+    }
+}
+
+/// Logs a table-recognition failure and degrades to "unrecognized".
+///
+/// A table failure must not abort the parse, but it must not vanish either: the
+/// most common cause is the `.bpk` weight fetch failing (see
+/// `mineru_table::weights::DEFAULT_WEIGHTS_BASE`), and swallowing that silently
+/// leaves the user with tables missing from the output and no clue why.
+fn warn_on_err(
+    kind: &str,
+    result: mineru_table::Result<mineru_types::Html>,
+) -> Option<mineru_types::Html> {
+    match result {
+        Ok(html) => Some(html),
+        Err(e) => {
+            tracing::warn!(table = kind, error = %e, "table recognition failed; emitting no table");
+            None
+        }
+    }
+}
+
+/// Writes an already-cropped region PNG through the sink, best-effort. A write
+/// error is logged and swallowed: a failed crop must not abort the parse. `name`
+/// is the ref name the caller mints, so the file written matches the reference.
+fn write_crop(sink: &dyn ImageWriter, page: usize, order: usize, name: &str, crop: &RgbImage) {
+    if let Err(e) = mineru_io::write_png(sink, name, crop) {
+        tracing::warn!(page, order, error = %e, "failed to write region crop");
     }
 }
 
@@ -577,5 +643,76 @@ mod tests {
     fn offset_translates_box() {
         let b = offset_bbox(&BBox::new(0.0, 0.0, 10.0, 10.0), 5.0, 7.0);
         assert_eq!((b.x0, b.y0, b.x1, b.y1), (5.0, 7.0, 15.0, 17.0));
+    }
+
+    use std::sync::Mutex;
+
+    use crate::models::PipelineModels;
+
+    /// Test sink that records each `(name, byte_len)` it is handed.
+    #[derive(Debug, Default)]
+    struct RecordingSink {
+        writes: Mutex<Vec<(String, usize)>>,
+    }
+
+    impl ImageWriter for RecordingSink {
+        fn write(&self, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+            if let Ok(mut w) = self.writes.lock() {
+                w.push((name.to_string(), bytes.len()));
+            }
+            Ok(())
+        }
+    }
+
+    /// A gradient RgbImage so the encoded PNG has non-trivial content.
+    fn synthetic_image(w: u32, h: u32) -> RgbImage {
+        RgbImage::from_fn(w, h, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8])
+        })
+    }
+
+    #[test]
+    fn crop_image_writes_one_png_matching_ref() {
+        let backend = PipelineBackend {
+            models: PipelineModels::<Cpu>::default(),
+            dpi: mineru_pdf::DEFAULT_DPI,
+        };
+        let image = synthetic_image(200, 200);
+        let det = LayoutDet::new(
+            BBox::new(10.0, 20.0, 110.0, 120.0),
+            mineru_layout::LayoutLabel::Chart,
+            0.9,
+            7,
+        );
+        let sink = RecordingSink::default();
+
+        let content = backend.crop_image(3, &det, &det.bbox, &image, Some(&sink));
+
+        // Ref name is minted and matches the written file.
+        let expected = format!("p3_o{}.png", det.order);
+        assert_eq!(content.image, Some(ImageRef(expected.clone())));
+
+        let writes = sink.writes.lock().unwrap();
+        assert_eq!(writes.len(), 1, "exactly one crop should be written");
+        assert_eq!(writes[0].0, expected, "written name must match the ref");
+        assert!(writes[0].1 > 100, "PNG bytes should be non-trivial");
+    }
+
+    #[test]
+    fn crop_image_without_sink_mints_ref_but_writes_nothing() {
+        let backend = PipelineBackend {
+            models: PipelineModels::<Cpu>::default(),
+            dpi: mineru_pdf::DEFAULT_DPI,
+        };
+        let image = synthetic_image(50, 50);
+        let det = LayoutDet::new(
+            BBox::new(0.0, 0.0, 40.0, 40.0),
+            mineru_layout::LayoutLabel::Chart,
+            0.9,
+            2,
+        );
+
+        let content = backend.crop_image(1, &det, &det.bbox, &image, None);
+        assert_eq!(content.image, Some(ImageRef(format!("p1_o{}.png", det.order))));
     }
 }

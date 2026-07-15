@@ -8,7 +8,10 @@ repository.workspace = true
 description = "Filesystem reader/writer abstraction and model-weight download helper for MinerU."
 
 [dependencies]
+mineru-types.workspace = true
 thiserror.workspace = true
+# PNG encoding for extracted image crops. `png` only — no decoders needed here.
+image = { version = "0.25", default-features = false, features = ["png"] }
 # Sync (ureq-backed) Hugging Face Hub client. The default `online` feature pulls
 # in ureq + native-tls only — no async runtime — which keeps the dependency tree
 # light and avoids a hard tokio dependency in this crate.

@@ -27,6 +27,7 @@ pub fn cpu_device() -> NdArrayDevice {
 mod gpu {
     use burn::backend::Wgpu;
     use burn::backend::wgpu::WgpuDevice;
+    use burn::tensor::Tensor;
 
     /// The optional GPU backend: `wgpu` with `f32` elements.
     ///
@@ -38,7 +39,35 @@ mod gpu {
     pub fn gpu_device() -> WgpuDevice {
         WgpuDevice::default()
     }
+
+    /// Probes whether a usable wgpu GPU is actually available.
+    ///
+    /// Returns `true` only if the default device can be initialized *and* a
+    /// trivial tensor op runs on it end-to-end (allocate → compute → read back).
+    /// A machine with no Metal/Vulkan adapter, broken drivers, or a headless
+    /// environment fails one of those steps; the probe reports `false` so callers
+    /// can fall back to CPU instead of committing to a device that would panic
+    /// mid-pipeline.
+    ///
+    /// The wgpu init path can `panic!` (rather than return an error) when no
+    /// adapter is present, so the probe runs inside [`std::panic::catch_unwind`]
+    /// and treats a panic as "unavailable". It is a one-off, cheap check meant to
+    /// be called once before loading models onto the GPU.
+    #[must_use]
+    pub fn gpu_available() -> bool {
+        // The probe both allocates a device buffer and reads it back, so a broken
+        // adapter that constructs but cannot execute is still caught. `catch_unwind`
+        // guards the wgpu init panic; the closure returns the checked value.
+        std::panic::catch_unwind(|| {
+            let device = gpu_device();
+            let a = Tensor::<Gpu, 1>::from_data([1.0f32, 2.0, 3.0], &device);
+            let sum = a.sum().into_scalar();
+            // 1 + 2 + 3 = 6; a finite, correct read-back confirms the device works.
+            (sum - 6.0).abs() < 1e-3
+        })
+        .unwrap_or(false)
+    }
 }
 
 #[cfg(feature = "gpu")]
-pub use gpu::{Gpu, gpu_device};
+pub use gpu::{Gpu, gpu_available, gpu_device};

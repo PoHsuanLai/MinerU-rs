@@ -24,6 +24,11 @@ pub struct VlmBlock {
     /// Optional finer classification for image/chart blocks (e.g. a seal).
     #[serde(default)]
     pub sub_type: Option<String>,
+    /// The filename of the crop written for this block, stamped by the client
+    /// after cropping (image/chart/table). The model never emits this, so it is
+    /// skipped during (de)serialization and defaults to `None`.
+    #[serde(default, skip)]
+    pub image_ref: Option<String>,
 }
 
 /// The VLM's output for a single page: its pixel size and the blocks it found.

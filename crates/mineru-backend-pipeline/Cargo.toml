@@ -9,6 +9,7 @@ description = "Local Burn-model pipeline backend for MinerU: orchestrates layout
 
 [dependencies]
 mineru-types = { workspace = true }
+mineru-io = { workspace = true }
 mineru-pdf = { workspace = true }
 mineru-layout = { workspace = true }
 mineru-ocr-det = { workspace = true }

@@ -16,6 +16,22 @@ use crate::parse::parse_layout;
 use crate::prompts::{self, Sampling};
 use crate::raw::{VlmBlock, VlmPage};
 
+/// Fixed square size (px) the page is resized to for the layout-detection pass.
+///
+/// MinerU2.5's layout model is trained at this resolution; sending any other size
+/// yields degenerate output. Mirrors the reference `layout_image_size = (1036, 1036)`.
+const LAYOUT_IMAGE_SIZE: u32 = 1036;
+
+/// Where to write per-block image crops during extraction, plus the page they
+/// belong to. Passed into [`VlmClient::extract_page`]; when `None`, no crops are
+/// written and blocks keep an empty image reference.
+pub struct CropSink<'a> {
+    /// The sink crops are written to.
+    pub sink: &'a dyn mineru_types::ImageWriter,
+    /// Zero-based index of the page being extracted, used in crop filenames.
+    pub page_index: usize,
+}
+
 /// Configuration for connecting to the VLM server.
 #[derive(Debug, Clone)]
 pub struct VlmClientConfig {
@@ -63,17 +79,49 @@ impl VlmClient {
     /// Step 1 detects the layout over the whole page; step 2 fills each block's
     /// content from a crop. `image_analysis` enables content extraction for
     /// image/chart blocks (off by default, matching the Python).
-    pub async fn extract_page(&self, page: &RgbImage, image_analysis: bool) -> Result<VlmPage> {
+    pub async fn extract_page(
+        &self,
+        page: &RgbImage,
+        image_analysis: bool,
+        crops: Option<CropSink<'_>>,
+    ) -> Result<VlmPage> {
         let (w, h) = (page.width() as f32, page.height() as f32);
 
-        // Step 1: layout over the full page.
+        // Step 1: layout over the full page. The model is trained on a FIXED
+        // layout-input size and produces garbage (a run of `!` tokens) for any
+        // other resolution — so the page is resized to `LAYOUT_IMAGE_SIZE` with
+        // bicubic resampling first, matching the reference `prepare_for_layout`.
+        // The returned boxes are normalized `0..1`, so this resize does not affect
+        // downstream coordinates.
+        let layout_input = image::imageops::resize(
+            page,
+            LAYOUT_IMAGE_SIZE,
+            LAYOUT_IMAGE_SIZE,
+            image::imageops::FilterType::CatmullRom,
+        );
         let layout_text = self
-            .complete(page, prompts::LAYOUT, Sampling::default())
+            .complete(&layout_input, prompts::LAYOUT, Sampling::default())
             .await?;
         let mut blocks = parse_layout(&layout_text);
 
-        // Step 2: per-block content extraction.
-        for block in &mut blocks {
+        // Step 2: per-block content extraction (and crop writing).
+        for (order, block) in blocks.iter_mut().enumerate() {
+            // Write the crop for visual blocks independently of content
+            // extraction: image/chart are skipped for CONTENT by default, but
+            // their raster still needs to be emitted so markdown can reference it.
+            if let Some(crops) = &crops {
+                if is_visual(&block.label) {
+                    let crop = crop_block(page, block);
+                    let name = format!("p{}_o{}.png", crops.page_index, order);
+                    match mineru_io::write_png(crops.sink, &name, &crop) {
+                        Ok(()) => block.image_ref = Some(name),
+                        Err(e) => {
+                            tracing::warn!("crop write failed for {}: {e}", block.label);
+                        }
+                    }
+                }
+            }
+
             if skip_extraction(&block.label, image_analysis) {
                 continue;
             }
@@ -143,6 +191,11 @@ impl VlmClient {
     }
 }
 
+/// Whether a block is a visual kind whose crop should be written to disk.
+fn is_visual(label: &str) -> bool {
+    matches!(label, "image" | "image_block" | "chart" | "table")
+}
+
 /// Whether a block is skipped in the extraction pass.
 fn skip_extraction(label: &str, image_analysis: bool) -> bool {
     match label {
@@ -210,6 +263,7 @@ mod tests {
             content: None,
             angle: 0,
             sub_type: None,
+            image_ref: None,
         };
         let crop = crop_block(&img, &block);
         assert_eq!((crop.width(), crop.height()), (40, 40));
