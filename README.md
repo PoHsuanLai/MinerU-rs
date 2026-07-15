@@ -120,9 +120,15 @@ mineru [OPTIONS] <PDF>
       --vlm-url <URL>      VLM server base URL      (vlm / hybrid)
       --vlm-model <NAME>   VLM served model name    (vlm / hybrid)
       --debug-output       Also write <stem>_document.json (the full parsed tree)
-  -v, --verbose            Debug-level logging
+  -v, --verbose            Debug-level logging (including noisy dependencies)
       --config <CONFIG>    Path to a JSON config file
 ```
+
+Logs go to stderr at `info`. GPU-backend dependencies (`cubecl_wgpu`, `wgpu_core`,
+`wgpu_hal`, `naga`) are pinned to `warn` by default — they log the adapter and every
+supported device feature on each run, which `mineru` already reports in one line.
+`RUST_LOG` overrides the default entirely (`RUST_LOG=cubecl_wgpu=info` brings that
+back), and `-v` raises everything to `debug` with no quieting.
 
 ## Using the crates as a library
 
