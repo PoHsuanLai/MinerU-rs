@@ -119,6 +119,111 @@ mod tests {
         assert_eq!(render_markdown(&d, MakeMode::MmMarkdown, "img"), "keep me");
     }
 
+    /// A one-page document whose `discarded` list holds `discarded`.
+    fn doc_with_discarded(blocks: Vec<Block>, discarded: Vec<Block>) -> Document {
+        Document {
+            pages: vec![Page {
+                index: 0,
+                size: PageSize {
+                    width: 100.0,
+                    height: 100.0,
+                },
+                blocks,
+                discarded,
+            }],
+        }
+    }
+
+    /// The `type` tag each item serializes under.
+    fn types(items: &[ContentItem]) -> Vec<String> {
+        items
+            .iter()
+            .map(|i| match serde_json::to_value(i) {
+                Ok(serde_json::Value::Object(m)) => m
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("?")
+                    .to_owned(),
+                _ => "?".to_owned(),
+            })
+            .collect()
+    }
+
+    /// Python emits header/footer/page-number/aside-text/page-footnote under
+    /// their own `type`, sourced from `discarded_blocks` — not as `text`, and
+    /// not dropped (`pipeline_middle_json_mkcontent.py:622`).
+    #[test]
+    fn discarded_blocks_are_emitted_under_their_own_types() {
+        let d = doc_with_discarded(
+            vec![text_block(TextRole::Body, "keep me")],
+            vec![
+                text_block(TextRole::Header, "hdr"),
+                text_block(TextRole::Footer, "ftr"),
+                text_block(TextRole::PageNumber, "7"),
+                text_block(TextRole::AsideText, "aside"),
+                text_block(TextRole::PageFootnote, "note"),
+            ],
+        );
+        let items = render_content_list(&d, "img");
+        assert_eq!(
+            types(&items),
+            ["text", "header", "footer", "page_number", "aside_text", "page_footnote"]
+        );
+        // The text must survive, not just the tag.
+        assert_eq!(
+            items.get(3).map(|i| i.content.clone()),
+            Some(ContentBody::PageNumber {
+                text: "7".to_owned()
+            })
+        );
+    }
+
+    /// Adjacent `ref_text` blocks collapse into one `list` entry carrying each
+    /// item's text (Python `merge_adjacent_ref_text_blocks_for_content`).
+    #[test]
+    fn adjacent_ref_text_blocks_become_one_list() {
+        let d = doc(vec![
+            text_block(TextRole::Body, "before"),
+            text_block(TextRole::RefText, "[1] First."),
+            text_block(TextRole::RefText, "[2] Second."),
+            text_block(TextRole::Body, "after"),
+        ]);
+        let items = render_content_list(&d, "img");
+        assert_eq!(types(&items), ["text", "list", "text"]);
+        assert_eq!(
+            items.get(1).map(|i| i.content.clone()),
+            Some(ContentBody::List {
+                sub_type: content_list::ListSubType::RefText,
+                list_items: vec!["[1] First.".to_owned(), "[2] Second.".to_owned()],
+            })
+        );
+    }
+
+    /// Python's `flush_ref_group` keeps a *lone* ref_text as a plain block, so it
+    /// renders as `text` — only runs of 2+ become a `list`.
+    #[test]
+    fn lone_ref_text_stays_text() {
+        let d = doc(vec![
+            text_block(TextRole::Body, "before"),
+            text_block(TextRole::RefText, "[1] Only."),
+            text_block(TextRole::Body, "after"),
+        ]);
+        assert_eq!(types(&render_content_list(&d, "img")), ["text", "text", "text"]);
+    }
+
+    /// Two ref_text runs separated by other content stay two distinct lists.
+    #[test]
+    fn separated_ref_runs_do_not_merge() {
+        let d = doc(vec![
+            text_block(TextRole::RefText, "[1] a"),
+            text_block(TextRole::RefText, "[2] b"),
+            text_block(TextRole::Title(TitleLevel(1)), "Appendix"),
+            text_block(TextRole::RefText, "[3] c"),
+            text_block(TextRole::RefText, "[4] d"),
+        ]);
+        assert_eq!(types(&render_content_list(&d, "img")), ["list", "text", "list"]);
+    }
+
     #[test]
     fn interline_equation_is_fenced() {
         let d = doc(vec![Block::InterlineEquation {

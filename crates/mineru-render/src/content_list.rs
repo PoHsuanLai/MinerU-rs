@@ -113,27 +113,152 @@ pub enum ContentBody {
         #[serde(skip_serializing_if = "Vec::is_empty")]
         code_footnote: Vec<String>,
     },
+    /// A list: a run of adjacent items rendered as one entry. `sub_type` names
+    /// what the run was built from (currently only `ref_text`), matching Python's
+    /// `{'type': 'list', 'sub_type': 'ref_text', 'list_items': [...]}`.
+    List {
+        /// What kind of items this list holds.
+        sub_type: ListSubType,
+        /// The item texts, in reading order.
+        list_items: Vec<String>,
+    },
+    /// A page header, emitted under its own `type` rather than as `text`.
+    Header {
+        /// The merged text of the block.
+        text: String,
+    },
+    /// A page footer.
+    Footer {
+        /// The merged text of the block.
+        text: String,
+    },
+    /// A page number.
+    PageNumber {
+        /// The merged text of the block.
+        text: String,
+    },
+    /// Marginal / aside text near the page edge.
+    AsideText {
+        /// The merged text of the block.
+        text: String,
+    },
+    /// A page footnote (distinct from a footnote nested onto a visual body).
+    PageFootnote {
+        /// The merged text of the block.
+        text: String,
+    },
+}
+
+/// The `sub_type` of a [`ContentBody::List`].
+///
+/// A dedicated enum rather than a bare `String` so the serialized tag cannot
+/// drift from the Python vocabulary by typo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ListSubType {
+    /// A run of reference-list items.
+    RefText,
 }
 
 /// Renders a document to a `content_list.json`-compatible vector.
 ///
 /// `image_dir` resolves image references (same joining as the Markdown
-/// renderer). Blocks with discard-y text roles produce no entry.
+/// renderer).
+///
+/// Both the main flow and the page's *discarded* blocks are emitted: Python's
+/// `union_make` builds this list from `para_blocks + discarded_blocks`
+/// (`pipeline_middle_json_mkcontent.py:983`), so headers, footers, page numbers,
+/// aside text and page footnotes each appear under their own `type`. "Discarded"
+/// means "out of the reading flow" (they are excluded from the Markdown), not
+/// "absent from the content list".
 pub fn render_content_list(doc: &Document, image_dir: &str) -> Vec<ContentItem> {
     // Iterate pages rather than `doc.blocks()`: each entry needs its page's index
     // and size, which flattening over blocks would discard.
     doc.pages
         .iter()
         .flat_map(|page| {
-            page.blocks.iter().filter_map(move |block| {
+            let items = group_ref_text(page.blocks.iter().chain(page.discarded.iter()));
+            items.into_iter().filter_map(move |item| {
                 Some(ContentItem {
-                    content: content_body(block, image_dir)?,
-                    bbox: scale_bbox(block.bbox(), page.size),
+                    content: item.body(image_dir)?,
+                    bbox: item.bbox().and_then(|b| scale_bbox(b, page.size)),
                     page_idx: page.index,
                 })
             })
         })
         .collect()
+}
+
+/// One reading-order entry: either a single block or a run of adjacent
+/// reference-list blocks that collapse into one `list` entry.
+enum Entry<'a> {
+    Single(&'a Block),
+    /// A run of two or more adjacent `RefText` blocks.
+    RefRun(Vec<&'a Block>),
+}
+
+impl<'a> Entry<'a> {
+    /// The entry's box: for a run, the first item's, matching Python's
+    /// `flush_ref_group`, which takes `ref_group[0]['bbox']`.
+    fn bbox(&self) -> Option<BBox> {
+        match self {
+            Entry::Single(b) => Some(b.bbox()),
+            Entry::RefRun(blocks) => blocks.first().map(|b| b.bbox()),
+        }
+    }
+
+    fn body(&self, image_dir: &str) -> Option<ContentBody> {
+        match self {
+            Entry::Single(b) => content_body(b, image_dir),
+            Entry::RefRun(blocks) => Some(ContentBody::List {
+                sub_type: ListSubType::RefText,
+                list_items: blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        Block::Text { lines, .. } => Some(merge_lines(lines)),
+                        _ => None,
+                    })
+                    .filter(|s| !s.trim().is_empty())
+                    .collect(),
+            }),
+        }
+    }
+}
+
+/// Collapses each run of adjacent `RefText` blocks into one [`Entry::RefRun`].
+///
+/// Ports Python's `merge_adjacent_ref_text_blocks_for_content`
+/// (`pipeline_middle_json_mkcontent.py:448`): consecutive `ref_text` blocks group
+/// into a single `list` entry, and — matching `flush_ref_group`'s `len == 1`
+/// branch — a lone `ref_text` stays a plain `text` entry rather than becoming a
+/// one-item list.
+fn group_ref_text<'a>(blocks: impl Iterator<Item = &'a Block>) -> Vec<Entry<'a>> {
+    let mut out: Vec<Entry<'a>> = Vec::new();
+    let mut run: Vec<&'a Block> = Vec::new();
+
+    // A lone ref_text stays `text`; two or more become one `list`.
+    let flush = |run: &mut Vec<&'a Block>, out: &mut Vec<Entry<'a>>| match run.len() {
+        0 => {}
+        1 => out.extend(run.drain(..).map(Entry::Single)),
+        _ => out.push(Entry::RefRun(std::mem::take(run))),
+    };
+
+    for block in blocks {
+        if matches!(
+            block,
+            Block::Text {
+                role: TextRole::RefText,
+                ..
+            }
+        ) {
+            run.push(block);
+            continue;
+        }
+        flush(&mut run, &mut out);
+        out.push(Entry::Single(block));
+    }
+    flush(&mut run, &mut out);
+    out
 }
 
 /// Normalizes a block's box to Python's `0..=1000` coordinate range.
@@ -168,7 +293,13 @@ fn content_body(block: &Block, image_dir: &str) -> Option<ContentBody> {
     }
 }
 
-/// Builds a text/heading item, dropping discard-y roles.
+/// Builds the item for a text block, routing each role to its Python `type`.
+///
+/// Mirrors `make_blocks_to_content_list` (`pipeline_middle_json_mkcontent.py:612`):
+/// body-ish roles become `text`, while header/footer/page-number/aside-text/
+/// page-footnote each carry their own type tag (line 622). A `RefText` reaching
+/// here is a *lone* one — runs are collapsed into a `list` by [`group_ref_text`]
+/// before this point — and Python renders that as plain `text`.
 fn text_item(role: TextRole, text: String) -> Option<ContentBody> {
     match role {
         TextRole::Title(level) => Some(ContentBody::Text {
@@ -176,11 +307,11 @@ fn text_item(role: TextRole, text: String) -> Option<ContentBody> {
             // Python omits `text_level` for the doc title (level 0).
             text_level: (level.0 != 0).then_some(level.0),
         }),
-        TextRole::Header
-        | TextRole::Footer
-        | TextRole::PageNumber
-        | TextRole::PageFootnote
-        | TextRole::AsideText => None,
+        TextRole::Header => Some(ContentBody::Header { text }),
+        TextRole::Footer => Some(ContentBody::Footer { text }),
+        TextRole::PageNumber => Some(ContentBody::PageNumber { text }),
+        TextRole::AsideText => Some(ContentBody::AsideText { text }),
+        TextRole::PageFootnote => Some(ContentBody::PageFootnote { text }),
         TextRole::Body
         | TextRole::List
         | TextRole::Index
