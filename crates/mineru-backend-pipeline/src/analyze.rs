@@ -32,6 +32,7 @@ use image::{imageops::crop_imm, RgbImage};
 use mineru_burn_common::backend::Cpu;
 use mineru_layout::LayoutDet;
 use mineru_pdf::{PageText, PdfiumLibrary, RenderOptions};
+use mineru_table::OcrSpan;
 use mineru_types::{
     Backend, BackendError, BBox, DocInput, Document, ImageRef, ImageWriter, Page, PageSize,
     ParseOptions,
@@ -56,6 +57,9 @@ struct Profile {
     ocr: Cell<Duration>,
     formula: Cell<Duration>,
     table_classify: Cell<Duration>,
+    /// OCR over table crops, kept separate from `ocr` (which covers text regions)
+    /// so the table stages' true cost is visible.
+    table_ocr: Cell<Duration>,
     table_recognize: Cell<Duration>,
 }
 
@@ -89,8 +93,9 @@ impl Profile {
         let ocr = self.ocr.get();
         let formula = self.formula.get();
         let t_cls = self.table_classify.get();
+        let t_ocr = self.table_ocr.get();
         let t_rec = self.table_recognize.get();
-        let table = t_cls + t_rec;
+        let table = t_cls + t_ocr + t_rec;
         let total = ras + nat + lay + ocr + formula + table;
         let pct = |d: Duration| {
             if total.is_zero() {
@@ -112,6 +117,7 @@ impl Profile {
             formula_s = formula.as_secs_f64(),
             formula_pct = pct(formula),
             table_classify_s = t_cls.as_secs_f64(),
+            table_ocr_s = t_ocr.as_secs_f64(),
             table_recognize_s = t_rec.as_secs_f64(),
             table_s = table.as_secs_f64(),
             table_pct = pct(table),
@@ -423,11 +429,16 @@ impl<B: BurnBackend> PipelineBackend<B> {
         // backend as the recognizers it dispatches to.
         let classified = mineru_table::classify::<Cpu>(&crop);
         profile.add(&profile.table_classify, t.elapsed());
+        // Cell text comes from OCR over the crop; without it both recognizers
+        // return their predicted grid with every cell empty.
+        let t = Instant::now();
+        let spans = self.table_spans(&crop);
+        profile.add(&profile.table_ocr, t.elapsed());
         let t = Instant::now();
         let html = match classified {
-            Ok(cls) => self.recognize_table_class(cls.class, &crop),
+            Ok(cls) => self.recognize_table_class(cls.class, &crop, &spans),
             // No classifier (model unavailable): try wireless as a default.
-            Err(_) => self.recognize_wireless(&crop),
+            Err(_) => self.recognize_wireless(&crop, &spans),
         };
         profile.add(&profile.table_recognize, t.elapsed());
         // Persist the table crop (best-effort) and mint its ref only when a sink is
@@ -447,24 +458,54 @@ impl<B: BurnBackend> PipelineBackend<B> {
     }
 
     /// Dispatches to the wired/wireless recognizer for a classified table.
+    ///
+    /// `spans` are the crop-local OCR detections both recognizers match onto the
+    /// structure they predict; see [`table_spans`](Self::table_spans).
     fn recognize_table_class(
         &self,
         class: mineru_table::TableClass,
         crop: &RgbImage,
+        spans: &[OcrSpan],
     ) -> Option<mineru_types::Html> {
         match class {
-            mineru_table::TableClass::Wireless => self.recognize_wireless(crop),
+            mineru_table::TableClass::Wireless => self.recognize_wireless(crop, spans),
             mineru_table::TableClass::Wired => self.models.table_wired.as_ref().and_then(|m| {
-                warn_on_err("wired", mineru_table::recognize_wired(m, crop, &[]))
+                warn_on_err("wired", mineru_table::recognize_wired(m, crop, spans))
             }),
         }
     }
 
     /// Wireless-table recognition, guarded on the loaded SLANet model.
-    fn recognize_wireless(&self, crop: &RgbImage) -> Option<mineru_types::Html> {
+    fn recognize_wireless(&self, crop: &RgbImage, spans: &[OcrSpan]) -> Option<mineru_types::Html> {
         self.models.table_wireless.as_ref().and_then(|m| {
-            warn_on_err("wireless", mineru_table::recognize_wireless(m, crop, &[]))
+            warn_on_err("wireless", mineru_table::recognize_wireless(m, crop, spans))
         })
+    }
+
+    /// OCRs a table crop into the spans the structure matcher fills cells from.
+    ///
+    /// Both table recognizers predict a cell grid and then assign each OCR span to
+    /// a cell by IoU against the predicted cell boxes, so the spans **must** be in
+    /// the same space those boxes are: crop-local pixels. That is what the
+    /// detector already returns here, so — unlike [`ocr_text`](Self::ocr_text),
+    /// which maps lines back to page points for the assembled `Document` — no
+    /// coordinate mapping is applied.
+    ///
+    /// Missing det/rec models yield no spans, which degrades a table to its
+    /// structure with empty cells rather than failing the region.
+    fn table_spans(&self, crop: &RgbImage) -> Vec<OcrSpan> {
+        let (Some(det), Some(rec)) = (&self.models.ocr_det, &self.models.ocr_rec) else {
+            return Vec::new();
+        };
+        det.detect(crop)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|line| {
+                let (line_crop, _, _) = crop_region(crop, &line)?;
+                let (text, score) = rec.recognize(&line_crop).ok()?;
+                Some(OcrSpan::new(line, text, score))
+            })
+            .collect()
     }
 
     /// Image/chart: record a stable [`ImageRef`] for the region.
