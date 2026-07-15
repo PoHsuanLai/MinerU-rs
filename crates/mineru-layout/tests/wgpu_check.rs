@@ -8,7 +8,7 @@
 //!     cargo test -p mineru-layout --features gpu --test wgpu_check -- --ignored --nocapture
 //! ```
 //!
-//! The test loads the *same* weights on both the CPU (`NdArray`) and GPU (`Wgpu`)
+//! The test loads the *same* weights on both the CPU (`Flex`) and GPU (`Wgpu`)
 //! backends, runs `detect` on both, and asserts the detections match: same count,
 //! same labels, same reading order, and boxes/scores within a small tolerance.
 //! This is the proof that the on-device threshold-sort/reading-order rewrites (and

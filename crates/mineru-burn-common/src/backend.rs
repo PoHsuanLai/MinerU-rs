@@ -5,22 +5,38 @@
 //! one place. The CPU backend ([`Cpu`]) is always available; the GPU backend
 //! ([`Gpu`]) is compiled only when the `gpu` feature is enabled.
 
-use burn::backend::NdArray;
-use burn::backend::ndarray::NdArrayDevice;
+use burn_flex::{Flex, FlexDevice};
 
-/// The default CPU backend: `ndarray` with `f32` elements.
+/// The default CPU backend: `flex` with `f32` elements.
 ///
 /// This backend requires no GPU toolchain and is used for development, tests, and
 /// as the fallback everywhere. Model crates should default to `Cpu` and only opt
 /// into [`Gpu`] behind their own feature flag.
-pub type Cpu = NdArray<f32>;
+///
+/// `flex` rather than `ndarray`: upstream marks `burn-ndarray` legacy in favour of
+/// this one, whose matmul goes through `gemm` instead of `matrixmultiply`. Measured
+/// on this project's real formula decode: 143.6 -> 60.1 ms/token (2.39x), same
+/// tokens out.
+pub type Cpu = Flex<f32>;
+
+/// The device type for the [`Cpu`] backend.
+///
+/// Exported so callers can name a device in a struct field or signature without
+/// importing the concrete backend's device type — naming that directly is what
+/// pinned four test files to `ndarray` and made swapping backends a source change
+/// rather than a one-line alias edit.
+pub type CpuDevice = FlexDevice;
 
 /// Returns the default device for the [`Cpu`] backend.
 ///
-/// `NdArray` is single-device, so this is always the CPU. Kept as a function
+/// `Flex` is single-device, so this is always the CPU. Kept as a function
 /// (rather than a `const`) to mirror the GPU case, where device selection is real.
-pub fn cpu_device() -> NdArrayDevice {
-    NdArrayDevice::default()
+pub fn cpu_device() -> CpuDevice {
+    // `FlexDevice` is a unit struct today, so clippy flags `default()` as
+    // redundant; going through the trait keeps callers working if it ever gains
+    // variants, as `NdArrayDevice` had.
+    #[allow(clippy::default_constructed_unit_structs)]
+    FlexDevice::default()
 }
 
 #[cfg(feature = "gpu")]

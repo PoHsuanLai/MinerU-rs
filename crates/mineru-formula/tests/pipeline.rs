@@ -9,7 +9,7 @@
 //!   been downloaded to `MINERU_FORMULA_MODEL_DIR`, so CI stays offline-clean.
 
 use burn::tensor::{Int, Tensor, TensorData};
-use mineru_burn_common::backend::{cpu_device, Cpu};
+use mineru_burn_common::backend::{cpu_device, Cpu, CpuDevice};
 use mineru_formula::config::UniMerNetConfig;
 use mineru_formula::model::UniMerNet;
 
@@ -75,7 +75,7 @@ fn greedy_loop_runs_end_to_end_with_random_weights() {
     struct Step<'a> {
         model: &'a UniMerNet<Cpu>,
         cache: mineru_formula::mbart::DecoderCache<Cpu>,
-        device: burn::backend::ndarray::NdArrayDevice,
+        device: CpuDevice,
         vocab: usize,
     }
     impl DecodeStep for Step<'_> {
@@ -84,7 +84,13 @@ fn greedy_loop_runs_end_to_end_with_random_weights() {
                 Tensor::from_data(TensorData::new(vec![token as i64], [1, 1]), &self.device);
             let logits = self.model.decode_step(input, position, &mut self.cache);
             let idx = logits.reshape([self.vocab]).argmax(0);
-            idx.into_data().to_vec::<i64>().expect("argmax to vec")[0] as u32
+            // `int_to_vec_i64`, not `to_vec::<i64>()`: no backend stores ints as
+            // `i64` (flex and wgpu both use `i32`), so the direct read is a dtype
+            // mismatch at runtime.
+            mineru_burn_common::host::int_to_vec_i64(idx)
+                .first()
+                .copied()
+                .unwrap_or_default() as u32
         }
     }
 

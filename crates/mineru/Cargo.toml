@@ -44,10 +44,10 @@ hybrid = ["pipeline", "vlm", "dep:mineru-backend-hybrid"]
 # feature to the pipeline crate and the shared harness (for the `Gpu` alias).
 gpu = ["pipeline", "mineru-backend-pipeline/gpu", "mineru-burn-common/gpu"]
 
-# Opt-in BLAS acceleration (Apple Accelerate) for the CPU backend. Unlike `gpu`
-# this needs no per-model plumbing: it swaps the matmul/conv kernels underneath
-# `burn-ndarray`, which every stage already shares. macOS only.
-accelerate = ["burn-common", "mineru-burn-common/accelerate"]
+# Opt-in Apple AMX matmul kernels for the CPU backend. Unlike `gpu` this needs no
+# per-model plumbing: it swaps the matmul kernels underneath the shared CPU
+# backend, which every stage already uses. Apple Silicon only.
+apple-amx = ["burn-common", "mineru-burn-common/apple-amx"]
 
 # Individual model crates, so a downstream user can pull just one.
 burn-common = ["dep:mineru-burn-common"]

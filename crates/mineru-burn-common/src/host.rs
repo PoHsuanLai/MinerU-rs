@@ -1,12 +1,17 @@
 //! Backend-portable host reads of tensor data.
 //!
 //! Copying a tensor to the host with `into_data().into_vec::<E>()` only succeeds
-//! when the *on-device* element type happens to equal `E`. That assumption holds
-//! for the CPU (`NdArray`) backend, whose ints are `i64` and floats `f32`, but
-//! **not** for `wgpu`, whose [`Gpu`](crate::backend::Gpu) alias stores ints as
-//! `i32`. On that backend `into_vec::<i64>()` returns [`DataError::TypeMismatch`]
-//! and any caller that swallowed the error into an empty/zeroed vec silently
-//! corrupted its result.
+//! when the *on-device* element type happens to equal `E`. **No** backend here
+//! stores ints as `i64`: both the CPU ([`Cpu`](crate::backend::Cpu), flex) and GPU
+//! ([`Gpu`](crate::backend::Gpu), wgpu) aliases use `i32`. On either,
+//! `into_vec::<i64>()` returns [`DataError::TypeMismatch`], and any caller that
+//! swallowed the error into an empty/zeroed vec silently corrupted its result.
+//!
+//! This module predates the flex switch, when the CPU backend's ints *were* `i64`
+//! and only wgpu diverged. That made `into_vec::<i64>()` work by luck on CPU and
+//! fail only on GPU — so the hazard was real but invisible in the default test run.
+//! Moving the CPU backend to flex turned it into a hard error everywhere, which is
+//! strictly better: there is no longer a configuration where the wrong call passes.
 //!
 //! These helpers read to a fixed host element type *regardless* of the backend's
 //! storage dtype by coercing through [`TensorData::convert`], which upcasts

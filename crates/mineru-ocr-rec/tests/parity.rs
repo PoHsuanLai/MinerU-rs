@@ -33,10 +33,9 @@
 
 use std::path::{Path, PathBuf};
 
-use burn::backend::ndarray::NdArrayDevice;
 use burn::tensor::{Tensor, TensorData};
 use image::{Rgb, RgbImage};
-use mineru_burn_common::backend::{cpu_device, Cpu};
+use mineru_burn_common::backend::{cpu_device, Cpu, CpuDevice};
 use mineru_ocr_rec::{CharDict, RecConfig, TextRecognizer};
 
 const H: u32 = 48;
@@ -58,7 +57,7 @@ fn make_image() -> RgbImage {
 
 /// Build the NCHW input tensor directly (no resize), matching Python `preprocess`:
 /// BGR channel order, `x/127.5 - 1`.
-fn make_input(device: &NdArrayDevice) -> Tensor<Cpu, 4> {
+fn make_input(device: &CpuDevice) -> Tensor<Cpu, 4> {
     let img = make_image();
     let (h, w) = (H as usize, W as usize);
     let mut data = vec![0.0_f32; 3 * h * w];

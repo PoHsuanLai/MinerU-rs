@@ -237,10 +237,10 @@ impl<B: Backend> UnetModel<B> {
         let mask = model.forward(x);
         let dims = mask.dims();
         let (h, w) = (dims[2], dims[3]);
-        let classes: Vec<i64> = mask
-            .into_data()
-            .into_vec::<i64>()
-            .map_err(|e| Error::Decode(format!("unet mask decode: {e:?}")))?;
+        // `int_to_vec_i64` coerces the backend's storage dtype; a direct
+        // `into_vec::<i64>()` is a dtype mismatch on every backend here, since flex
+        // and wgpu both store ints as `i32`.
+        let classes: Vec<i64> = mineru_burn_common::host::int_to_vec_i64(mask);
         Ok(SegMask {
             height: h,
             width: w,

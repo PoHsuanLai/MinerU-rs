@@ -8,14 +8,13 @@ repository.workspace = true
 description = "Shared Burn harness for MinerU model crates: backends, weight loading, preprocessing, and decode helpers."
 
 [dependencies]
-# Burn core, with the ndarray CPU backend enabled by default so every model
-# crate works out of the box with no GPU toolchain. The `autodiff` machinery is
-# not needed for inference, so we stay on default-features = false + explicit
-# feature selection to keep the dependency surface small.
-burn = { workspace = true, features = ["ndarray"] }
-# Pulls in `burn-ndarray`'s defaults (simd + multi-threads); see the workspace
-# manifest. `burn/ndarray` alone would enable the same crate with those off.
-burn-ndarray = { workspace = true }
+# Burn core. The `autodiff` machinery is not needed for inference, so we stay on
+# default-features = false + explicit feature selection to keep the dependency
+# surface small.
+burn = { workspace = true }
+# The CPU backend, depended on directly so its defaults (simd + rayon) apply; see
+# the workspace manifest.
+burn-flex = { workspace = true }
 # burn-store carries the PyTorch / safetensors readers plus key remapping and the
 # ApplyResult report we build the "all keys consumed" assertion on top of.
 burn-store = { workspace = true }
@@ -29,11 +28,11 @@ default = []
 # Opt-in GPU backend. Enabling this pulls in the wgpu backend and exposes the
 # `gpu` backend alias; it is never required for CPU inference or the test suite.
 gpu = ["burn/wgpu"]
-# Opt-in BLAS acceleration for the ndarray CPU backend, via Apple's Accelerate
-# framework. Without it `burn-ndarray` uses its own naive matmul on a single
-# thread; Accelerate dispatches the conv/matmul-heavy stages across cores. macOS
-# only (Accelerate is a system framework), which is why it is not a default.
-accelerate = ["burn/accelerate"]
+# Opt-in Apple AMX matmul kernels for the CPU backend. Replaces the old
+# `accelerate` feature, which drove `burn-ndarray`'s BLAS hook and became
+# meaningless when matmul moved to flex's `gemm`. Upstream marks this
+# experimental, so it is not a default. Apple Silicon only.
+apple-amx = ["burn-flex/apple-amx"]
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false }
