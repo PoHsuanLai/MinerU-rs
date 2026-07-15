@@ -11,7 +11,7 @@ description = "DBNet (PP-OCRv6) text-line detection for MinerU, ported to Burn."
 mineru-types.workspace = true
 mineru-burn-common = { workspace = true }
 
-burn = { version = "0.21", default-features = false, features = ["ndarray", "std"] }
+burn = { version = "0.21", default-features = false, features = ["std"] }
 
 image = { version = "0.25", default-features = false }
 imageproc = "0.27"

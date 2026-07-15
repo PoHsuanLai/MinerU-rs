@@ -17,7 +17,7 @@
 //!   shared by the detection and table post-processors.
 //! - **A uniform [`model::Model`] trait** and common [`nn`] blocks.
 //!
-//! All backends default to CPU (`ndarray`), so the crate and its tests build and
+//! All backends default to CPU (`flex`), so the crate and its tests build and
 //! run with no GPU toolchain.
 
 pub mod backend;

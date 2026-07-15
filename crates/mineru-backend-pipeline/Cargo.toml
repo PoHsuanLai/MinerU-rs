@@ -20,8 +20,8 @@ mineru-burn-common = { workspace = true }
 
 # Burn is needed only for its `Backend` trait bound on the generic
 # `PipelineBackend<B>`/`PipelineModels<B>`; the model crates carry the actual
-# backend implementations. `ndarray` for the default CPU backend.
-burn = { workspace = true, features = ["ndarray"] }
+# backend implementations, so no backend feature is enabled here.
+burn = { workspace = true }
 
 image = { version = "0.25", default-features = false }
 async-trait = "0.1"

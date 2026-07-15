@@ -40,12 +40,12 @@
 //!   --test unet_real -- --ignored --nocapture --test-threads=1
 //! ```
 //!
-//! Measured on-disk (release, ndarray CPU forward): the two masks agree on
+//! Measured on-disk (release, CPU forward): the two masks agree on
 //! **100.0%** of the 1024² pixels, so the gate asserts exact per-pixel equality.
 //!
 //! The `.bin`/`.shape` dumps are gitignored (regenerable). This test is
 //! `#[ignore]`d because it triggers a runtime weight fetch (or reuses the cache
-//! under `MINERU_MODELS_DIR`) and the ndarray CPU forward over a 1024² image is
+//! under `MINERU_MODELS_DIR`) and the CPU forward over a 1024² image is
 //! slow (minutes in debug — use `--release`). The models are always compiled, so
 //! no cargo feature is needed.
 
@@ -117,7 +117,7 @@ fn load_i32(name: &str) -> Option<Vec<i32>> {
 }
 
 #[test]
-#[ignore = "requires the UNet model files + reference dump on disk; slow ndarray forward"]
+#[ignore = "requires the UNet model files + reference dump on disk; slow CPU forward"]
 fn unet_matches_onnx_reference() {
     // Non-square on purpose: preprocess fits the long edge and keeps the aspect
     // ratio, so a square fixture would make a squashing bug invisible here.

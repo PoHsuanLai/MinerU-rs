@@ -13,11 +13,10 @@ mineru-burn-common = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
-# Burn deep-learning framework. The concrete backend (CPU ndarray) and the
-# weight-loading harness come from `mineru-burn-common`; this crate defines the
-# `burn::module::Module` graph. `ndarray` is enabled so the crate is usable and
-# testable standalone with no GPU toolchain.
-burn = { workspace = true, features = ["ndarray"] }
+# Burn deep-learning framework. The concrete backend and the weight-loading
+# harness come from `mineru-burn-common`; this crate only defines the
+# `burn::module::Module` graph, so it enables no backend feature of its own.
+burn = { workspace = true }
 
 # Tokenizer: the checkpoint ships an HF `tokenizer.json`, loaded via this crate.
 tokenizers = { version = "0.20", default-features = false, features = ["onig"] }

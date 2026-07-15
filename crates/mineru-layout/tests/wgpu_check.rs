@@ -94,7 +94,7 @@ fn wgpu_detect_matches_cpu() {
             c.score,
             g.score
         );
-        // Boxes are in PIXEL coordinates on a 1000x1400 page. wgpu and ndarray
+        // Boxes are in PIXEL coordinates on a 1000x1400 page. wgpu and the CPU backend
         // accumulate f32 in different orders (tiled-2D vs matrixmultiply kernels),
         // so raw coordinates differ by a fraction of a pixel — expected and not a
         // decision difference. The bar is a sane pixel tolerance (2 px ≈ 0.2% of the
