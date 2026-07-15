@@ -454,20 +454,17 @@ impl<B: BurnBackend> PipelineBackend<B> {
     ) -> Option<mineru_types::Html> {
         match class {
             mineru_table::TableClass::Wireless => self.recognize_wireless(crop),
-            mineru_table::TableClass::Wired => self
-                .models
-                .table_wired
-                .as_ref()
-                .and_then(|m| mineru_table::recognize_wired(m, crop, &[]).ok()),
+            mineru_table::TableClass::Wired => self.models.table_wired.as_ref().and_then(|m| {
+                warn_on_err("wired", mineru_table::recognize_wired(m, crop, &[]))
+            }),
         }
     }
 
     /// Wireless-table recognition, guarded on the loaded SLANet model.
     fn recognize_wireless(&self, crop: &RgbImage) -> Option<mineru_types::Html> {
-        self.models
-            .table_wireless
-            .as_ref()
-            .and_then(|m| mineru_table::recognize_wireless(m, crop, &[]).ok())
+        self.models.table_wireless.as_ref().and_then(|m| {
+            warn_on_err("wireless", mineru_table::recognize_wireless(m, crop, &[]))
+        })
     }
 
     /// Image/chart: record a stable [`ImageRef`] for the region.
@@ -498,6 +495,25 @@ impl<B: BurnBackend> PipelineBackend<B> {
         RegionContent {
             image: Some(ImageRef(name)),
             ..Default::default()
+        }
+    }
+}
+
+/// Logs a table-recognition failure and degrades to "unrecognized".
+///
+/// A table failure must not abort the parse, but it must not vanish either: the
+/// most common cause is the `.bpk` weight fetch failing (see
+/// `mineru_table::weights::DEFAULT_WEIGHTS_BASE`), and swallowing that silently
+/// leaves the user with tables missing from the output and no clue why.
+fn warn_on_err(
+    kind: &str,
+    result: mineru_table::Result<mineru_types::Html>,
+) -> Option<mineru_types::Html> {
+    match result {
+        Ok(html) => Some(html),
+        Err(e) => {
+            tracing::warn!(table = kind, error = %e, "table recognition failed; emitting no table");
+            None
         }
     }
 }

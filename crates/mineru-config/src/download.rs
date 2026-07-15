@@ -2,9 +2,18 @@
 //!
 //! On a clean machine the pipeline backend has no weights on disk. Rather than
 //! hard-erroring and forcing the user to provision them by hand, this module
-//! fetches any missing weight files from a public GitHub release and caches them
-//! under the resolved [`crate::Config::models_dir`], so `mineru <pdf>` works out
-//! of the box.
+//! fetches any missing weight files from the upstream Hugging Face repo and
+//! caches them under the resolved [`crate::Config::models_dir`], so
+//! `mineru <pdf>` works out of the box.
+//!
+//! # Why fetch from Hugging Face rather than mirror
+//!
+//! The weights are `opendatalab/PDF-Extract-Kit-1.0`, whose repo-level license is
+//! AGPL-3.0. Fetching each user's copy from the canonical upstream repo makes them
+//! the downloader and us a client — no redistribution, no license obligations we
+//! cannot meet (AGPL's "Corresponding Source" for model weights is unanswerable),
+//! and no mirror that drifts as upstream updates. It is also what upstream MinerU
+//! itself does.
 //!
 //! It mirrors the already-shipped PDFium auto-download
 //! (`mineru-pdf::download`): a base URL resolved from an env var (default
@@ -31,14 +40,21 @@ use std::path::Path;
 
 use crate::error::{Error, Result};
 
-/// Default base URL the pipeline weight files are fetched from.
+/// Default base URL the pipeline weight files are fetched from: the upstream
+/// Hugging Face repo, pinned to a revision.
 ///
-/// Matches the release-hosting style already used by `mineru-table`'s weight
-/// fetch (`.../releases/download/<tag>/`). The files are not hosted at this tag
-/// yet — the dev will publish them later; overridable via the `MINERU_MODELS_BASE`
-/// environment variable in the meantime.
-pub const DEFAULT_MODELS_BASE: &str =
-    "https://github.com/PoHsuanLai/MinerU-rs/releases/download/pipeline-models-v1/";
+/// `resolve/<rev>/` is the Hub's raw-file endpoint (it redirects to the LFS blob),
+/// so `{base}{relative}` addresses a weight by the same relative path the models
+/// directory uses on disk — no Hub API or listing call needed.
+///
+/// The revision is pinned to a **commit SHA** rather than `main` so a fresh
+/// install is reproducible and an upstream push cannot silently change the
+/// weights under an already-populated models dir (the fetch is skip-if-exists, so
+/// a moving `main` would mix revisions across files). The repo publishes no tags,
+/// so the SHA is the only stable handle. Bumping it is a deliberate, reviewable
+/// edit. Override the whole base with `MINERU_MODELS_BASE` (e.g. a ModelScope
+/// mirror or an internal cache).
+pub const DEFAULT_MODELS_BASE: &str = "https://huggingface.co/opendatalab/PDF-Extract-Kit-1.0/resolve/ed6b654c018d742e65a17671e379c5e6ecc87ec9/models/";
 
 /// The weight files required by the pipeline backend, as paths relative to the
 /// models directory root.
@@ -49,28 +65,34 @@ pub const DEFAULT_MODELS_BASE: &str =
 /// so the canonical relative-path list is duplicated here with this note rather
 /// than imported. `ModelPaths::under` carries a reciprocal comment.
 ///
-/// The two ONNX table models additionally need a sibling `<stem>.safetensors`
-/// (that is what `SlaNet::load` / the UNet loader actually read — the `.onnx` is
-/// the pipeline's path handle), so those `.safetensors` files are listed too.
+/// Every entry must exist in the upstream repo at [`DEFAULT_MODELS_BASE`]'s
+/// revision. Listing a file that upstream does not host makes every clean install
+/// log a 404 warning for a file that was never fetchable — so entries here are
+/// verified against the Hub, not assumed.
+///
+/// Deliberately **not** listed:
+/// - `OCR/paddleocr_torch/ppocrv6_dict.txt` — not in the upstream repo, and
+///   `mineru-ocr-rec` embeds the PP-OCRv6 dict via `include_str!` anyway, so
+///   nothing ever reads a fetched copy.
+/// - `TabRec/SlanetPlus/slanet-plus.safetensors` — not upstream either; it is
+///   *generated locally* from the sibling `.onnx` by
+///   `mineru-table/tests/reference/convert_slanet_weights.py`.
+/// - `TabRec/UnetStructure/unet.safetensors` — no such file upstream, and nothing
+///   loads it: `PipelineModels` builds the UNet with `UnetModel::new()`, and the
+///   real wired-table weights are fetched separately by `mineru-table` as `.bpk`.
 pub const REQUIRED_MODEL_FILES: &[&str] = &[
     // Layout: PP-DocLayoutV2 detector.
     "Layout/PP-DocLayoutV2/model.safetensors",
-    // OCR: PP-OCRv6 detector, recognizer, and character dict.
+    // OCR: PP-OCRv6 detector and recognizer (the dict is embedded — see above).
     "OCR/paddleocr_torch/ch_PP-OCRv6_small_det_infer.safetensors",
     "OCR/paddleocr_torch/ch_PP-OCRv6_small_rec_infer.safetensors",
-    // The v6 dict is OPTIONAL at load time: `mineru-ocr-rec` embeds a PP-OCRv6
-    // fallback and the pipeline loader only reads this file if it exists. It stays
-    // in the list because caching it locally is nice-to-have, but because the
-    // download is best-effort a 404/missing host for it merely warns.
-    "OCR/paddleocr_torch/ppocrv6_dict.txt",
     // Formula: UniMerNet checkpoint directory (two files).
     "MFR/unimernet_hf_small_2503/model.safetensors",
     "MFR/unimernet_hf_small_2503/tokenizer.json",
-    // Tables: the `.onnx` path handle plus the sibling `.safetensors` actually read.
+    // Tables: the ONNX graphs. `slanet-plus.onnx` is both the pipeline's path
+    // handle and the input the local `.safetensors` conversion is derived from.
     "TabRec/SlanetPlus/slanet-plus.onnx",
-    "TabRec/SlanetPlus/slanet-plus.safetensors",
     "TabRec/UnetStructure/unet.onnx",
-    "TabRec/UnetStructure/unet.safetensors",
 ];
 
 /// The base URL (with a guaranteed trailing `/`) weight files are fetched from.

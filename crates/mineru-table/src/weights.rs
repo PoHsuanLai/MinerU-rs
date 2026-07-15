@@ -29,6 +29,26 @@ use crate::error::{Error, Result};
 /// Default base URL for the release the `.bpk` weight files are fetched from.
 ///
 /// Overridable via the `MINERU_TABLE_WEIGHTS_BASE` environment variable.
+///
+/// # This release is currently unpublished
+///
+/// Unlike every other weight in the workspace, these two cannot be fetched from
+/// the upstream `opendatalab/PDF-Extract-Kit-1.0` repo: `.bpk` is Burn's native
+/// format, and these files are *conversions* of the upstream `unet.onnx` and
+/// `PP-LCNet_x1_0_table_cls.onnx`. Upstream hosts no `.bpk`, so there is nothing
+/// canonical to point at.
+///
+/// The release that hosted them was taken down pending a licensing question:
+/// PDF-Extract-Kit-1.0 is AGPL-3.0 at the repo level, which makes re-hosting a
+/// derivative of its weights an obligation we cannot currently meet. Until that
+/// is resolved, a fetch from this URL 404s and the table stages degrade to
+/// "unrecognized" (see [`weight_path`]'s caller in `mineru-backend-pipeline`,
+/// which treats a table-model failure as non-fatal).
+///
+/// To use the table stages meanwhile, point `MINERU_TABLE_WEIGHTS_BASE` at a host
+/// serving `lcnet_table_cls.bpk` and `unet.bpk`, or drop them into
+/// `<MINERU_MODELS_DIR>/table-weights-v1/` directly — [`weight_path`] returns any
+/// cached file without touching the network.
 pub const DEFAULT_WEIGHTS_BASE: &str =
     "https://github.com/PoHsuanLai/MinerU-rs/releases/download/table-weights-v1/";
 
