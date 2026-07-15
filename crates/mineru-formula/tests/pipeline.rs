@@ -105,193 +105,23 @@ fn greedy_loop_runs_end_to_end_with_random_weights() {
     assert!(decoded.tokens.len() <= 6);
 }
 
-/// KV-cache parity gate (weight-free, deterministic).
+/// Pins the reason this crate has **no** weight-free decoder gate.
 ///
-/// Runs the SAME in-memory model two ways over the same fake encoder grid and the
-/// same greedy driving order, and asserts the generated token sequences are
-/// **identical**:
-/// - REFERENCE: the non-cached path — at each step rebuild the full prefix and run
-///   [`UniMerNet::decode`], argmaxing the last position (this is exactly the old
-///   pre-cache decode loop, kept here as the oracle).
-/// - CACHED: the new [`UniMerNet::init_decode_cache`] + [`UniMerNet::decode_step`]
-///   incremental path.
+/// `PtLinear::init` zeroes its weights — sound for inference, where loading overwrites
+/// them immediately, but it means an unloaded [`UniMerNet`] is a zero map: every input
+/// produces identically zero logits. So a weight-free test of the decoder compares
+/// `[0.0, …]` against `[0.0, …]` and passes with the code under test arbitrarily
+/// broken. Two such tests (KV-cache parity and batch lane-independence) were removed
+/// after a mutation test — corrupting the cache's position offset — failed to make
+/// either one fail; both are covered on real weights by
+/// [`real_weights_kv_cache_token_parity`] and [`real_weights_batch_token_parity`].
 ///
-/// Because both share one model instance, any divergence is purely the cache logic —
-/// not weight randomness. Gating on the token *sequence* (not shapes/logits) is the
-/// only sound correctness check for an autoregressive decoder. We drive many steps so
-/// the growing self-attention cache is exercised well past length 1.
+/// This test exists so that trap cannot re-establish itself silently. If init ever
+/// produces live weights, `spread` goes non-zero and this fails loudly — at which
+/// point a weight-free decoder gate becomes worth writing, and this test should be
+/// replaced by one.
 #[test]
-fn kv_cache_matches_non_cached_token_sequence() {
-    use mineru_formula::mbart::DecoderCache;
-
-    let device = cpu_device();
-    let cfg = UniMerNetConfig::small_2503();
-    let model = UniMerNet::<Cpu>::new(&cfg, &device);
-
-    // A non-trivial fake encoder grid so cross-attention actually varies.
-    let (l, d) = (10usize, cfg.decoder.d_model);
-    let n = (l * d) as i64;
-    let enc_data: Vec<f32> = (0..n).map(|i| ((i % 37) as f32 - 18.0) * 0.01).collect();
-    let enc: Tensor<Cpu, 3> =
-        Tensor::from_data(TensorData::new(enc_data, [1, l, d]), &device);
-
-    let vocab = cfg.decoder.vocab_size;
-    let start = cfg.decoder.bos_token_id as u32;
-    // Force a fixed number of steps regardless of what EOS the random weights emit,
-    // so the two paths are compared over a long, identical horizon.
-    let steps = 24usize;
-
-    // REFERENCE: non-cached, full-prefix rebuild each step.
-    let reference: Vec<u32> = {
-        let mut ids = vec![start];
-        let mut out = Vec::new();
-        for _ in 0..steps {
-            let t = ids.len();
-            let data: Vec<i64> = ids.iter().map(|&x| x as i64).collect();
-            let input: Tensor<Cpu, 2, Int> =
-                Tensor::from_data(TensorData::new(data, [1, t]), &device);
-            let logits = model.decode(input, enc.clone());
-            let idx = logits.narrow(1, t - 1, 1).reshape([vocab]).argmax(0);
-            let next = idx.into_data().to_vec::<i64>().expect("argmax to vec")[0] as u32;
-            out.push(next);
-            ids.push(next);
-        }
-        out
-    };
-
-    // CACHED: incremental path.
-    let cached: Vec<u32> = {
-        let mut cache: DecoderCache<Cpu> = model.init_decode_cache(enc.clone());
-        let mut out = Vec::new();
-        let mut token = start;
-        for position in 0..steps {
-            let input: Tensor<Cpu, 2, Int> =
-                Tensor::from_data(TensorData::new(vec![token as i64], [1, 1]), &device);
-            let logits = model.decode_step(input, position, &mut cache);
-            let idx = logits.reshape([vocab]).argmax(0);
-            let next = idx.into_data().to_vec::<i64>().expect("argmax to vec")[0] as u32;
-            out.push(next);
-            token = next;
-        }
-        out
-    };
-
-    assert_eq!(
-        reference, cached,
-        "KV-cached decode diverged from the non-cached reference token sequence"
-    );
-}
-
-/// Batch lane-independence gate (weight-free, deterministic, runs in CI).
-///
-/// Drives `decode_step` with an N-lane batch and, separately, with N one-lane decodes
-/// over the same per-lane encoder grids and the same fed tokens, and asserts each
-/// lane's **logits are bit-identical** between the two. This is the cross-talk check:
-/// if batching ever let row `i` see row `j`'s keys/values — a mask that mixes instead
-/// of broadcasting, a reshape that folds the batch into another dim — a batched lane's
-/// logits would drift from its solo run here, on every commit, with no checkpoint.
-///
-/// # Why logits and not token ids here
-/// A freshly-initialised [`UniMerNet`] emits **identically zero** logits (the untrained
-/// LM head annihilates the signal), so with random weights every lane argmaxes to token
-/// 0 no matter what it was fed. A token-sequence comparison would therefore be vacuous
-/// — all-zeros vs all-zeros — and would pass with batching totally broken. The hidden
-/// state *is* lane-dependent, so the pre-argmax logits are the live signal at this
-/// weight regime. This does not weaken the gate: exact equality on the full logits row
-/// is strictly stronger than equality of its argmax. Token-id parity on real weights,
-/// where the LM head is meaningful, is covered by `real_weights_batch_token_parity`.
-///
-/// Distinct per-lane hidden states are asserted as a precondition below: with the
-/// lanes indistinguishable, cross-talk would be invisible.
-#[test]
-fn batched_decode_step_matches_per_lane_decodes() {
-    let device = cpu_device();
-    let cfg = UniMerNetConfig::small_2503();
-    let model = UniMerNet::<Cpu>::new(&cfg, &device);
-
-    let (lanes, l, d) = (4usize, 10usize, cfg.decoder.d_model);
-    let steps = 12usize;
-
-    // One clearly different encoder grid per lane.
-    let lane_grid = |lane: usize| -> Tensor<Cpu, 3> {
-        let phase = lane as f32 * 1.7;
-        let scale = 0.05 * (1.0 + lane as f32);
-        let data: Vec<f32> = (0..(l * d))
-            .map(|i| ((i as f32 * 0.031 + phase).sin() + phase.cos()) * scale)
-            .collect();
-        Tensor::from_data(TensorData::new(data, [1, l, d]), &device)
-    };
-    // A distinct token stream per lane, so the self-attention cache (not just the
-    // cross-attention grid) differs across rows too.
-    let lane_token = |lane: usize, position: usize| -> i64 { ((lane * 7 + position * 3) % 50) as i64 };
-
-    // Cross-attention K/V are what carry the encoder grid into the decoder; if the
-    // grids collapsed to the same values the lanes would be trivially equal.
-    let mut grid_sigs: Vec<Vec<u32>> = Vec::new();
-    for lane in 0..lanes {
-        let v = lane_grid(lane).into_data().to_vec::<f32>().expect("grid to vec");
-        grid_sigs.push(v.iter().map(|x| x.to_bits()).collect());
-    }
-    let distinct_grids: std::collections::HashSet<_> = grid_sigs.iter().collect();
-    assert_eq!(
-        distinct_grids.len(),
-        lanes,
-        "per-lane encoder grids are not distinct; the test cannot see cross-talk"
-    );
-
-    // SOLO: each lane decoded on its own, batch dim 1. Collect every step's logits row.
-    let solo: Vec<Vec<Vec<f32>>> = (0..lanes)
-        .map(|lane| {
-            let mut cache = model.init_decode_cache(lane_grid(lane));
-            let mut rows = Vec::new();
-            for position in 0..steps {
-                let input: Tensor<Cpu, 2, Int> = Tensor::from_data(
-                    TensorData::new(vec![lane_token(lane, position)], [1, 1]),
-                    &device,
-                );
-                let logits = model.decode_step(input, position, &mut cache);
-                rows.push(logits.into_data().to_vec::<f32>().expect("logits to vec"));
-            }
-            rows
-        })
-        .collect();
-
-    // BATCHED: all lanes at once, one shared cache, same grids and same fed tokens.
-    let batched: Vec<Vec<Vec<f32>>> = {
-        let grids: Vec<Tensor<Cpu, 3>> = (0..lanes).map(lane_grid).collect();
-        let enc = Tensor::cat(grids, 0); // [lanes, l, d]
-        let mut cache = model.init_decode_cache(enc);
-        let mut out: Vec<Vec<Vec<f32>>> = vec![Vec::new(); lanes];
-        for position in 0..steps {
-            let data: Vec<i64> = (0..lanes).map(|lane| lane_token(lane, position)).collect();
-            let input: Tensor<Cpu, 2, Int> =
-                Tensor::from_data(TensorData::new(data, [lanes, 1]), &device);
-            let logits = model.decode_step(input, position, &mut cache); // [lanes, vocab]
-            let flat = logits.into_data().to_vec::<f32>().expect("logits to vec");
-            let vocab = flat.len() / lanes;
-            for (lane, slot) in out.iter_mut().enumerate() {
-                slot.push(flat[lane * vocab..(lane + 1) * vocab].to_vec());
-            }
-        }
-        out
-    };
-
-    for lane in 0..lanes {
-        assert_eq!(
-            solo[lane], batched[lane],
-            "lane {lane} diverged when batched: batching leaked state across rows"
-        );
-    }
-}
-
-/// Documents the weight-regime trap that shapes the CI batch test above: a freshly
-/// initialised [`UniMerNet`] emits **identically zero** logits, so ANY token-level
-/// assertion over random weights is vacuous (every lane argmaxes to token 0 regardless
-/// of input). Pinning it here means that if Burn's init ever changes to produce live
-/// logits, this test fails loudly and the CI gate above can be upgraded from logits to
-/// token ids — rather than the trap silently persisting.
-#[test]
-fn random_weights_produce_degenerate_logits() {
+fn unloaded_model_emits_zero_logits_so_weight_free_gates_are_vacuous() {
     let device = cpu_device();
     let cfg = UniMerNetConfig::small_2503();
     let model = UniMerNet::<Cpu>::new(&cfg, &device);
@@ -309,8 +139,8 @@ fn random_weights_produce_degenerate_logits() {
         - v.iter().cloned().fold(f32::MAX, f32::min);
     assert_eq!(
         spread, 0.0,
-        "random-weights logits are no longer degenerate (spread {spread}); the CI batch \
-         test can now assert token ids instead of logits"
+        "an unloaded model now emits live logits (spread {spread}); a weight-free \
+         decoder gate is finally worth writing — add one and delete this test"
     );
 }
 

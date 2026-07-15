@@ -232,10 +232,14 @@ impl<B: BurnBackend> PipelineBackend<B> {
         };
         profile.add(&profile.layout, t.elapsed());
 
-        let regions: Vec<Region> = dets
+        let mut regions: Vec<Region> = dets
             .into_iter()
             .map(|det| self.recognize_region(index, det, image, scale, page_text, sink, profile))
             .collect();
+
+        let t = Instant::now();
+        self.fill_formulas(&mut regions, image, scale);
+        profile.add(&profile.formula, t.elapsed());
 
         let assembled = PageAssembler.assemble(regions);
         let blocks = merge_paragraphs(assembled.blocks);
@@ -278,18 +282,10 @@ impl<B: BurnBackend> PipelineBackend<B> {
                 profile.add(&profile.ocr, t.elapsed());
                 c
             }
-            RegionKind::Equation => {
-                let t = Instant::now();
-                let c = self.recognize_formula(&pixel_bbox, image);
-                profile.add(&profile.formula, t.elapsed());
-                c
-            }
-            RegionKind::InlineFormula => {
-                let t = Instant::now();
-                let c = self.recognize_inline_formula(&pixel_bbox, image);
-                profile.add(&profile.formula, t.elapsed());
-                c
-            }
+            // Formulas are left empty here and filled by `fill_formulas` after the
+            // whole page is mapped, so every crop on the page decodes in one batched
+            // pass instead of one model call each.
+            RegionKind::Equation | RegionKind::InlineFormula => RegionContent::default(),
             RegionKind::Table => self.recognize_table(page, &det, &pixel_bbox, image, sink, profile),
             RegionKind::Image | RegionKind::Chart => {
                 self.crop_image(page, &det, &pixel_bbox, image, sink)
@@ -378,37 +374,70 @@ impl<B: BurnBackend> PipelineBackend<B> {
         }
     }
 
-    /// Formula: recognize LaTeX for the display-formula crop.
-    fn recognize_formula(&self, pixel_bbox: &BBox, image: &RgbImage) -> RegionContent {
-        let Some(model) = &self.models.formula else {
-            return RegionContent::default();
-        };
-        let Some((crop, _, _)) = crop_region(image, pixel_bbox) else {
-            return RegionContent::default();
-        };
-        RegionContent {
-            latex: model.predict(&crop).ok(),
-            ..Default::default()
-        }
-    }
-
-    /// Inline formula: recognize LaTeX for the inline-formula crop.
+    /// Recognizes every formula on the page in one batched decode and fills the
+    /// results into their regions.
     ///
-    /// Runs the same MFR model as [`recognize_formula`](Self::recognize_formula)
-    /// (Python feeds `inline_formula` and `display_formula` dets to one MFR batch —
-    /// `batch_analyze.py`), but stores the result in
-    /// [`RegionContent::inline_latex`] so the assembler folds it into the
-    /// surrounding text block as an inline `$…$` span rather than a `$$…$$` block.
-    fn recognize_inline_formula(&self, pixel_bbox: &BBox, image: &RgbImage) -> RegionContent {
+    /// Display and inline formulas go through the same model and the same batch —
+    /// as they do in the reference, which feeds both labels to one MFR call — and
+    /// differ only in which [`RegionContent`] field receives the LaTeX. The
+    /// assembler folds `inline_latex` into the surrounding text as `$…$` and
+    /// `latex` into a standalone `$$…$$` block.
+    ///
+    /// Batching is what makes this worth the two-pass shape: the decoder is
+    /// autoregressive, so at batch 1 its matmuls are matrix-vector and the model
+    /// weights are re-read for every crop. One call per page amortizes that read
+    /// across the page's formulas.
+    ///
+    /// A crop that fails to preprocess yields `None` for that lane alone and leaves
+    /// its region empty, which is what the per-crop path did with `.ok()`.
+    fn fill_formulas(&self, regions: &mut [Region], image: &RgbImage, scale: f32) {
         let Some(model) = &self.models.formula else {
-            return RegionContent::default();
+            return;
         };
-        let Some((crop, _, _)) = crop_region(image, pixel_bbox) else {
-            return RegionContent::default();
+
+        // Region bboxes are in page points by now; the crop has to come from the
+        // pixel raster, so undo the scaling `recognize_region` applied.
+        let mut lanes: Vec<(usize, RgbImage)> = Vec::new();
+        for (i, region) in regions.iter().enumerate() {
+            match RegionKind::classify(region.det.label) {
+                RegionKind::Equation | RegionKind::InlineFormula => {}
+                _ => continue,
+            }
+            let pixel_bbox = scale_bbox(region.det.bbox, scale);
+            if let Some((crop, _, _)) = crop_region(image, &pixel_bbox) {
+                lanes.push((i, crop));
+            }
+        }
+        if lanes.is_empty() {
+            return;
+        }
+
+        let crops: Vec<RgbImage> = lanes.iter().map(|(_, crop)| crop.clone()).collect();
+        let results = match model.predict_batch(&crops) {
+            Ok(results) => results,
+            Err(e) => {
+                tracing::warn!(error = %e, "batched formula decode failed; page has no formulas");
+                return;
+            }
         };
-        RegionContent {
-            inline_latex: model.predict(&crop).ok(),
-            ..Default::default()
+        if results.len() != lanes.len() {
+            tracing::warn!(
+                got = results.len(),
+                want = lanes.len(),
+                "batched formula decode returned the wrong lane count; page has no formulas"
+            );
+            return;
+        }
+
+        for ((region_index, _), latex) in lanes.iter().zip(results) {
+            let Some(latex) = latex else { continue };
+            let Some(region) = regions.get_mut(*region_index) else {
+                continue;
+            };
+            match RegionKind::classify(region.det.label) {
+                RegionKind::InlineFormula => region.content.inline_latex = Some(latex),
+                _ => region.content.latex = Some(latex),
+            }
         }
     }
 
