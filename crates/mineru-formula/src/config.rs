@@ -155,8 +155,15 @@ impl MBartConfig {
     }
 }
 
+/// Number of crops decoded together by the batched entry point.
+///
+/// Matches the Python reference's `batch_size=16`. Every lane in a batch runs until
+/// the *longest* one finishes, so oversized batches waste work on short formulas;
+/// 16 is the reference's balance point.
+const DEFAULT_BATCH_SIZE: usize = 16;
+
 /// Full model configuration: the encoder + decoder pair plus the decode budget.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct UniMerNetConfig {
     /// Swin encoder config.
     pub encoder: SwinConfig,
@@ -166,6 +173,20 @@ pub struct UniMerNetConfig {
     /// entry point caps this at 1152/1344 depending on batch size; we use a single
     /// conservative bound here.
     pub max_new_tokens: usize,
+    /// How many crops [`crate::FormulaRecognizer::predict_batch`] decodes per batch.
+    /// Defaults to [`DEFAULT_BATCH_SIZE`] (16, matching the Python reference).
+    pub batch_size: usize,
+}
+
+impl Default for UniMerNetConfig {
+    fn default() -> Self {
+        Self {
+            encoder: SwinConfig::default(),
+            decoder: MBartConfig::default(),
+            max_new_tokens: 0,
+            batch_size: DEFAULT_BATCH_SIZE,
+        }
+    }
 }
 
 impl UniMerNetConfig {
@@ -173,9 +194,8 @@ impl UniMerNetConfig {
     /// generation budget (the small-batch cap in the Python reference).
     pub fn small_2503() -> Self {
         Self {
-            encoder: SwinConfig::default(),
-            decoder: MBartConfig::default(),
             max_new_tokens: 1152,
+            ..Self::default()
         }
     }
 }

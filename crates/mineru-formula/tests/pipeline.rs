@@ -182,6 +182,138 @@ fn kv_cache_matches_non_cached_token_sequence() {
     );
 }
 
+/// Batch lane-independence gate (weight-free, deterministic, runs in CI).
+///
+/// Drives `decode_step` with an N-lane batch and, separately, with N one-lane decodes
+/// over the same per-lane encoder grids and the same fed tokens, and asserts each
+/// lane's **logits are bit-identical** between the two. This is the cross-talk check:
+/// if batching ever let row `i` see row `j`'s keys/values — a mask that mixes instead
+/// of broadcasting, a reshape that folds the batch into another dim — a batched lane's
+/// logits would drift from its solo run here, on every commit, with no checkpoint.
+///
+/// # Why logits and not token ids here
+/// A freshly-initialised [`UniMerNet`] emits **identically zero** logits (the untrained
+/// LM head annihilates the signal), so with random weights every lane argmaxes to token
+/// 0 no matter what it was fed. A token-sequence comparison would therefore be vacuous
+/// — all-zeros vs all-zeros — and would pass with batching totally broken. The hidden
+/// state *is* lane-dependent, so the pre-argmax logits are the live signal at this
+/// weight regime. This does not weaken the gate: exact equality on the full logits row
+/// is strictly stronger than equality of its argmax. Token-id parity on real weights,
+/// where the LM head is meaningful, is covered by `real_weights_batch_token_parity`.
+///
+/// Distinct per-lane hidden states are asserted as a precondition below: with the
+/// lanes indistinguishable, cross-talk would be invisible.
+#[test]
+fn batched_decode_step_matches_per_lane_decodes() {
+    let device = cpu_device();
+    let cfg = UniMerNetConfig::small_2503();
+    let model = UniMerNet::<Cpu>::new(&cfg, &device);
+
+    let (lanes, l, d) = (4usize, 10usize, cfg.decoder.d_model);
+    let steps = 12usize;
+
+    // One clearly different encoder grid per lane.
+    let lane_grid = |lane: usize| -> Tensor<Cpu, 3> {
+        let phase = lane as f32 * 1.7;
+        let scale = 0.05 * (1.0 + lane as f32);
+        let data: Vec<f32> = (0..(l * d))
+            .map(|i| ((i as f32 * 0.031 + phase).sin() + phase.cos()) * scale)
+            .collect();
+        Tensor::from_data(TensorData::new(data, [1, l, d]), &device)
+    };
+    // A distinct token stream per lane, so the self-attention cache (not just the
+    // cross-attention grid) differs across rows too.
+    let lane_token = |lane: usize, position: usize| -> i64 { ((lane * 7 + position * 3) % 50) as i64 };
+
+    // Cross-attention K/V are what carry the encoder grid into the decoder; if the
+    // grids collapsed to the same values the lanes would be trivially equal.
+    let mut grid_sigs: Vec<Vec<u32>> = Vec::new();
+    for lane in 0..lanes {
+        let v = lane_grid(lane).into_data().to_vec::<f32>().expect("grid to vec");
+        grid_sigs.push(v.iter().map(|x| x.to_bits()).collect());
+    }
+    let distinct_grids: std::collections::HashSet<_> = grid_sigs.iter().collect();
+    assert_eq!(
+        distinct_grids.len(),
+        lanes,
+        "per-lane encoder grids are not distinct; the test cannot see cross-talk"
+    );
+
+    // SOLO: each lane decoded on its own, batch dim 1. Collect every step's logits row.
+    let solo: Vec<Vec<Vec<f32>>> = (0..lanes)
+        .map(|lane| {
+            let mut cache = model.init_decode_cache(lane_grid(lane));
+            let mut rows = Vec::new();
+            for position in 0..steps {
+                let input: Tensor<Cpu, 2, Int> = Tensor::from_data(
+                    TensorData::new(vec![lane_token(lane, position)], [1, 1]),
+                    &device,
+                );
+                let logits = model.decode_step(input, position, &mut cache);
+                rows.push(logits.into_data().to_vec::<f32>().expect("logits to vec"));
+            }
+            rows
+        })
+        .collect();
+
+    // BATCHED: all lanes at once, one shared cache, same grids and same fed tokens.
+    let batched: Vec<Vec<Vec<f32>>> = {
+        let grids: Vec<Tensor<Cpu, 3>> = (0..lanes).map(lane_grid).collect();
+        let enc = Tensor::cat(grids, 0); // [lanes, l, d]
+        let mut cache = model.init_decode_cache(enc);
+        let mut out: Vec<Vec<Vec<f32>>> = vec![Vec::new(); lanes];
+        for position in 0..steps {
+            let data: Vec<i64> = (0..lanes).map(|lane| lane_token(lane, position)).collect();
+            let input: Tensor<Cpu, 2, Int> =
+                Tensor::from_data(TensorData::new(data, [lanes, 1]), &device);
+            let logits = model.decode_step(input, position, &mut cache); // [lanes, vocab]
+            let flat = logits.into_data().to_vec::<f32>().expect("logits to vec");
+            let vocab = flat.len() / lanes;
+            for (lane, slot) in out.iter_mut().enumerate() {
+                slot.push(flat[lane * vocab..(lane + 1) * vocab].to_vec());
+            }
+        }
+        out
+    };
+
+    for lane in 0..lanes {
+        assert_eq!(
+            solo[lane], batched[lane],
+            "lane {lane} diverged when batched: batching leaked state across rows"
+        );
+    }
+}
+
+/// Documents the weight-regime trap that shapes the CI batch test above: a freshly
+/// initialised [`UniMerNet`] emits **identically zero** logits, so ANY token-level
+/// assertion over random weights is vacuous (every lane argmaxes to token 0 regardless
+/// of input). Pinning it here means that if Burn's init ever changes to produce live
+/// logits, this test fails loudly and the CI gate above can be upgraded from logits to
+/// token ids — rather than the trap silently persisting.
+#[test]
+fn random_weights_produce_degenerate_logits() {
+    let device = cpu_device();
+    let cfg = UniMerNetConfig::small_2503();
+    let model = UniMerNet::<Cpu>::new(&cfg, &device);
+
+    let (l, d) = (10usize, cfg.decoder.d_model);
+    let data: Vec<f32> = (0..(l * d)).map(|i| (i as f32 * 0.031).sin()).collect();
+    let enc: Tensor<Cpu, 3> = Tensor::from_data(TensorData::new(data, [1, l, d]), &device);
+
+    let ids: Tensor<Cpu, 2, Int> =
+        Tensor::from_data(TensorData::new(vec![cfg.decoder.bos_token_id as i64], [1, 1]), &device);
+    let logits = model.decode(ids, enc);
+    let v = logits.into_data().to_vec::<f32>().expect("logits to vec");
+
+    let spread = v.iter().cloned().fold(f32::MIN, f32::max)
+        - v.iter().cloned().fold(f32::MAX, f32::min);
+    assert_eq!(
+        spread, 0.0,
+        "random-weights logits are no longer degenerate (spread {spread}); the CI batch \
+         test can now assert token ids instead of logits"
+    );
+}
+
 /// Real-weights smoke test. Ignored by default: set `MINERU_FORMULA_MODEL_DIR` to
 /// a directory containing `model.safetensors` + `tokenizer.json` and run with
 /// `--ignored` to exercise the actual load + a real prediction.
@@ -272,6 +404,174 @@ fn real_weights_kv_cache_token_parity() {
         "real-weights KV-cache parity OK: {} tokens byte-identical",
         cached.len()
     );
+}
+
+/// Decodes one raw-RGB8 crop dump: 8-byte little-endian header (`u32` width, `u32`
+/// height) then `width*height*3` RGB bytes. Same convention as `MINERU_FORMULA_CROP`;
+/// see that test for why file-format decoding is sidestepped.
+#[cfg(test)]
+fn read_raw_crop(path: &std::path::Path) -> image::RgbImage {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read crop {path:?}: {e}"));
+    assert!(bytes.len() > 8, "crop {path:?} is too short to hold a header");
+    let w = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let h = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    let pixels = bytes[8..].to_vec();
+    assert_eq!(
+        pixels.len(),
+        (w * h * 3) as usize,
+        "raw RGB payload of {path:?} does not match {w}x{h}"
+    );
+    image::RgbImage::from_raw(w, h, pixels).expect("build RgbImage from raw")
+}
+
+/// Loads every `*.bin` raw-RGB8 crop in `MINERU_FORMULA_CROP_DIR`, sorted by filename
+/// for a deterministic corpus. Same dump format as `MINERU_FORMULA_CROP`, extended to
+/// a directory so the batch gate can exercise >16 real crops.
+#[cfg(test)]
+fn load_crop_corpus() -> Vec<image::RgbImage> {
+    let dir = std::env::var("MINERU_FORMULA_CROP_DIR")
+        .expect("set MINERU_FORMULA_CROP_DIR to a directory of raw-RGB8 crop dumps");
+    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("read dir {dir}: {e}"))
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "bin"))
+        .collect();
+    paths.sort();
+    paths.iter().map(|p| read_raw_crop(p)).collect()
+}
+
+/// **Real-weights batch parity gate.** Ignored by default.
+///
+/// The correctness contract for batched formula recognition: decoding N real crops as
+/// batches must produce **byte-identical token ids** to decoding each one alone. Set
+/// `MINERU_FORMULA_MODEL_DIR` to the checkpoint and `MINERU_FORMULA_CROP_DIR` to a
+/// directory of raw-RGB8 crop dumps (see [`read_raw_crop`]).
+///
+/// Why token ids and not LaTeX or logits: LaTeX hides a divergence that re-converges
+/// (two different token paths detokenising to the same string), and "logits are close"
+/// hides an argmax flip that sends an autoregressive decoder down a different branch
+/// entirely. Only the emitted id sequence is a sound gate.
+///
+/// The differing-lengths precondition is load-bearing: if every crop decoded to the
+/// same length, ragged EOS — the exact thing the done-mask implements — would never be
+/// exercised and this test would pass with the mask completely broken.
+#[test]
+#[ignore = "requires the unimernet_hf_small_2503 checkpoint and a crop corpus on disk"]
+fn real_weights_batch_token_parity() {
+    use mineru_burn_common::weights::Coverage;
+    use mineru_formula::FormulaRecognizer;
+    use std::collections::HashSet;
+
+    let dir = std::env::var("MINERU_FORMULA_MODEL_DIR")
+        .expect("set MINERU_FORMULA_MODEL_DIR to the checkpoint directory");
+    let recognizer = FormulaRecognizer::<Cpu>::from_pretrained(&dir, Coverage::Strict)
+        .expect("load recognizer");
+
+    let images = load_crop_corpus();
+    // >16 crops so decoding spans multiple batches: a chunk-boundary or reorder bug
+    // is invisible in a single full batch.
+    assert!(
+        images.len() > 16,
+        "need >16 crops to cross the default batch_size=16 boundary, got {}",
+        images.len()
+    );
+
+    let t_sequential = std::time::Instant::now();
+    let sequential: Vec<Vec<u32>> = images
+        .iter()
+        .map(|img| recognizer.predict_token_ids(img).expect("sequential decode"))
+        .collect();
+    let t_sequential = t_sequential.elapsed();
+
+    // Precondition: without ragged lengths the done-mask is never exercised.
+    let lengths: HashSet<usize> = sequential.iter().map(Vec::len).collect();
+    assert!(
+        lengths.len() > 1,
+        "corpus does not exercise ragged EOS: all {} crops decode to the same length",
+        sequential.len()
+    );
+
+    let t_batched = std::time::Instant::now();
+    let batched = recognizer
+        .predict_token_ids_batch(&images)
+        .expect("batched decode");
+    let t_batched = t_batched.elapsed();
+
+    assert_eq!(
+        batched.len(),
+        sequential.len(),
+        "batched decode returned {} lanes for {} inputs",
+        batched.len(),
+        sequential.len()
+    );
+    for (i, (want, got)) in sequential.iter().zip(batched.iter()).enumerate() {
+        assert_eq!(
+            want, got,
+            "crop {i} diverged: sequential {} tokens vs batched {} tokens",
+            want.len(),
+            got.len()
+        );
+    }
+    assert_eq!(sequential, batched, "batched decode diverged from sequential");
+
+    // Reported, never asserted: a timing threshold would make this flake on a busy
+    // machine, and the point of this test is parity. The ratio is here so the win is
+    // reproducible from a test run rather than an ad-hoc benchmark.
+    println!(
+        "batched {:.1}s vs sequential {:.1}s over {} crops ({:.2}x)",
+        t_batched.as_secs_f64(),
+        t_sequential.as_secs_f64(),
+        images.len(),
+        t_sequential.as_secs_f64() / t_batched.as_secs_f64().max(f64::MIN_POSITIVE),
+    );
+    println!(
+        "real-weights batch parity OK: {} crops byte-identical, lengths {:?}",
+        sequential.len(),
+        {
+            let mut l: Vec<usize> = lengths.into_iter().collect();
+            l.sort_unstable();
+            l
+        }
+    );
+}
+
+/// Real-weights batch-of-one check. Ignored by default. The degenerate batch must
+/// agree with the scalar entry point — this isolates the stacking/argmax plumbing
+/// (`[1,1,H,W]` build, `argmax(1)`, single readback) from any ragged-EOS logic.
+#[test]
+#[ignore = "requires the unimernet_hf_small_2503 checkpoint on disk"]
+fn batch_of_one_matches_predict() {
+    use mineru_burn_common::weights::Coverage;
+    use mineru_formula::FormulaRecognizer;
+
+    let dir = std::env::var("MINERU_FORMULA_MODEL_DIR")
+        .expect("set MINERU_FORMULA_MODEL_DIR to the checkpoint directory");
+    let recognizer = FormulaRecognizer::<Cpu>::from_pretrained(&dir, Coverage::Strict)
+        .expect("load recognizer");
+
+    let img = match std::env::var("MINERU_FORMULA_CROP") {
+        Ok(path) => read_raw_crop(std::path::Path::new(&path)),
+        Err(_) => image::RgbImage::from_pixel(320, 64, image::Rgb([255, 255, 255])),
+    };
+
+    let scalar = recognizer.predict_token_ids(&img).expect("scalar decode");
+    let batched = recognizer
+        .predict_token_ids_batch(std::slice::from_ref(&img))
+        .expect("batch-of-one decode");
+    assert_eq!(batched.len(), 1);
+    assert_eq!(scalar, batched[0], "batch-of-one diverged from predict");
+
+    let latex_scalar = recognizer.predict(&img).expect("scalar predict");
+    let latex_batched = recognizer
+        .predict_batch(std::slice::from_ref(&img))
+        .expect("batch predict");
+    assert_eq!(latex_batched.len(), 1);
+    assert_eq!(
+        Some(latex_scalar.0.clone()),
+        latex_batched[0].as_ref().map(|l| l.0.clone()),
+        "batch-of-one LaTeX diverged from predict"
+    );
+    println!("batch-of-one OK: {} tokens | {}", scalar.len(), latex_scalar.0);
 }
 
 /// Real-weights timing + LaTeX sanity. Ignored by default. Times the cached path

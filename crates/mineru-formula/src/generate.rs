@@ -98,6 +98,115 @@ pub fn greedy_decode<S: DecodeStep>(
     }
 }
 
+/// The batched sibling of [`DecodeStep`]: advances **N independent lanes** by one
+/// token each, in lockstep.
+///
+/// # Why lane independence holds
+/// Every tensor in the decoder carries the batch as its leading dim and no operation
+/// mixes across it. Self-attention shapes q/k/v to `[B, heads, len, dim]` and the
+/// score matmul contracts only the last two dims, so row `i` of the batch attends
+/// solely to row `i` of the cached K/V ([`crate::mbart::attention`]). The additive
+/// attention mask is reshaped to `[1, 1, tgt, src]` and *broadcast* over the batch —
+/// it never carries information between rows. Cross-attention K/V are per-row slices
+/// of the encoder grid. Therefore decoding N crops as one batch is arithmetically the
+/// same as decoding each alone, and the token ids must be byte-identical. That is the
+/// invariant the real-weights batch parity gate proves.
+///
+/// # Contract
+/// [`greedy_decode_batch`] calls [`BatchDecodeStep::step_batch`] with a slice of
+/// exactly `batch_len` tokens (all lanes' BOS on the first call, then each lane's
+/// previously returned token) and a single shared `position`. Every lane advances one
+/// position per call, including lanes that already finished — see
+/// [`greedy_decode_batch`] for why. Implementations must return exactly `batch_len`
+/// ids, index-aligned to the input lanes.
+pub trait BatchDecodeStep {
+    /// Advances every lane by one token.
+    ///
+    /// - `tokens`: one id per lane (BOS on the first call, else the ids the previous
+    ///   call returned).
+    /// - `position`: the 0-based position of these tokens; shared by all lanes, which
+    ///   is what keeps the per-lane KV caches aligned.
+    ///
+    /// Returns the greedy next-token id per lane, in lane order. As with
+    /// [`DecodeStep::step`], the argmax is taken on the tensor backend so only the
+    /// chosen ids cross to the host. Ties must break toward the **lower** index.
+    fn step_batch(&mut self, tokens: &[u32], position: usize) -> Vec<u32>;
+}
+
+/// Runs greedy decoding over `batch_len` independent lanes in lockstep.
+///
+/// Returns one [`Decoded`] per lane, **index-aligned to the input lanes**.
+///
+/// # Ragged EOS
+/// Lanes finish at different steps. Rather than compacting the batch (which would
+/// mean slicing every layer's KV cache — more cost than it saves, and it would breach
+/// the cache's encapsulation), a finished lane is simply kept in the batch and fed
+/// `eos_token` forever. Its emitted ids are discarded via the host-side done mask.
+/// This keeps `position` and the cached K/V aligned across all lanes at zero
+/// bookkeeping cost. The loop breaks as soon as every lane is done, so the batch runs
+/// for as long as its longest lane — which is why callers group similar-length work.
+pub fn greedy_decode_batch<S: BatchDecodeStep>(
+    step: &mut S,
+    start_token: u32,
+    eos_token: u32,
+    max_new_tokens: usize,
+    batch_len: usize,
+) -> Vec<Decoded> {
+    let mut out: Vec<Decoded> = (0..batch_len)
+        .map(|_| Decoded {
+            tokens: Vec::new(),
+            hit_eos: false,
+        })
+        .collect();
+    if batch_len == 0 {
+        return out;
+    }
+
+    let mut tokens = vec![start_token; batch_len];
+    let mut done = vec![false; batch_len];
+
+    for position in 0..max_new_tokens {
+        let next = step.step_batch(&tokens, position);
+        // A short return would silently misalign lanes; treat it as "all lanes
+        // finished" rather than indexing past the end.
+        if next.len() != batch_len {
+            break;
+        }
+
+        for (lane, &id) in next.iter().enumerate() {
+            match done.get(lane) {
+                Some(true) | None => continue,
+                Some(false) => {}
+            }
+            if id == eos_token {
+                if let Some(slot) = out.get_mut(lane) {
+                    slot.hit_eos = true;
+                }
+                if let Some(flag) = done.get_mut(lane) {
+                    *flag = true;
+                }
+            } else if let Some(slot) = out.get_mut(lane) {
+                slot.tokens.push(id);
+            }
+        }
+
+        if done.iter().all(|&d| d) {
+            break;
+        }
+
+        // Finished lanes are re-fed EOS so their positions stay in lockstep with the
+        // live ones; their outputs are already excluded by the done mask.
+        for (lane, slot) in tokens.iter_mut().enumerate() {
+            *slot = match done.get(lane) {
+                Some(true) | None => eos_token,
+                Some(false) => next.get(lane).copied().unwrap_or(eos_token),
+            };
+        }
+    }
+
+    out
+}
+
 /// Convenience wrapper reading `start`/`eos`/cap straight from the decoder config.
 pub fn greedy_decode_with_config<S: DecodeStep>(
     step: &mut S,
@@ -195,5 +304,119 @@ mod tests {
         let d = greedy_decode(&mut m, 0, 2, 10);
         assert!(d.tokens.is_empty());
         assert!(d.hit_eos);
+    }
+
+    /// A batched mock: `scripts[lane]` is the id that lane emits at each step. A lane
+    /// whose script is exhausted repeats its last id forever (so callers can script a
+    /// lane that never stops). Records what it was fed to prove finished lanes keep
+    /// being driven with EOS.
+    struct MockBatch {
+        scripts: Vec<Vec<u32>>,
+        fed: Vec<Vec<u32>>,
+        positions: Vec<usize>,
+    }
+
+    impl MockBatch {
+        fn new(scripts: Vec<Vec<u32>>) -> Self {
+            Self {
+                scripts,
+                fed: Vec::new(),
+                positions: Vec::new(),
+            }
+        }
+    }
+
+    impl BatchDecodeStep for MockBatch {
+        fn step_batch(&mut self, tokens: &[u32], position: usize) -> Vec<u32> {
+            self.fed.push(tokens.to_vec());
+            self.positions.push(position);
+            self.scripts
+                .iter()
+                .map(|s| match s.get(position) {
+                    Some(&id) => id,
+                    None => s.last().copied().unwrap_or(0),
+                })
+                .collect()
+        }
+    }
+
+    #[test]
+    fn batch_lanes_finishing_at_different_steps() {
+        // eos=2. Lane 0 stops after 1 token, lane 1 after 3, lane 2 after 2.
+        let mut m = MockBatch::new(vec![
+            vec![5, 2],
+            vec![6, 7, 8, 2],
+            vec![9, 4, 2],
+        ]);
+        let d = greedy_decode_batch(&mut m, 0, 2, 10, 3);
+
+        assert_eq!(d[0].tokens, vec![5]);
+        assert_eq!(d[1].tokens, vec![6, 7, 8]);
+        assert_eq!(d[2].tokens, vec![9, 4]);
+        assert!(d.iter().all(|x| x.hit_eos));
+        // Ran exactly as long as the longest lane (4 steps), then stopped.
+        assert_eq!(m.positions, vec![0, 1, 2, 3]);
+        // Lane 0 finished at step 1, so from step 2 on it must be fed EOS to stay
+        // positionally aligned with the still-live lanes.
+        assert_eq!(m.fed[2][0], 2);
+        assert_eq!(m.fed[3][0], 2);
+        // Lane 1 was still live at step 3 and must be fed its own last real token.
+        assert_eq!(m.fed[3][1], 8);
+    }
+
+    #[test]
+    fn batch_lane_hitting_eos_on_step_zero() {
+        // Lane 1 emits EOS immediately; the other lanes must be unaffected.
+        let mut m = MockBatch::new(vec![vec![5, 6, 2], vec![2], vec![7, 2]]);
+        let d = greedy_decode_batch(&mut m, 0, 2, 10, 3);
+
+        assert_eq!(d[0].tokens, vec![5, 6]);
+        assert!(d[1].tokens.is_empty(), "lane 1 stopped before emitting");
+        assert!(d[1].hit_eos);
+        assert_eq!(d[2].tokens, vec![7]);
+    }
+
+    #[test]
+    fn batch_all_lanes_hit_the_cap() {
+        // No lane ever emits eos=2; every lane must stop at the cap with hit_eos false.
+        let mut m = MockBatch::new(vec![vec![1], vec![3], vec![4]]);
+        let d = greedy_decode_batch(&mut m, 0, 2, 4, 3);
+
+        assert_eq!(d[0].tokens, vec![1, 1, 1, 1]);
+        assert_eq!(d[1].tokens, vec![3, 3, 3, 3]);
+        assert_eq!(d[2].tokens, vec![4, 4, 4, 4]);
+        assert!(d.iter().all(|x| !x.hit_eos));
+        assert_eq!(m.positions.len(), 4, "cap must bound the step count");
+    }
+
+    #[test]
+    fn batch_of_one_equals_scalar_greedy_decode() {
+        let script = vec![7u32, 8, 9, 2];
+
+        let mut batched_mock = MockBatch::new(vec![script.clone()]);
+        let batched = greedy_decode_batch(&mut batched_mock, 0, 2, 20, 1);
+
+        // Drive the scalar loop off the identical script.
+        struct Scripted {
+            script: Vec<u32>,
+        }
+        impl DecodeStep for Scripted {
+            fn step(&mut self, _token: u32, position: usize) -> u32 {
+                self.script.get(position).copied().unwrap_or(0)
+            }
+        }
+        let mut scalar_mock = Scripted { script };
+        let scalar = greedy_decode(&mut scalar_mock, 0, 2, 20);
+
+        assert_eq!(batched.len(), 1);
+        assert_eq!(batched[0], scalar);
+    }
+
+    #[test]
+    fn batch_of_zero_lanes_returns_empty() {
+        let mut m = MockBatch::new(vec![]);
+        let d = greedy_decode_batch(&mut m, 0, 2, 10, 0);
+        assert!(d.is_empty());
+        assert!(m.positions.is_empty(), "must not drive the model at all");
     }
 }
