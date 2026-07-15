@@ -661,6 +661,8 @@ impl<B: BurnBackend> PipelineBackend<B> {
                     ?choice,
                     class = ?cls.class,
                     score = cls.score,
+                    wired_cells = wired.0.matches("<td").count() + wired.0.matches("<th").count(),
+                    wireless_cells = wireless.0.matches("<td").count() + wireless.0.matches("<th").count(),
                     "picked a table engine by comparing both recognitions"
                 );
                 Some(match choice {
