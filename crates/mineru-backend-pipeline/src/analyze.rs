@@ -56,6 +56,9 @@ struct Profile {
     layout: Cell<Duration>,
     ocr: Cell<Duration>,
     formula: Cell<Duration>,
+    /// Orientation detection over table crops. Cheap on the common (upright)
+    /// path, and two extra det+rec passes on the rare rotated one.
+    table_orient: Cell<Duration>,
     table_classify: Cell<Duration>,
     /// OCR over table crops, kept separate from `ocr` (which covers text regions)
     /// so the table stages' true cost is visible.
@@ -92,10 +95,11 @@ impl Profile {
         let lay = self.layout.get();
         let ocr = self.ocr.get();
         let formula = self.formula.get();
+        let t_ori = self.table_orient.get();
         let t_cls = self.table_classify.get();
         let t_ocr = self.table_ocr.get();
         let t_rec = self.table_recognize.get();
-        let table = t_cls + t_ocr + t_rec;
+        let table = t_ori + t_cls + t_ocr + t_rec;
         let total = ras + nat + lay + ocr + formula + table;
         let pct = |d: Duration| {
             if total.is_zero() {
@@ -116,6 +120,7 @@ impl Profile {
             ocr_pct = pct(ocr),
             formula_s = formula.as_secs_f64(),
             formula_pct = pct(formula),
+            table_orient_s = t_ori.as_secs_f64(),
             table_classify_s = t_cls.as_secs_f64(),
             table_ocr_s = t_ocr.as_secs_f64(),
             table_recognize_s = t_rec.as_secs_f64(),
@@ -409,9 +414,10 @@ impl<B: BurnBackend> PipelineBackend<B> {
 
     /// Table: classify wired/wireless and recognize into HTML.
     ///
-    /// OCR spans are needed by the recognizers; this v1 passes an empty span set
-    /// (structure-only) — full OCR-span matching is a later phase. Any missing
-    /// model leaves `table_html` empty.
+    /// A sideways-typeset table is rotated upright first (see
+    /// [`deskew_table`](Self::deskew_table)); everything downstream — the
+    /// wired/wireless classifier, the structure model, the cell OCR — then sees
+    /// an upright crop. Any missing model leaves `table_html` empty.
     fn recognize_table(
         &self,
         page: usize,
@@ -424,6 +430,9 @@ impl<B: BurnBackend> PipelineBackend<B> {
         let Some((crop, _, _)) = crop_region(image, pixel_bbox) else {
             return RegionContent::default();
         };
+        let t = Instant::now();
+        let crop = self.deskew_table(crop);
+        profile.add(&profile.table_orient, t.elapsed());
         let t = Instant::now();
         // Tables are wired on CPU (see `PipelineModels`); classify on the same
         // backend as the recognizers it dispatches to.
@@ -480,6 +489,76 @@ impl<B: BurnBackend> PipelineBackend<B> {
         self.models.table_wireless.as_ref().and_then(|m| {
             warn_on_err("wireless", mineru_table::recognize_wireless(m, crop, spans))
         })
+    }
+
+    /// Rotates a sideways-typeset table crop upright, returning it unchanged when
+    /// it already is (the overwhelmingly common case).
+    ///
+    /// Wide tables are often printed rotated to fit a portrait page. OCR reads
+    /// such a crop as confident nonsense rather than failing — `Forest age
+    /// (years)` becomes `20 20 20 20 20` — so nothing downstream can detect it.
+    ///
+    /// The policy lives in [`mineru_table::orientation`]; this supplies the OCR
+    /// it decides on. A cheap detection-box gate runs first, because scoring
+    /// costs two extra det+rec passes and almost no tables need it.
+    ///
+    /// Without a det/rec model there is nothing to score with, so the crop is
+    /// returned as-is.
+    fn deskew_table(&self, crop: RgbImage) -> RgbImage {
+        use mineru_table::orientation::{
+            is_rotation_candidate, select_rotation, OrientationScore, Rotation,
+        };
+
+        let (Some(det), Some(_)) = (&self.models.ocr_det, &self.models.ocr_rec) else {
+            return crop;
+        };
+
+        let boxes = det.detect(&crop).unwrap_or_default();
+        if !is_rotation_candidate(&boxes) {
+            return crop;
+        }
+
+        let scores: Vec<(Rotation, OrientationScore)> = Rotation::ALL
+            .iter()
+            .map(|&rotation| {
+                let view = rotate(&crop, rotation);
+                // Re-detect per angle: box shapes are what changed, and the 0°
+                // boxes do not carry over to a rotated view.
+                let view_boxes = det.detect(&view).unwrap_or_default();
+                (rotation, self.score_orientation(&view, &view_boxes))
+            })
+            .collect();
+
+        let choice = select_rotation(&scores);
+        if choice != Rotation::None {
+            tracing::debug!(
+                rotation = ?choice,
+                scores = ?scores.iter().map(|(r, s)| (r, s.confidence)).collect::<Vec<_>>(),
+                "rotated a sideways table crop upright"
+            );
+        }
+        rotate(&crop, choice)
+    }
+
+    /// Scores how well OCR reads `view`, over an even sample of its boxes.
+    fn score_orientation(
+        &self,
+        view: &RgbImage,
+        boxes: &[BBox],
+    ) -> mineru_table::orientation::OrientationScore {
+        use mineru_table::orientation::OrientationScore;
+
+        let Some(rec) = &self.models.ocr_rec else {
+            return OrientationScore::ZERO;
+        };
+        let reads: Vec<(String, f32)> = mineru_table::orientation::sample_boxes(boxes)
+            .into_iter()
+            .filter_map(|b| {
+                let (line_crop, _, _) = crop_region(view, &b)?;
+                rec.recognize(&line_crop).ok()
+            })
+            .collect();
+        OrientationScore::from_reads(reads.iter().map(|(t, s)| (t.as_str(), *s)))
     }
 
     /// OCRs a table crop into the spans the structure matcher fills cells from.
@@ -591,6 +670,23 @@ fn page_bounds(page_count: usize, opts: &ParseOptions) -> (usize, usize) {
     }
 }
 
+/// Applies a [`Rotation`] to an image.
+///
+/// [`Rotation::None`] clones rather than borrowing so callers can hand back one
+/// owned image whichever branch they take; a table crop is small and this runs
+/// at most once per table.
+///
+/// [`Rotation`]: mineru_table::orientation::Rotation
+fn rotate(image: &RgbImage, rotation: mineru_table::orientation::Rotation) -> RgbImage {
+    use mineru_table::orientation::Rotation;
+    match rotation {
+        Rotation::None => image.clone(),
+        // `rotate90` maps the left edge to the top; `rotate270` the right edge.
+        Rotation::LeftEdgeToTop => image::imageops::rotate90(image),
+        Rotation::RightEdgeToTop => image::imageops::rotate270(image),
+    }
+}
+
 /// Crops the region from the page image, returning the crop and its `(x, y)` origin
 /// in the source image's pixel space. `None` when the box has no area or lies
 /// outside the image.
@@ -678,6 +774,32 @@ mod tests {
         let (crop, ox, oy) = crop_region(&img, &BBox::new(-10.0, 50.0, 40.0, 90.0)).unwrap();
         assert_eq!((ox, oy), (0.0, 50.0));
         assert_eq!(crop.dimensions(), (40, 40));
+    }
+
+    #[test]
+    fn rotation_maps_the_named_edge_to_the_top() {
+        use mineru_table::orientation::Rotation;
+
+        // A 2x1 image: left pixel red, right pixel blue. After a quarter turn the
+        // named edge's pixel must be the one on top. Asserting on pixels rather
+        // than on `rotate90`/`rotate270` names is the point: the direction
+        // conventions invert between libraries, and getting this backwards
+        // produces a 180°-wrong crop that OCR reads as plausible garbage.
+        let mut img = RgbImage::new(2, 1);
+        img.put_pixel(0, 0, image::Rgb([255, 0, 0])); // left
+        img.put_pixel(1, 0, image::Rgb([0, 0, 255])); // right
+
+        let left_up = rotate(&img, Rotation::LeftEdgeToTop);
+        assert_eq!(left_up.dimensions(), (1, 2));
+        assert_eq!(*left_up.get_pixel(0, 0), image::Rgb([255, 0, 0]));
+
+        let right_up = rotate(&img, Rotation::RightEdgeToTop);
+        assert_eq!(right_up.dimensions(), (1, 2));
+        assert_eq!(*right_up.get_pixel(0, 0), image::Rgb([0, 0, 255]));
+
+        let same = rotate(&img, Rotation::None);
+        assert_eq!(same.dimensions(), (2, 1));
+        assert_eq!(*same.get_pixel(0, 0), image::Rgb([255, 0, 0]));
     }
 
     #[test]

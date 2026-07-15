@@ -57,7 +57,7 @@ fn ocr_reads_table_crop_at_each_rotation() {
 
     let dev = cpu_device();
     let root = std::path::Path::new(&models_dir);
-    let mut det = TextDetector::<Cpu>::new(DetConfig::default(), dev.clone());
+    let mut det = TextDetector::<Cpu>::new(DetConfig::default(), dev);
     det.load_weights(root.join("OCR/paddleocr_torch/ch_PP-OCRv6_small_det_infer.safetensors"))
         .expect("det weights should load");
     let dict = CharDict::ppocrv6(true).expect("embedded dict should build");
