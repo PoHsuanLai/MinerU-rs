@@ -157,10 +157,16 @@ impl MBartConfig {
 
 /// Number of crops decoded together by the batched entry point.
 ///
-/// Matches the Python reference's `batch_size=16`. Every lane in a batch runs until
-/// the *longest* one finishes, so oversized batches waste work on short formulas;
-/// 16 is the reference's balance point.
-const DEFAULT_BATCH_SIZE: usize = 16;
+/// A decode step is latency-bound on one lane's serial op chain, not compute-bound:
+/// measured on this project's CPU backend a step costs ~53 ms at batch 1 and only
+/// ~83 ms at batch 16, so extra lanes ride along nearly free and wider batches raise
+/// throughput. 32 (not the reference's GPU-oriented 16) is the CPU sweet spot: on a
+/// formula-dense 9-page paper, 16→32 cut wall-clock 354→281 s (1.26x), while 48 was
+/// *slower* (290 s) — past 32 the ragged tail (every lane runs until the longest in
+/// its batch hits EOS) and the KV-cache memory (~47 MB/lane worst case) outweigh the
+/// gain. Output is byte-identical across batch sizes: each lane is an independent
+/// greedy decode, so regrouping changes only throughput, never the LaTeX.
+const DEFAULT_BATCH_SIZE: usize = 32;
 
 /// Full model configuration: the encoder + decoder pair plus the decode budget.
 #[derive(Debug, Clone)]
