@@ -133,69 +133,12 @@ impl<B: Backend> PtLinear<B> {
     }
 
     /// Applies the linear transform to a rank-`D` tensor over its last dim.
-    ///
-    /// When the flattened problem is large in *both* the row count (`M`, all leading
-    /// dims) and the contraction (`K`, the input feature dim), the matmul is tiled
-    /// along `M` — see [`linear_tiled`] for why (a Burn 0.21 wgpu matmul kernel bug at
-    /// `M >= 512 && K >= 512`). The tiling is exact and a no-op on shapes that do not
-    /// trip the bug, so CPU and small matmuls are unaffected.
     pub fn forward<const D: usize>(&self, input: Tensor<B, D>) -> Tensor<B, D> {
         // weightᵀ is [in, out]; burn's `linear` computes `input @ weight`.
         let weight_t = self.weight.val().transpose();
         let bias = self.bias.as_ref().map(|b| b.val());
-        linear_tiled(input, weight_t, bias)
+        burn::tensor::module::linear(input, weight_t, bias)
     }
-}
-
-/// Row count above which, combined with a large contraction, the wgpu matmul kernel
-/// in Burn 0.21 returns wrong results; and the tile size to stay safely under it.
-const WGPU_MATMUL_M_LIMIT: usize = 512;
-const WGPU_MATMUL_K_LIMIT: usize = 512;
-const WGPU_MATMUL_TILE: usize = 256;
-
-/// `burn::tensor::module::linear`, but tiled along the row dim when the shape would
-/// trip a Burn 0.21 wgpu matmul bug.
-///
-/// The bug: a `[M, K] @ [K, N]` matmul on the wgpu backend returns numerically wrong
-/// results when **both `M >= 512` and `K >= 512`** (a tiling-boundary defect in the
-/// kernel; verified with sharp thresholds — `M`/`K` of 384 or 511 are correct, 512 is
-/// not). It corrupted the Swin encoder's FFN (2016 tokens × 768) and so produced
-/// garbled formula LaTeX on GPU, while the batch-1 decoder (small `M`) was unaffected.
-///
-/// Fix: when both dims are large, split the rows into [`WGPU_MATMUL_TILE`]-sized
-/// chunks so no sub-matmul has `M >= 512`, run each, and concatenate. Row `i` of the
-/// output depends only on row `i` of the input, so this is arithmetically identical
-/// to the untiled matmul. On CPU, or when either dim is small, the untiled path runs
-/// unchanged (the check is a couple of integer comparisons).
-pub fn linear_tiled<B: Backend, const D: usize>(
-    input: Tensor<B, D>,
-    weight_t: Tensor<B, 2>,
-    bias: Option<Tensor<B, 1>>,
-) -> Tensor<B, D> {
-    let dims = input.dims();
-    let k = dims[D - 1];
-    let m: usize = dims[..D - 1].iter().product();
-
-    if m < WGPU_MATMUL_M_LIMIT || k < WGPU_MATMUL_K_LIMIT {
-        return burn::tensor::module::linear(input, weight_t, bias);
-    }
-
-    // Flatten leading dims to a single row dim, tile along it, then restore shape.
-    let n_out = weight_t.dims()[1];
-    let flat: Tensor<B, 2> = input.reshape([m, k]);
-    let mut parts: Vec<Tensor<B, 2>> = Vec::with_capacity(m.div_ceil(WGPU_MATMUL_TILE));
-    let mut off = 0;
-    while off < m {
-        let len = (m - off).min(WGPU_MATMUL_TILE);
-        let chunk = flat.clone().narrow(0, off, len);
-        parts.push(burn::tensor::module::linear(chunk, weight_t.clone(), bias.clone()));
-        off += len;
-    }
-    let out = Tensor::cat(parts, 0); // [M, n_out]
-
-    let mut out_shape = dims;
-    out_shape[D - 1] = n_out;
-    out.reshape(out_shape)
 }
 
 /// A `nn.LayerNorm` storing `weight`/`bias` (not Burn's `gamma`/`beta`).

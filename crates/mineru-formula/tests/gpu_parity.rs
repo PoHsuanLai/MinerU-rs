@@ -1,11 +1,13 @@
 //! GPU-vs-CPU parity regression test for the formula model.
 //!
-//! Guards the fix for a Burn 0.21 wgpu matmul bug (`M >= 512 && K >= 512` returns
-//! wrong results — see [`mineru_burn_common::nn::linear_tiled`]) that corrupted the
-//! Swin encoder's FFN and produced garbled formula LaTeX on GPU. This runs BOTH
-//! backends on the identical preprocessed pixel tensor and asserts the encoder grid
-//! and the decoder logits match to floating-point noise, stage by stage, so a
-//! regression re-localizes immediately to the encoder or the decoder.
+//! Guards against a Burn 0.21 wgpu matmul bug (`M >= 512 && K >= 512` returned wrong
+//! results without autotune) that corrupted the Swin encoder's FFN and produced
+//! garbled formula LaTeX on GPU. The `gpu` feature now enables `burn/autotune`, which
+//! selects a correct kernel and fixes the bug (the earlier `nn::linear_tiled` tiling
+//! workaround was dropped once autotune was on). This runs BOTH backends on the
+//! identical preprocessed pixel tensor and asserts the encoder grid and the decoder
+//! logits match to floating-point noise, stage by stage, so a regression re-localizes
+//! immediately to the encoder or the decoder.
 //!
 //! Requires the `gpu` feature and a Metal/Vulkan device.
 //!

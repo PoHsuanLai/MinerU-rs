@@ -27,7 +27,22 @@ tracing.workspace = true
 default = []
 # Opt-in GPU backend. Enabling this pulls in the wgpu backend and exposes the
 # `gpu` backend alias; it is never required for CPU inference or the test suite.
-gpu = ["burn/wgpu"]
+#
+# `autotune` and `fusion` are DEFAULT features of `burn-wgpu`, but the workspace
+# pins `burn` with `default-features = false` (to drop autodiff), which strips
+# them. We re-enable ONLY `autotune`: it picks the correct/fast matmul kernel and
+# on the demo1 pipeline cut GPU wall-clock 61.6s -> 43.9s (1.4x), output
+# byte-identical. It also FIXES the M>=512 & K>=512 silent-wrong-result matmul bug
+# (verified: the standalone repro is exact with autotune on), so the
+# `nn::linear_tiled` tiling workaround is no longer needed with this feature on.
+#
+# `fusion` is deliberately NOT enabled. It makes `burn::backend::Wgpu` resolve to
+# `Fusion<CubeBackend<..>>` and helps a tight fixed-shape loop, but on the real
+# pipeline (every page/crop a different shape) it REGRESSED wall-clock ~3x
+# (43.9s -> ~187s) — the fused-kernel JIT never amortizes across the shape
+# diversity. Measured 2026-07-18; do not re-add fusion without re-measuring the
+# full pipeline, not just an isolated op.
+gpu = ["burn/wgpu", "burn/autotune"]
 # Opt-in Apple AMX matmul kernels, via `burn-flex` -> `gemm`. Replaces the old
 # `accelerate` feature, which drove `burn-ndarray`'s BLAS hook and became
 # meaningless when matmul moved to flex's `gemm`.
