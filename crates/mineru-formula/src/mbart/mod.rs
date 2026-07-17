@@ -151,17 +151,32 @@ impl<B: Backend> MBartDecoder<B> {
         cache: &mut DecoderCache<B>,
     ) -> Tensor<B, 2> {
         let device = token.device();
+        let pos_ids: Tensor<B, 2, Int> = Tensor::from_data(
+            TensorData::new(vec![(position + self.position_offset) as i64], [1, 1]),
+            &device,
+        );
+        self.step_from_tensors(token, pos_ids, cache)
+    }
+
+    /// Like [`MBartDecoder::step`], but both the token id and the position id arrive
+    /// as on-device `[?, 1]` int tensors, so a caller running an incremental loop can
+    /// keep the argmax output on-device and feed it straight back in — no per-step
+    /// host read-back, which on wgpu is a full pipeline stall. Position is carried
+    /// explicitly via `pos_ids` (broadcast to the batch) rather than a host scalar.
+    pub fn step_from_tensors(
+        &self,
+        token: Tensor<B, 2, Int>,
+        pos_ids: Tensor<B, 2, Int>,
+        cache: &mut DecoderCache<B>,
+    ) -> Tensor<B, 2> {
         let [b, _one] = token.dims();
 
         // Scaled word embedding for the single new token: [B, 1, d].
         let mut hidden = self.embed_tokens.forward(token).mul_scalar(self.embed_scale);
 
-        // Learned positional embedding at this one position (offset by 2).
-        let pos_ids: Tensor<B, 2, Int> = Tensor::from_data(
-            TensorData::new(vec![(position + self.position_offset) as i64], [1, 1]),
-            &device,
-        )
-        .repeat_dim(0, b);
+        // Learned positional embedding at this one position (offset by 2). `pos_ids`
+        // is `[1, 1]` or `[b, 1]`; broadcast to the batch if a single row was passed.
+        let pos_ids = if pos_ids.dims()[0] == b { pos_ids } else { pos_ids.repeat_dim(0, b) };
         hidden = hidden + self.embed_positions.forward(pos_ids);
 
         hidden = self.layernorm_embedding.forward(hidden);

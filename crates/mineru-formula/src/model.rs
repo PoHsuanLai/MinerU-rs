@@ -83,6 +83,18 @@ impl<B: Backend> UniMerNet<B> {
     ) -> Tensor<B, 2> {
         self.decoder.step(token, position, cache)
     }
+
+    /// On-device variant of [`UniMerNet::decode_step`]: token and position arrive as
+    /// device int tensors, so an incremental loop can feed the previous step's argmax
+    /// back in without a host read-back. See [`crate::mbart::MBartDecoder::step_from_tensors`].
+    pub fn decode_step_from_tensors(
+        &self,
+        token: Tensor<B, 2, Int>,
+        pos_ids: Tensor<B, 2, Int>,
+        cache: &mut DecoderCache<B>,
+    ) -> Tensor<B, 2> {
+        self.decoder.step_from_tensors(token, pos_ids, cache)
+    }
 }
 
 /// A [`DecodeStep`] that holds the encoded image plus a running decoder KV cache and
