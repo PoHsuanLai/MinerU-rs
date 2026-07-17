@@ -346,6 +346,88 @@ impl<B: Backend> FormulaRecognizer<B> {
         logits.narrow(1, t - 1, 1).reshape([1, vocab])
     }
 
+    /// Profiling hook: run the real cached decode loop for `n_steps` batch-`batch`
+    /// steps and return each step's wall-clock in milliseconds.
+    ///
+    /// This is the exact production per-token path — [`UniMerNet::init_decode_cache`]
+    /// once, then [`UniMerNet::decode_step`] with the KV cache — not the non-cached
+    /// `decoder_step_logits` re-run. Each step ends with an on-device argmax whose
+    /// host read-back drains any GPU queue, so a returned time is real device
+    /// wall-clock, not a lazily-enqueued kernel. `bos` seeds every lane's first token.
+    #[doc(hidden)]
+    pub fn cached_step_times_ms(
+        &self,
+        encoder_hidden: Tensor<B, 3>,
+        batch: usize,
+        n_steps: usize,
+        bos: u32,
+    ) -> Vec<f64> {
+        let mut cache = self.model.init_decode_cache(encoder_hidden);
+        let mut tokens = vec![bos; batch];
+        let mut times = Vec::with_capacity(n_steps);
+        for position in 0..n_steps {
+            let t = std::time::Instant::now();
+            let data: Vec<i64> = tokens.iter().map(|&x| x as i64).collect();
+            let ids: Tensor<B, 2, Int> =
+                Tensor::from_data(TensorData::new(data, [batch, 1]), &self.device);
+            let logits = self
+                .model
+                .decode_step(ids, position, &mut cache)
+                .reshape([batch, self.config.decoder.vocab_size]);
+            let idx = logits.argmax(1); // [batch, 1], Int
+            let host = mineru_burn_common::int_to_vec_i64(idx); // read-back drains queue
+            times.push(t.elapsed().as_secs_f64() * 1e3);
+            tokens = host.into_iter().map(|v| v as u32).collect();
+            if tokens.len() != batch {
+                break;
+            }
+        }
+        times
+    }
+
+    /// Profiling hook: run `n_steps` cached decode steps keeping the argmax token
+    /// ON-DEVICE (fed straight back in as a tensor), syncing to the host only every
+    /// `sync_every` steps. Returns total wall-clock in ms. Compare against the sum of
+    /// [`Self::cached_step_times_ms`] (which syncs every step) to see how much of the
+    /// per-step floor is the host read-back / pipeline stall vs real kernel work.
+    #[doc(hidden)]
+    pub fn ondevice_decode_ms(
+        &self,
+        encoder_hidden: Tensor<B, 3>,
+        batch: usize,
+        n_steps: usize,
+        bos: u32,
+        sync_every: usize,
+    ) -> f64 {
+        let mut cache = self.model.init_decode_cache(encoder_hidden);
+        // Seed token tensor [batch, 1] with BOS, on-device.
+        let mut tok: Tensor<B, 2, Int> = Tensor::from_data(
+            TensorData::new(vec![bos as i64; batch], [batch, 1]),
+            &self.device,
+        );
+        let offset = crate::config::MBartConfig::POSITION_OFFSET as i64;
+        let t = std::time::Instant::now();
+        for position in 0..n_steps {
+            let pos_ids: Tensor<B, 2, Int> =
+                Tensor::from_data(TensorData::new(vec![position as i64 + offset], [1, 1]), &self.device);
+            let logits = self
+                .model
+                .decode_step_from_tensors(tok, pos_ids, &mut cache)
+                .reshape([batch, self.config.decoder.vocab_size]);
+            // argmax stays on-device and becomes the next step's input tensor — no
+            // host round-trip. Reshape [batch] -> [batch, 1].
+            tok = logits.argmax(1).reshape([batch, 1]);
+            // Periodic sync only: drain the queue so we don't build an unbounded
+            // command backlog, and so timing reflects real progress.
+            if sync_every > 0 && (position + 1) % sync_every == 0 {
+                let _ = mineru_burn_common::int_to_vec_i64(tok.clone());
+            }
+        }
+        // Final sync so the timer captures all enqueued work.
+        let _ = mineru_burn_common::int_to_vec_i64(tok);
+        t.elapsed().as_secs_f64() * 1e3
+    }
+
     /// Turns the single normalised channel into a `[1, 3, H, W]` pixel tensor by
     /// repeating the channel three times (mirroring `pixel_values.repeat(1,3,1,1)`).
     ///

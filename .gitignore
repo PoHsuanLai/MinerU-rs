@@ -21,3 +21,6 @@ crates/mineru-table/tests/reference/*.shape
 /*_content_list.json
 /*_document.json
 /images/
+
+# Nested cargo target dirs (e.g. autotune caches created by in-tree test runs)
+**/target/
