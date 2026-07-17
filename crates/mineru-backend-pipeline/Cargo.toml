@@ -25,6 +25,7 @@ burn = { workspace = true }
 
 image = { version = "0.25", default-features = false }
 async-trait = "0.1"
+rayon = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 

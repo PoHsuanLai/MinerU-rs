@@ -41,6 +41,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 anyhow = "1"
+# Data parallelism for the pipeline's per-page neural stages. Already in the tree
+# transitively (burn-flex uses it internally); named here to use it directly.
+rayon = "1"
 burn = { version = "0.21", default-features = false }
 # The CPU backend. Depended on directly so its own defaults apply (`std` + `simd`
 # + `rayon`): reaching a backend only through a `burn` feature enables the crate

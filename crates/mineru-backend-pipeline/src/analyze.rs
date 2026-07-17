@@ -22,12 +22,13 @@
 //! [`PipelineModels`](crate::PipelineModels)) still produces a block, just without
 //! its recognized text/latex/html — the layout structure is always emitted.
 
-use std::cell::Cell;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use burn::prelude::Backend as BurnBackend;
 use image::{imageops::crop_imm, RgbImage};
+use rayon::prelude::*;
 
 use mineru_burn_common::backend::Cpu;
 use mineru_layout::LayoutDet;
@@ -42,28 +43,61 @@ use crate::assemble::{PageAssembler, RecognizedLine, Region, RegionContent, Regi
 use crate::models::PipelineModels;
 use crate::para::merge_paragraphs;
 
+/// A rasterized page: the PDFium outputs (raster + native text) carried out of the
+/// serial rasterization loop so the neural stages can run on them in parallel.
+struct RasterizedPage {
+    index: usize,
+    size: PageSize,
+    image: RgbImage,
+    page_text: PageText,
+}
+
+/// A page after layout + per-region recognition but before the doc-wide formula
+/// decode and the table phase.
+///
+/// Holds the pixel raster, kept alive across the whole document rather than dropped
+/// per page: the doc-wide formula batch crops formulas out of every page's raster at
+/// once, and the later table phase still needs each page's raster for its own crops.
+struct PartialPage {
+    index: usize,
+    size: PageSize,
+    image: RgbImage,
+    regions: Vec<Region>,
+}
+
+/// One formula crop's destination in the doc-wide batch: which page (slot in the
+/// `partials` vec), which region on that page, and whether it is an inline formula
+/// (LaTeX → `inline_latex`, folded into text) or a display one (→ `latex`).
+struct FormulaLane {
+    page_slot: usize,
+    region_index: usize,
+    is_inline: bool,
+}
+
 /// Per-stage wall-clock accumulators, gated behind `MINERU_PROFILE=1`.
 ///
 /// Purely diagnostic: when disabled every timing helper is a no-op and the
-/// pipeline output is unchanged. The serial page loop means a plain [`Cell`]
-/// (single-threaded, panic-free) suffices — no locking. Times are summed across
-/// all pages and logged once at the end of [`PipelineBackend::run`].
+/// pipeline output is unchanged. Uses atomics (not a `Cell`) because pages are
+/// analyzed in parallel — several threads accumulate into the same slot at once.
+/// Each slot holds summed nanoseconds; note that under parallelism these are a sum
+/// of per-thread busy time, so `stage_sum_s` can exceed wall-clock. Logged once at
+/// the end of [`PipelineBackend::run`].
 #[derive(Default)]
 struct Profile {
     enabled: bool,
-    rasterize: Cell<Duration>,
-    native_text: Cell<Duration>,
-    layout: Cell<Duration>,
-    ocr: Cell<Duration>,
-    formula: Cell<Duration>,
+    rasterize: AtomicU64,
+    native_text: AtomicU64,
+    layout: AtomicU64,
+    ocr: AtomicU64,
+    formula: AtomicU64,
     /// Orientation detection over table crops. Cheap on the common (upright)
     /// path, and two extra det+rec passes on the rare rotated one.
-    table_orient: Cell<Duration>,
-    table_classify: Cell<Duration>,
+    table_orient: AtomicU64,
+    table_classify: AtomicU64,
     /// OCR over table crops, kept separate from `ocr` (which covers text regions)
     /// so the table stages' true cost is visible.
-    table_ocr: Cell<Duration>,
-    table_recognize: Cell<Duration>,
+    table_ocr: AtomicU64,
+    table_recognize: AtomicU64,
 }
 
 impl Profile {
@@ -79,9 +113,9 @@ impl Profile {
     }
 
     /// Adds `elapsed` to `slot` (no-op when profiling is disabled).
-    fn add(&self, slot: &Cell<Duration>, elapsed: Duration) {
+    fn add(&self, slot: &AtomicU64, elapsed: Duration) {
         if self.enabled {
-            slot.set(slot.get() + elapsed);
+            slot.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
         }
     }
 
@@ -90,15 +124,16 @@ impl Profile {
         if !self.enabled {
             return;
         }
-        let ras = self.rasterize.get();
-        let nat = self.native_text.get();
-        let lay = self.layout.get();
-        let ocr = self.ocr.get();
-        let formula = self.formula.get();
-        let t_ori = self.table_orient.get();
-        let t_cls = self.table_classify.get();
-        let t_ocr = self.table_ocr.get();
-        let t_rec = self.table_recognize.get();
+        let get = |slot: &AtomicU64| Duration::from_nanos(slot.load(Ordering::Relaxed));
+        let ras = get(&self.rasterize);
+        let nat = get(&self.native_text);
+        let lay = get(&self.layout);
+        let ocr = get(&self.ocr);
+        let formula = get(&self.formula);
+        let t_ori = get(&self.table_orient);
+        let t_cls = get(&self.table_classify);
+        let t_ocr = get(&self.table_ocr);
+        let t_rec = get(&self.table_recognize);
         let table = t_ori + t_cls + t_ocr + t_rec;
         let total = ras + nat + lay + ocr + formula + table;
         let pct = |d: Duration| {
@@ -174,11 +209,16 @@ impl<B: BurnBackend> PipelineBackend<B> {
         let render = RenderOptions::with_dpi(self.dpi);
 
         let (start, end) = page_bounds(doc.page_count(), opts);
-        let mut pages = Vec::with_capacity(end.saturating_sub(start));
 
         let profile = Profile::from_env();
+        let sink = opts.image_sink.as_deref();
 
-        // SERIAL iteration: PDFium is not safe for concurrent page ops.
+        // Rasterize + extract the native text layer for every page. This is the
+        // only concurrency-unsafe work — PDFium keeps process-global state — so it
+        // stays serial, and it is cheap (rasterize + native text are a fraction of
+        // a percent of runtime). Everything downstream operates on the owned
+        // rasters and needs no PDFium access, so it can run in parallel.
+        let mut rasters: Vec<RasterizedPage> = Vec::with_capacity(end.saturating_sub(start));
         for index in start..end {
             let size = doc.page_size(index)?;
             let t = Instant::now();
@@ -193,38 +233,60 @@ impl<B: BurnBackend> PipelineBackend<B> {
                 PageText::default()
             });
             profile.add(&profile.native_text, t.elapsed());
-            let page = self.analyze_page(
-                index,
-                size,
-                &image,
-                &page_text,
-                opts.image_sink.as_deref(),
-                &profile,
-            );
-            pages.push(page);
+            rasters.push(RasterizedPage { index, size, image, page_text });
         }
+
+        // Layout + per-region recognition, across pages in parallel. The models are
+        // `Send + Sync` and every page produces an independent `PartialPage`, so
+        // there is no cross-page state — only PDFium forced the serial loop above,
+        // and it is already done. Formulas are left empty here so every page's
+        // formula crops can be decoded together in one doc-wide batch below.
+        let mut partials: Vec<PartialPage> = rasters
+            .into_par_iter()
+            .map(|r| self.analyze_page_pre_formula(r.index, r.size, r.image, &r.page_text, sink, &profile))
+            .collect();
+
+        // One batched formula decode across every page's formula regions. Kept
+        // single-threaded: the decode already batches all the document's formulas
+        // and its own matmuls fan out across cores internally.
+        self.fill_formulas_doc(&mut partials, &profile);
+
+        // Tables (which need the formula LaTeX) + assembly, across pages in
+        // parallel. rayon's indexed `collect` preserves input order, so `pages` is
+        // already page-ordered; the sort below is a cheap guard against that
+        // assumption ever changing.
+        let mut pages: Vec<Page> = partials
+            .into_par_iter()
+            .map(|p| self.finish_page(p, sink, &profile))
+            .collect();
+        pages.sort_by_key(|p| p.index);
 
         profile.log_summary();
 
         Ok(Document { pages })
     }
 
-    /// Runs layout + recognition + assembly for one already-rasterized page.
-    fn analyze_page(
+    /// Runs layout + per-region recognition for one page, leaving formulas empty for
+    /// the doc-wide formula decode to fill.
+    ///
+    /// Returns the page's regions alongside its raster, which is retained (not
+    /// dropped per page) because the doc-wide formula batch and the table crops both
+    /// still need it.
+    fn analyze_page_pre_formula(
         &self,
         index: usize,
         size: PageSize,
-        image: &RgbImage,
+        image: RgbImage,
         page_text: &PageText,
         sink: Option<&dyn ImageWriter>,
         profile: &Profile,
-    ) -> Page {
+    ) -> PartialPage {
         let scale = self.scale();
 
         // Layout is the driver; with no layout model the page is empty.
         let t = Instant::now();
         let dets = match &self.models.layout {
-            Some(layout) => layout.detect(image).unwrap_or_else(|e| {
+            Some(layout) => layout.detect(&image).unwrap_or_else(|e| {
                 tracing::warn!(page = index, error = %e, "layout detect failed");
                 Vec::new()
             }),
@@ -232,19 +294,29 @@ impl<B: BurnBackend> PipelineBackend<B> {
         };
         profile.add(&profile.layout, t.elapsed());
 
-        let mut regions: Vec<Region> = dets
+        let regions: Vec<Region> = dets
             .into_iter()
-            .map(|det| self.recognize_region(index, det, image, scale, page_text, sink, profile))
+            .map(|det| self.recognize_region(index, det, &image, scale, page_text, sink, profile))
             .collect();
 
-        let t = Instant::now();
-        self.fill_formulas(&mut regions, image, scale);
-        profile.add(&profile.formula, t.elapsed());
+        PartialPage {
+            index,
+            size,
+            image,
+            regions,
+        }
+    }
+
+    /// Recognizes the page's tables and assembles its blocks, run after formulas are
+    /// filled so a table can claim the LaTeX of any formula printed inside it.
+    fn finish_page(&self, partial: PartialPage, sink: Option<&dyn ImageWriter>, profile: &Profile) -> Page {
+        let scale = self.scale();
+        let PartialPage { index, size, image, mut regions } = partial;
 
         // Tables run last: a formula printed inside one is detected as a page
-        // formula, so its LaTeX only exists once `fill_formulas` has run, and the
+        // formula, so its LaTeX only exists once formulas have been filled, and the
         // table needs it to fill the cell the formula sits in.
-        let claimed = self.fill_tables(index, &mut regions, image, scale, sink, profile);
+        let claimed = self.fill_tables(index, &mut regions, &image, scale, sink, profile);
         drop_regions(&mut regions, &claimed);
 
         let assembled = PageAssembler.assemble(regions);
@@ -382,8 +454,8 @@ impl<B: BurnBackend> PipelineBackend<B> {
         }
     }
 
-    /// Recognizes every formula on the page in one batched decode and fills the
-    /// results into their regions.
+    /// Recognizes every formula in the **whole document** in one batched decode and
+    /// fills the results back into their regions.
     ///
     /// Display and inline formulas go through the same model and the same batch —
     /// as they do in the reference, which feeds both labels to one MFR call — and
@@ -391,60 +463,78 @@ impl<B: BurnBackend> PipelineBackend<B> {
     /// assembler folds `inline_latex` into the surrounding text as `$…$` and
     /// `latex` into a standalone `$$…$$` block.
     ///
-    /// Batching is what makes this worth the two-pass shape: the decoder is
-    /// autoregressive, so at batch 1 its matmuls are matrix-vector and the model
-    /// weights are re-read for every crop. One call per page amortizes that read
-    /// across the page's formulas.
+    /// Batching across pages is what makes this worth the multi-phase shape: the
+    /// decoder is autoregressive, so at batch 1 its matmuls are matrix-vector and
+    /// the model weights are re-read for every crop, and each batch runs until its
+    /// *longest* lane hits EOS. Collecting every page's crops into one call lets
+    /// [`predict_batch`](mineru_formula::FormulaRecognizer::predict_batch) area-sort
+    /// the entire document at once — full batches instead of a two-lane batch per
+    /// page, and tighter length grouping so the ragged-EOS tail is smaller. The
+    /// output is unchanged: each lane is an independent greedy decode of its crop,
+    /// so grouping only affects throughput, not the LaTeX produced.
     ///
     /// A crop that fails to preprocess yields `None` for that lane alone and leaves
     /// its region empty, which is what the per-crop path did with `.ok()`.
-    fn fill_formulas(&self, regions: &mut [Region], image: &RgbImage, scale: f32) {
+    fn fill_formulas_doc(&self, partials: &mut [PartialPage], profile: &Profile) {
         let Some(model) = &self.models.formula else {
             return;
         };
+        let scale = self.scale();
 
-        // Region bboxes are in page points by now; the crop has to come from the
-        // pixel raster, so undo the scaling `recognize_region` applied.
-        let mut lanes: Vec<(usize, RgbImage)> = Vec::new();
-        for (i, region) in regions.iter().enumerate() {
-            match RegionKind::classify(region.det.label) {
-                RegionKind::Equation | RegionKind::InlineFormula => {}
-                _ => continue,
-            }
-            let pixel_bbox = scale_bbox(region.det.bbox, scale);
-            if let Some((crop, _, _)) = crop_region(image, &pixel_bbox) {
-                lanes.push((i, crop));
+        // Gather every formula crop across all pages, tagged with where its LaTeX
+        // must land: (page slot in `partials`, region index, is_inline).
+        let mut lanes: Vec<FormulaLane> = Vec::new();
+        let mut crops: Vec<RgbImage> = Vec::new();
+        for (page_slot, partial) in partials.iter().enumerate() {
+            for (region_index, region) in partial.regions.iter().enumerate() {
+                let is_inline = match RegionKind::classify(region.det.label) {
+                    RegionKind::InlineFormula => true,
+                    RegionKind::Equation => false,
+                    _ => continue,
+                };
+                // Region bboxes are in page points by now; the crop has to come from
+                // the pixel raster, so undo the scaling `recognize_region` applied.
+                let pixel_bbox = scale_bbox(region.det.bbox, scale);
+                if let Some((crop, _, _)) = crop_region(&partial.image, &pixel_bbox) {
+                    lanes.push(FormulaLane { page_slot, region_index, is_inline });
+                    crops.push(crop);
+                }
             }
         }
-        if lanes.is_empty() {
+        if crops.is_empty() {
             return;
         }
 
-        let crops: Vec<RgbImage> = lanes.iter().map(|(_, crop)| crop.clone()).collect();
+        let t = Instant::now();
         let results = match model.predict_batch(&crops) {
             Ok(results) => results,
             Err(e) => {
-                tracing::warn!(error = %e, "batched formula decode failed; page has no formulas");
+                tracing::warn!(error = %e, "batched formula decode failed; document has no formulas");
                 return;
             }
         };
+        profile.add(&profile.formula, t.elapsed());
         if results.len() != lanes.len() {
             tracing::warn!(
                 got = results.len(),
                 want = lanes.len(),
-                "batched formula decode returned the wrong lane count; page has no formulas"
+                "batched formula decode returned the wrong lane count; document has no formulas"
             );
             return;
         }
 
-        for ((region_index, _), latex) in lanes.iter().zip(results) {
+        for (lane, latex) in lanes.iter().zip(results) {
             let Some(latex) = latex else { continue };
-            let Some(region) = regions.get_mut(*region_index) else {
+            let Some(partial) = partials.get_mut(lane.page_slot) else {
                 continue;
             };
-            match RegionKind::classify(region.det.label) {
-                RegionKind::InlineFormula => region.content.inline_latex = Some(latex),
-                _ => region.content.latex = Some(latex),
+            let Some(region) = partial.regions.get_mut(lane.region_index) else {
+                continue;
+            };
+            if lane.is_inline {
+                region.content.inline_latex = Some(latex);
+            } else {
+                region.content.latex = Some(latex);
             }
         }
     }
