@@ -11,7 +11,7 @@ description = "SVTR/CRNN + CTC (PP-OCRv6) text recognition for MinerU, ported to
 mineru-types.workspace = true
 mineru-burn-common = { workspace = true }
 
-burn = { version = "0.21", default-features = false, features = ["ndarray", "std"] }
+burn = { version = "0.21", default-features = false, features = ["std"] }
 
 image = { version = "0.25", default-features = false }
 

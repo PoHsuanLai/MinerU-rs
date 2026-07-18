@@ -136,7 +136,8 @@ impl<B: Backend> PtLinear<B> {
     pub fn forward<const D: usize>(&self, input: Tensor<B, D>) -> Tensor<B, D> {
         // weightᵀ is [in, out]; burn's `linear` computes `input @ weight`.
         let weight_t = self.weight.val().transpose();
-        burn::tensor::module::linear(input, weight_t, self.bias.as_ref().map(|b| b.val()))
+        let bias = self.bias.as_ref().map(|b| b.val());
+        burn::tensor::module::linear(input, weight_t, bias)
     }
 }
 

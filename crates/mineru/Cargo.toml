@@ -44,6 +44,13 @@ hybrid = ["pipeline", "vlm", "dep:mineru-backend-hybrid"]
 # feature to the pipeline crate and the shared harness (for the `Gpu` alias).
 gpu = ["pipeline", "mineru-backend-pipeline/gpu", "mineru-burn-common/gpu"]
 
+# Opt-in Apple AMX matmul kernels for the CPU backend. Unlike `gpu` this needs no
+# per-model plumbing: it swaps the matmul kernels underneath the shared CPU
+# backend, which every stage already uses. M1-M3 only — `gemm`'s runtime probe
+# does not recognize M4+, so this is a measured no-op there; see the feature's
+# comment in `mineru-burn-common/Cargo.toml`.
+apple-amx = ["burn-common", "mineru-burn-common/apple-amx"]
+
 # Individual model crates, so a downstream user can pull just one.
 burn-common = ["dep:mineru-burn-common"]
 ocr = ["dep:mineru-ocr-det", "dep:mineru-ocr-rec", "burn-common"]

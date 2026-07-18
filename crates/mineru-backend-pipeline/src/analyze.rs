@@ -22,16 +22,18 @@
 //! [`PipelineModels`](crate::PipelineModels)) still produces a block, just without
 //! its recognized text/latex/html — the layout structure is always emitted.
 
-use std::cell::Cell;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use burn::prelude::Backend as BurnBackend;
 use image::{imageops::crop_imm, RgbImage};
+use rayon::prelude::*;
 
 use mineru_burn_common::backend::Cpu;
 use mineru_layout::LayoutDet;
 use mineru_pdf::{PageText, PdfiumLibrary, RenderOptions};
+use mineru_table::{orientation::Rotation, OcrSpan};
 use mineru_types::{
     Backend, BackendError, BBox, DocInput, Document, ImageRef, ImageWriter, Page, PageSize,
     ParseOptions,
@@ -41,22 +43,61 @@ use crate::assemble::{PageAssembler, RecognizedLine, Region, RegionContent, Regi
 use crate::models::PipelineModels;
 use crate::para::merge_paragraphs;
 
+/// A rasterized page: the PDFium outputs (raster + native text) carried out of the
+/// serial rasterization loop so the neural stages can run on them in parallel.
+struct RasterizedPage {
+    index: usize,
+    size: PageSize,
+    image: RgbImage,
+    page_text: PageText,
+}
+
+/// A page after layout + per-region recognition but before the doc-wide formula
+/// decode and the table phase.
+///
+/// Holds the pixel raster, kept alive across the whole document rather than dropped
+/// per page: the doc-wide formula batch crops formulas out of every page's raster at
+/// once, and the later table phase still needs each page's raster for its own crops.
+struct PartialPage {
+    index: usize,
+    size: PageSize,
+    image: RgbImage,
+    regions: Vec<Region>,
+}
+
+/// One formula crop's destination in the doc-wide batch: which page (slot in the
+/// `partials` vec), which region on that page, and whether it is an inline formula
+/// (LaTeX → `inline_latex`, folded into text) or a display one (→ `latex`).
+struct FormulaLane {
+    page_slot: usize,
+    region_index: usize,
+    is_inline: bool,
+}
+
 /// Per-stage wall-clock accumulators, gated behind `MINERU_PROFILE=1`.
 ///
 /// Purely diagnostic: when disabled every timing helper is a no-op and the
-/// pipeline output is unchanged. The serial page loop means a plain [`Cell`]
-/// (single-threaded, panic-free) suffices — no locking. Times are summed across
-/// all pages and logged once at the end of [`PipelineBackend::run`].
+/// pipeline output is unchanged. Uses atomics (not a `Cell`) because pages are
+/// analyzed in parallel — several threads accumulate into the same slot at once.
+/// Each slot holds summed nanoseconds; note that under parallelism these are a sum
+/// of per-thread busy time, so `stage_sum_s` can exceed wall-clock. Logged once at
+/// the end of [`PipelineBackend::run`].
 #[derive(Default)]
 struct Profile {
     enabled: bool,
-    rasterize: Cell<Duration>,
-    native_text: Cell<Duration>,
-    layout: Cell<Duration>,
-    ocr: Cell<Duration>,
-    formula: Cell<Duration>,
-    table_classify: Cell<Duration>,
-    table_recognize: Cell<Duration>,
+    rasterize: AtomicU64,
+    native_text: AtomicU64,
+    layout: AtomicU64,
+    ocr: AtomicU64,
+    formula: AtomicU64,
+    /// Orientation detection over table crops. Cheap on the common (upright)
+    /// path, and two extra det+rec passes on the rare rotated one.
+    table_orient: AtomicU64,
+    table_classify: AtomicU64,
+    /// OCR over table crops, kept separate from `ocr` (which covers text regions)
+    /// so the table stages' true cost is visible.
+    table_ocr: AtomicU64,
+    table_recognize: AtomicU64,
 }
 
 impl Profile {
@@ -72,9 +113,9 @@ impl Profile {
     }
 
     /// Adds `elapsed` to `slot` (no-op when profiling is disabled).
-    fn add(&self, slot: &Cell<Duration>, elapsed: Duration) {
+    fn add(&self, slot: &AtomicU64, elapsed: Duration) {
         if self.enabled {
-            slot.set(slot.get() + elapsed);
+            slot.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
         }
     }
 
@@ -83,14 +124,17 @@ impl Profile {
         if !self.enabled {
             return;
         }
-        let ras = self.rasterize.get();
-        let nat = self.native_text.get();
-        let lay = self.layout.get();
-        let ocr = self.ocr.get();
-        let formula = self.formula.get();
-        let t_cls = self.table_classify.get();
-        let t_rec = self.table_recognize.get();
-        let table = t_cls + t_rec;
+        let get = |slot: &AtomicU64| Duration::from_nanos(slot.load(Ordering::Relaxed));
+        let ras = get(&self.rasterize);
+        let nat = get(&self.native_text);
+        let lay = get(&self.layout);
+        let ocr = get(&self.ocr);
+        let formula = get(&self.formula);
+        let t_ori = get(&self.table_orient);
+        let t_cls = get(&self.table_classify);
+        let t_ocr = get(&self.table_ocr);
+        let t_rec = get(&self.table_recognize);
+        let table = t_ori + t_cls + t_ocr + t_rec;
         let total = ras + nat + lay + ocr + formula + table;
         let pct = |d: Duration| {
             if total.is_zero() {
@@ -111,7 +155,9 @@ impl Profile {
             ocr_pct = pct(ocr),
             formula_s = formula.as_secs_f64(),
             formula_pct = pct(formula),
+            table_orient_s = t_ori.as_secs_f64(),
             table_classify_s = t_cls.as_secs_f64(),
+            table_ocr_s = t_ocr.as_secs_f64(),
             table_recognize_s = t_rec.as_secs_f64(),
             table_s = table.as_secs_f64(),
             table_pct = pct(table),
@@ -163,11 +209,16 @@ impl<B: BurnBackend> PipelineBackend<B> {
         let render = RenderOptions::with_dpi(self.dpi);
 
         let (start, end) = page_bounds(doc.page_count(), opts);
-        let mut pages = Vec::with_capacity(end.saturating_sub(start));
 
         let profile = Profile::from_env();
+        let sink = opts.image_sink.as_deref();
 
-        // SERIAL iteration: PDFium is not safe for concurrent page ops.
+        // Rasterize + extract the native text layer for every page. This is the
+        // only concurrency-unsafe work — PDFium keeps process-global state — so it
+        // stays serial, and it is cheap (rasterize + native text are a fraction of
+        // a percent of runtime). Everything downstream operates on the owned
+        // rasters and needs no PDFium access, so it can run in parallel.
+        let mut rasters: Vec<RasterizedPage> = Vec::with_capacity(end.saturating_sub(start));
         for index in start..end {
             let size = doc.page_size(index)?;
             let t = Instant::now();
@@ -182,38 +233,60 @@ impl<B: BurnBackend> PipelineBackend<B> {
                 PageText::default()
             });
             profile.add(&profile.native_text, t.elapsed());
-            let page = self.analyze_page(
-                index,
-                size,
-                &image,
-                &page_text,
-                opts.image_sink.as_deref(),
-                &profile,
-            );
-            pages.push(page);
+            rasters.push(RasterizedPage { index, size, image, page_text });
         }
+
+        // Layout + per-region recognition, across pages in parallel. The models are
+        // `Send + Sync` and every page produces an independent `PartialPage`, so
+        // there is no cross-page state — only PDFium forced the serial loop above,
+        // and it is already done. Formulas are left empty here so every page's
+        // formula crops can be decoded together in one doc-wide batch below.
+        let mut partials: Vec<PartialPage> = rasters
+            .into_par_iter()
+            .map(|r| self.analyze_page_pre_formula(r.index, r.size, r.image, &r.page_text, sink, &profile))
+            .collect();
+
+        // One batched formula decode across every page's formula regions. Kept
+        // single-threaded: the decode already batches all the document's formulas
+        // and its own matmuls fan out across cores internally.
+        self.fill_formulas_doc(&mut partials, &profile);
+
+        // Tables (which need the formula LaTeX) + assembly, across pages in
+        // parallel. rayon's indexed `collect` preserves input order, so `pages` is
+        // already page-ordered; the sort below is a cheap guard against that
+        // assumption ever changing.
+        let mut pages: Vec<Page> = partials
+            .into_par_iter()
+            .map(|p| self.finish_page(p, sink, &profile))
+            .collect();
+        pages.sort_by_key(|p| p.index);
 
         profile.log_summary();
 
         Ok(Document { pages })
     }
 
-    /// Runs layout + recognition + assembly for one already-rasterized page.
-    fn analyze_page(
+    /// Runs layout + per-region recognition for one page, leaving formulas empty for
+    /// the doc-wide formula decode to fill.
+    ///
+    /// Returns the page's regions alongside its raster, which is retained (not
+    /// dropped per page) because the doc-wide formula batch and the table crops both
+    /// still need it.
+    fn analyze_page_pre_formula(
         &self,
         index: usize,
         size: PageSize,
-        image: &RgbImage,
+        image: RgbImage,
         page_text: &PageText,
         sink: Option<&dyn ImageWriter>,
         profile: &Profile,
-    ) -> Page {
+    ) -> PartialPage {
         let scale = self.scale();
 
         // Layout is the driver; with no layout model the page is empty.
         let t = Instant::now();
         let dets = match &self.models.layout {
-            Some(layout) => layout.detect(image).unwrap_or_else(|e| {
+            Some(layout) => layout.detect(&image).unwrap_or_else(|e| {
                 tracing::warn!(page = index, error = %e, "layout detect failed");
                 Vec::new()
             }),
@@ -223,8 +296,28 @@ impl<B: BurnBackend> PipelineBackend<B> {
 
         let regions: Vec<Region> = dets
             .into_iter()
-            .map(|det| self.recognize_region(index, det, image, scale, page_text, sink, profile))
+            .map(|det| self.recognize_region(index, det, &image, scale, page_text, sink, profile))
             .collect();
+
+        PartialPage {
+            index,
+            size,
+            image,
+            regions,
+        }
+    }
+
+    /// Recognizes the page's tables and assembles its blocks, run after formulas are
+    /// filled so a table can claim the LaTeX of any formula printed inside it.
+    fn finish_page(&self, partial: PartialPage, sink: Option<&dyn ImageWriter>, profile: &Profile) -> Page {
+        let scale = self.scale();
+        let PartialPage { index, size, image, mut regions } = partial;
+
+        // Tables run last: a formula printed inside one is detected as a page
+        // formula, so its LaTeX only exists once formulas have been filled, and the
+        // table needs it to fill the cell the formula sits in.
+        let claimed = self.fill_tables(index, &mut regions, &image, scale, sink, profile);
+        drop_regions(&mut regions, &claimed);
 
         let assembled = PageAssembler.assemble(regions);
         let blocks = merge_paragraphs(assembled.blocks);
@@ -267,19 +360,13 @@ impl<B: BurnBackend> PipelineBackend<B> {
                 profile.add(&profile.ocr, t.elapsed());
                 c
             }
-            RegionKind::Equation => {
-                let t = Instant::now();
-                let c = self.recognize_formula(&pixel_bbox, image);
-                profile.add(&profile.formula, t.elapsed());
-                c
-            }
-            RegionKind::InlineFormula => {
-                let t = Instant::now();
-                let c = self.recognize_inline_formula(&pixel_bbox, image);
-                profile.add(&profile.formula, t.elapsed());
-                c
-            }
-            RegionKind::Table => self.recognize_table(page, &det, &pixel_bbox, image, sink, profile),
+            // Formulas are left empty here and filled by `fill_formulas` after the
+            // whole page is mapped, so every crop on the page decodes in one batched
+            // pass instead of one model call each.
+            RegionKind::Equation | RegionKind::InlineFormula => RegionContent::default(),
+            // Filled by `fill_tables` once formulas are recognized; a table may
+            // need their LaTeX for its own cells.
+            RegionKind::Table => RegionContent::default(),
             RegionKind::Image | RegionKind::Chart => {
                 self.crop_image(page, &det, &pixel_bbox, image, sink)
             }
@@ -367,67 +454,243 @@ impl<B: BurnBackend> PipelineBackend<B> {
         }
     }
 
-    /// Formula: recognize LaTeX for the display-formula crop.
-    fn recognize_formula(&self, pixel_bbox: &BBox, image: &RgbImage) -> RegionContent {
+    /// Recognizes every formula in the **whole document** in one batched decode and
+    /// fills the results back into their regions.
+    ///
+    /// Display and inline formulas go through the same model and the same batch —
+    /// as they do in the reference, which feeds both labels to one MFR call — and
+    /// differ only in which [`RegionContent`] field receives the LaTeX. The
+    /// assembler folds `inline_latex` into the surrounding text as `$…$` and
+    /// `latex` into a standalone `$$…$$` block.
+    ///
+    /// Batching across pages is what makes this worth the multi-phase shape: the
+    /// decoder is autoregressive, so at batch 1 its matmuls are matrix-vector and
+    /// the model weights are re-read for every crop, and each batch runs until its
+    /// *longest* lane hits EOS. Collecting every page's crops into one call lets
+    /// [`predict_batch`](mineru_formula::FormulaRecognizer::predict_batch) area-sort
+    /// the entire document at once — full batches instead of a two-lane batch per
+    /// page, and tighter length grouping so the ragged-EOS tail is smaller. The
+    /// output is unchanged: each lane is an independent greedy decode of its crop,
+    /// so grouping only affects throughput, not the LaTeX produced.
+    ///
+    /// A crop that fails to preprocess yields `None` for that lane alone and leaves
+    /// its region empty, which is what the per-crop path did with `.ok()`.
+    fn fill_formulas_doc(&self, partials: &mut [PartialPage], profile: &Profile) {
         let Some(model) = &self.models.formula else {
-            return RegionContent::default();
+            return;
         };
-        let Some((crop, _, _)) = crop_region(image, pixel_bbox) else {
-            return RegionContent::default();
+        let scale = self.scale();
+
+        // Gather every formula crop across all pages, tagged with where its LaTeX
+        // must land: (page slot in `partials`, region index, is_inline).
+        let mut lanes: Vec<FormulaLane> = Vec::new();
+        let mut crops: Vec<RgbImage> = Vec::new();
+        for (page_slot, partial) in partials.iter().enumerate() {
+            for (region_index, region) in partial.regions.iter().enumerate() {
+                let is_inline = match RegionKind::classify(region.det.label) {
+                    RegionKind::InlineFormula => true,
+                    RegionKind::Equation => false,
+                    _ => continue,
+                };
+                // Region bboxes are in page points by now; the crop has to come from
+                // the pixel raster, so undo the scaling `recognize_region` applied.
+                let pixel_bbox = scale_bbox(region.det.bbox, scale);
+                if let Some((crop, _, _)) = crop_region(&partial.image, &pixel_bbox) {
+                    lanes.push(FormulaLane { page_slot, region_index, is_inline });
+                    crops.push(crop);
+                }
+            }
+        }
+        if crops.is_empty() {
+            return;
+        }
+
+        let t = Instant::now();
+        let results = match model.predict_batch(&crops) {
+            Ok(results) => results,
+            Err(e) => {
+                tracing::warn!(error = %e, "batched formula decode failed; document has no formulas");
+                return;
+            }
         };
-        RegionContent {
-            latex: model.predict(&crop).ok(),
-            ..Default::default()
+        profile.add(&profile.formula, t.elapsed());
+        if results.len() != lanes.len() {
+            tracing::warn!(
+                got = results.len(),
+                want = lanes.len(),
+                "batched formula decode returned the wrong lane count; document has no formulas"
+            );
+            return;
+        }
+
+        for (lane, latex) in lanes.iter().zip(results) {
+            let Some(latex) = latex else { continue };
+            let Some(partial) = partials.get_mut(lane.page_slot) else {
+                continue;
+            };
+            let Some(region) = partial.regions.get_mut(lane.region_index) else {
+                continue;
+            };
+            if lane.is_inline {
+                region.content.inline_latex = Some(latex);
+            } else {
+                region.content.latex = Some(latex);
+            }
         }
     }
 
-    /// Inline formula: recognize LaTeX for the inline-formula crop.
+    /// Recognizes every table on the page, routing the page's formulas into the
+    /// tables that contain them, and returns the region indices whose formulas were
+    /// consumed by a table.
     ///
-    /// Runs the same MFR model as [`recognize_formula`](Self::recognize_formula)
-    /// (Python feeds `inline_formula` and `display_formula` dets to one MFR batch —
-    /// `batch_analyze.py`), but stores the result in
-    /// [`RegionContent::inline_latex`] so the assembler folds it into the
-    /// surrounding text block as an inline `$…$` span rather than a `$$…$$` block.
-    fn recognize_inline_formula(&self, pixel_bbox: &BBox, image: &RgbImage) -> RegionContent {
-        let Some(model) = &self.models.formula else {
-            return RegionContent::default();
-        };
-        let Some((crop, _, _)) = crop_region(image, pixel_bbox) else {
-            return RegionContent::default();
-        };
-        RegionContent {
-            inline_latex: model.predict(&crop).ok(),
-            ..Default::default()
+    /// A formula printed inside a table is never seen by the table path: the page
+    /// layout model detects it as an ordinary page formula, and [`fill_formulas`]
+    /// has already turned it into LaTeX by the time this runs. Left alone, that
+    /// LaTeX is emitted as a block beside the table while the table's own cell
+    /// holds whatever OCR made of the formula's glyphs. So each table claims the
+    /// formulas whose centers fall inside it, masks their pixels out of its crop,
+    /// and hands their LaTeX to the structure matcher as ordinary spans — the
+    /// reference's design (`_extract_table_inline_objects`), and the reason
+    /// [`mineru_table::inline`] needs no formula model of its own.
+    ///
+    /// [`fill_formulas`]: Self::fill_formulas
+    fn fill_tables(
+        &self,
+        page: usize,
+        regions: &mut [Region],
+        image: &RgbImage,
+        scale: f32,
+        sink: Option<&dyn ImageWriter>,
+        profile: &Profile,
+    ) -> Vec<usize> {
+        use mineru_table::inline::PageFormula;
+
+        // Region bboxes are page points by now; formulas and table boxes are
+        // compared in the pixel space the crops come from.
+        let mut formulas: Vec<PageFormula> = Vec::new();
+        let mut formula_regions: Vec<usize> = Vec::new();
+        for (i, region) in regions.iter().enumerate() {
+            let latex = match RegionKind::classify(region.det.label) {
+                RegionKind::Equation => region.content.latex.as_ref(),
+                RegionKind::InlineFormula => region.content.inline_latex.as_ref(),
+                _ => None,
+            };
+            if let Some(latex) = latex {
+                formulas.push(PageFormula {
+                    bbox: scale_bbox(region.det.bbox, scale),
+                    latex: latex.0.clone(),
+                });
+                formula_regions.push(i);
+            }
         }
+
+        // The three stay index-aligned: a table that cannot be cropped is skipped
+        // in all of them, and `table_boxes` is what `assign_to_tables` indexes.
+        let mut table_regions: Vec<usize> = Vec::new();
+        let mut table_boxes: Vec<Option<BBox>> = Vec::new();
+        let mut crops: Vec<RgbImage> = Vec::new();
+        for (i, region) in regions.iter().enumerate() {
+            if !matches!(RegionKind::classify(region.det.label), RegionKind::Table) {
+                continue;
+            }
+            let pixel_bbox = scale_bbox(region.det.bbox, scale);
+            let Some((crop, _, _)) = crop_region(image, &pixel_bbox) else {
+                continue;
+            };
+            let t = Instant::now();
+            let (crop, rotation) = self.deskew_table(crop);
+            profile.add(&profile.table_orient, t.elapsed());
+
+            table_regions.push(i);
+            // A rotated crop has moved its pixels out from under the page-space
+            // box, so this table opts out of formulas (as the reference does).
+            table_boxes.push((rotation == Rotation::None).then_some(pixel_bbox));
+            crops.push(crop);
+        }
+
+        let assignment = mineru_table::assign_to_tables(&table_boxes, &formulas);
+
+        for (slot, (&region_index, crop)) in table_regions.iter().zip(crops).enumerate() {
+            // Resolve each assigned formula to the span text and box the matcher
+            // needs, so the table path never sees the formula types at all.
+            let inline: Vec<OcrSpan> = assignment
+                .per_table
+                .get(slot)
+                .map_or(&[][..], |v| &v[..])
+                .iter()
+                .filter_map(|f| {
+                    let latex = &formulas.get(f.formula)?.latex;
+                    // Delimiters go on here rather than at render time: the matcher
+                    // splices span text into cells verbatim, and by the time the
+                    // HTML exists a formula cell is indistinguishable from a text
+                    // one. Score 1.0 marks it exact — a model output, not an OCR
+                    // read.
+                    Some(OcrSpan::new(f.crop_bbox, format!("${latex}$"), 1.0))
+                })
+                .collect();
+            let order = match regions.get(region_index) {
+                Some(region) => region.det.order,
+                None => continue,
+            };
+            let content = self.recognize_table(page, order, crop, &inline, sink, profile);
+            if let Some(region) = regions.get_mut(region_index) {
+                region.content = content;
+            }
+        }
+
+        // Map claimed formula indices back to the regions they came from.
+        assignment
+            .claimed
+            .iter()
+            .filter_map(|&f| formula_regions.get(f).copied())
+            .collect()
     }
 
     /// Table: classify wired/wireless and recognize into HTML.
     ///
-    /// OCR spans are needed by the recognizers; this v1 passes an empty span set
-    /// (structure-only) — full OCR-span matching is a later phase. Any missing
-    /// model leaves `table_html` empty.
+    /// `crop` arrives already deskewed (see [`deskew_table`](Self::deskew_table)),
+    /// so the classifier, structure model and cell OCR all see an upright table.
+    /// Any missing model leaves `table_html` empty.
+    ///
+    /// `inline` carries the spans for formulas printed inside this table, in
+    /// crop-local pixels, already carrying their delimiters —
+    /// [`fill_tables`](Self::fill_tables) resolves those and is the only caller
+    /// that has the page context to do so. They are masked out of the crop before
+    /// OCR and appended afterwards; see the masking note below.
     fn recognize_table(
         &self,
         page: usize,
-        det: &LayoutDet,
-        pixel_bbox: &BBox,
-        image: &RgbImage,
+        order: usize,
+        crop: RgbImage,
+        inline: &[OcrSpan],
         sink: Option<&dyn ImageWriter>,
         profile: &Profile,
     ) -> RegionContent {
-        let Some((crop, _, _)) = crop_region(image, pixel_bbox) else {
-            return RegionContent::default();
-        };
         let t = Instant::now();
         // Tables are wired on CPU (see `PipelineModels`); classify on the same
         // backend as the recognizers it dispatches to.
         let classified = mineru_table::classify::<Cpu>(&crop);
         profile.add(&profile.table_classify, t.elapsed());
+        // Cell text comes from OCR over the crop; without it both recognizers
+        // return their predicted grid with every cell empty.
+        let t = Instant::now();
+        // OCR reads a formula's glyphs as ordinary text, which would compete with
+        // its LaTeX for the same cell, so the formulas' pixels are painted out
+        // first and their LaTeX added back as spans below.
+        let spans = if inline.is_empty() {
+            self.table_spans(&crop)
+        } else {
+            let masked = mineru_table::mask_boxes(&crop, inline.iter().map(|s| s.bbox));
+            let mut spans = self.table_spans(&masked);
+            spans.extend_from_slice(inline);
+            spans
+        };
+        profile.add(&profile.table_ocr, t.elapsed());
         let t = Instant::now();
         let html = match classified {
-            Ok(cls) => self.recognize_table_class(cls.class, &crop),
+            Ok(cls) => self.recognize_classified(&cls, &crop, &spans),
             // No classifier (model unavailable): try wireless as a default.
-            Err(_) => self.recognize_wireless(&crop),
+            Err(_) => self.recognize_wireless(&crop, &spans),
         };
         profile.add(&profile.table_recognize, t.elapsed());
         // Persist the table crop (best-effort) and mint its ref only when a sink is
@@ -435,8 +698,8 @@ impl<B: BurnBackend> PipelineBackend<B> {
         // (unchanged behavior). The assembler forwards `content.image` into
         // `TableBody.image`.
         let image = sink.map(|sink| {
-            let name = format!("p{page}_o{}.png", det.order);
-            write_crop(sink, page, det.order, &name, &crop);
+            let name = format!("p{page}_o{order}.png");
+            write_crop(sink, page, order, &name, &crop);
             ImageRef(name)
         });
         RegionContent {
@@ -446,25 +709,176 @@ impl<B: BurnBackend> PipelineBackend<B> {
         }
     }
 
-    /// Dispatches to the wired/wireless recognizer for a classified table.
-    fn recognize_table_class(
+    /// Recognizes a classified table, running *both* engines when the
+    /// classification is not decisive and keeping the better result.
+    ///
+    /// The classifier judges a 224x224 view of the whole crop, which is a weak
+    /// signal for the thing that actually matters here: whether the wired engine
+    /// can find the rules. A table with faint or partial ruling reads as
+    /// borderless to it while the wired engine still recovers the grid, and a
+    /// confidently-wireless call can still be wrong. So a `Wired` call — or a
+    /// `Wireless` one under
+    /// [`WIRELESS_TRUST_THRESHOLD`](mineru_table::WIRELESS_TRUST_THRESHOLD) —
+    /// runs both and lets [`mineru_table::select`] compare what they produced,
+    /// mirroring `batch_analyze.py:666-670` + `unet_table/main.py:337-357`.
+    ///
+    /// Only a confidently-wireless table skips the wired engine, which is the
+    /// cost side of this: everything else pays a UNet forward.
+    ///
+    /// `spans` are the crop-local OCR detections both recognizers match onto the
+    /// structure they predict; see [`table_spans`](Self::table_spans).
+    fn recognize_classified(
         &self,
-        class: mineru_table::TableClass,
+        cls: &mineru_table::Classification,
         crop: &RgbImage,
+        spans: &[OcrSpan],
     ) -> Option<mineru_types::Html> {
-        match class {
-            mineru_table::TableClass::Wireless => self.recognize_wireless(crop),
-            mineru_table::TableClass::Wired => self.models.table_wired.as_ref().and_then(|m| {
-                warn_on_err("wired", mineru_table::recognize_wired(m, crop, &[]))
-            }),
+        use mineru_table::{Choice, TableClass, WIRELESS_TRUST_THRESHOLD};
+
+        let confident_wireless =
+            cls.class == TableClass::Wireless && cls.score >= WIRELESS_TRUST_THRESHOLD;
+        if confident_wireless {
+            return self.recognize_wireless(crop, spans);
+        }
+
+        // Both engines, then decide on their output rather than on the score.
+        let wireless = self.recognize_wireless(crop, spans);
+        let wired = self.recognize_wired(crop, spans);
+        match (wired, wireless) {
+            (Some(wired), Some(wireless)) => {
+                let choice = mineru_table::select(&wired.0, &wireless.0, spans);
+                tracing::debug!(
+                    ?choice,
+                    class = ?cls.class,
+                    score = cls.score,
+                    wired_cells = wired.0.matches("<td").count() + wired.0.matches("<th").count(),
+                    wireless_cells = wireless.0.matches("<td").count() + wireless.0.matches("<th").count(),
+                    "picked a table engine by comparing both recognitions"
+                );
+                Some(match choice {
+                    Choice::Wired => wired,
+                    Choice::Wireless => wireless,
+                })
+            }
+            // One engine failed or is unavailable: the other is the only answer.
+            (wired, wireless) => wired.or(wireless),
         }
     }
 
+    /// Wired-table recognition, guarded on the loaded UNet model.
+    fn recognize_wired(&self, crop: &RgbImage, spans: &[OcrSpan]) -> Option<mineru_types::Html> {
+        self.models
+            .table_wired
+            .as_ref()
+            .and_then(|m| warn_on_err("wired", mineru_table::recognize_wired(m, crop, spans)))
+    }
+
     /// Wireless-table recognition, guarded on the loaded SLANet model.
-    fn recognize_wireless(&self, crop: &RgbImage) -> Option<mineru_types::Html> {
+    fn recognize_wireless(&self, crop: &RgbImage, spans: &[OcrSpan]) -> Option<mineru_types::Html> {
         self.models.table_wireless.as_ref().and_then(|m| {
-            warn_on_err("wireless", mineru_table::recognize_wireless(m, crop, &[]))
+            warn_on_err("wireless", mineru_table::recognize_wireless(m, crop, spans))
         })
+    }
+
+    /// Rotates a sideways-typeset table crop upright, returning it unchanged when
+    /// it already is (the overwhelmingly common case).
+    ///
+    /// The chosen [`Rotation`] is returned alongside the crop because it invalidates
+    /// page-space geometry: anything computed against the unrotated table box (the
+    /// inline formulas of [`fill_table_formulas`](Self::fill_table_formulas)) no
+    /// longer lines up once the pixels move.
+    ///
+    /// Wide tables are often printed rotated to fit a portrait page. OCR reads
+    /// such a crop as confident nonsense rather than failing — `Forest age
+    /// (years)` becomes `20 20 20 20 20` — so nothing downstream can detect it.
+    ///
+    /// The policy lives in [`mineru_table::orientation`]; this supplies the OCR
+    /// it decides on. A cheap detection-box gate runs first, because scoring
+    /// costs two extra det+rec passes and almost no tables need it.
+    ///
+    /// Without a det/rec model there is nothing to score with, so the crop is
+    /// returned as-is.
+    fn deskew_table(&self, crop: RgbImage) -> (RgbImage, Rotation) {
+        use mineru_table::orientation::{
+            is_rotation_candidate, select_rotation, OrientationScore, Rotation,
+        };
+
+        let (Some(det), Some(_)) = (&self.models.ocr_det, &self.models.ocr_rec) else {
+            return (crop, Rotation::None);
+        };
+
+        let boxes = det.detect(&crop).unwrap_or_default();
+        if !is_rotation_candidate(&boxes) {
+            return (crop, Rotation::None);
+        }
+
+        let scores: Vec<(Rotation, OrientationScore)> = Rotation::ALL
+            .iter()
+            .map(|&rotation| {
+                let view = rotate(&crop, rotation);
+                // Re-detect per angle: box shapes are what changed, and the 0°
+                // boxes do not carry over to a rotated view.
+                let view_boxes = det.detect(&view).unwrap_or_default();
+                (rotation, self.score_orientation(&view, &view_boxes))
+            })
+            .collect();
+
+        let choice = select_rotation(&scores);
+        if choice != Rotation::None {
+            tracing::debug!(
+                rotation = ?choice,
+                scores = ?scores.iter().map(|(r, s)| (r, s.confidence)).collect::<Vec<_>>(),
+                "rotated a sideways table crop upright"
+            );
+        }
+        (rotate(&crop, choice), choice)
+    }
+
+    /// Scores how well OCR reads `view`, over an even sample of its boxes.
+    fn score_orientation(
+        &self,
+        view: &RgbImage,
+        boxes: &[BBox],
+    ) -> mineru_table::orientation::OrientationScore {
+        use mineru_table::orientation::OrientationScore;
+
+        let Some(rec) = &self.models.ocr_rec else {
+            return OrientationScore::ZERO;
+        };
+        let reads: Vec<(String, f32)> = mineru_table::orientation::sample_boxes(boxes)
+            .into_iter()
+            .filter_map(|b| {
+                let (line_crop, _, _) = crop_region(view, &b)?;
+                rec.recognize(&line_crop).ok()
+            })
+            .collect();
+        OrientationScore::from_reads(reads.iter().map(|(t, s)| (t.as_str(), *s)))
+    }
+
+    /// OCRs a table crop into the spans the structure matcher fills cells from.
+    ///
+    /// Both table recognizers predict a cell grid and then assign each OCR span to
+    /// a cell by IoU against the predicted cell boxes, so the spans **must** be in
+    /// the same space those boxes are: crop-local pixels. That is what the
+    /// detector already returns here, so — unlike [`ocr_text`](Self::ocr_text),
+    /// which maps lines back to page points for the assembled `Document` — no
+    /// coordinate mapping is applied.
+    ///
+    /// Missing det/rec models yield no spans, which degrades a table to its
+    /// structure with empty cells rather than failing the region.
+    fn table_spans(&self, crop: &RgbImage) -> Vec<OcrSpan> {
+        let (Some(det), Some(rec)) = (&self.models.ocr_det, &self.models.ocr_rec) else {
+            return Vec::new();
+        };
+        det.detect(crop)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|line| {
+                let (line_crop, _, _) = crop_region(crop, &line)?;
+                let (text, score) = rec.recognize(&line_crop).ok()?;
+                Some(OcrSpan::new(line, text, score))
+            })
+            .collect()
     }
 
     /// Image/chart: record a stable [`ImageRef`] for the region.
@@ -518,6 +932,23 @@ fn warn_on_err(
     }
 }
 
+/// Removes the regions at `indices` (positions in `regions`), ignoring any that
+/// are out of range.
+///
+/// Used to drop formulas a table absorbed into a cell, which would otherwise be
+/// emitted a second time as a standalone block next to that table.
+fn drop_regions(regions: &mut Vec<Region>, indices: &[usize]) {
+    if indices.is_empty() {
+        return;
+    }
+    let mut position = 0usize;
+    regions.retain(|_| {
+        let keep = !indices.contains(&position);
+        position += 1;
+        keep
+    });
+}
+
 /// Writes an already-cropped region PNG through the sink, best-effort. A write
 /// error is logged and swallowed: a failed crop must not abort the parse. `name`
 /// is the ref name the caller mints, so the file written matches the reference.
@@ -547,6 +978,23 @@ fn page_bounds(page_count: usize, opts: &ParseOptions) -> (usize, usize) {
             (start, end)
         }
         None => (0, page_count),
+    }
+}
+
+/// Applies a [`Rotation`] to an image.
+///
+/// [`Rotation::None`] clones rather than borrowing so callers can hand back one
+/// owned image whichever branch they take; a table crop is small and this runs
+/// at most once per table.
+///
+/// [`Rotation`]: mineru_table::orientation::Rotation
+fn rotate(image: &RgbImage, rotation: mineru_table::orientation::Rotation) -> RgbImage {
+    use mineru_table::orientation::Rotation;
+    match rotation {
+        Rotation::None => image.clone(),
+        // `rotate90` maps the left edge to the top; `rotate270` the right edge.
+        Rotation::LeftEdgeToTop => image::imageops::rotate90(image),
+        Rotation::RightEdgeToTop => image::imageops::rotate270(image),
     }
 }
 
@@ -591,6 +1039,46 @@ fn scale_bbox(bbox: BBox, factor: f32) -> BBox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A region tagged by `order`, so a survivor can be identified after removal.
+    fn region(order: usize) -> Region {
+        Region {
+            det: LayoutDet {
+                bbox: BBox::new(0.0, 0.0, 1.0, 1.0),
+                label: mineru_layout::LayoutLabel::Text,
+                score: 1.0,
+                order,
+            },
+            content: RegionContent::default(),
+        }
+    }
+
+    fn orders(regions: &[Region]) -> Vec<usize> {
+        regions.iter().map(|r| r.det.order).collect()
+    }
+
+    /// Asserts on *which* regions survive, not how many: removing by shifting
+    /// indices is exactly the bug an count-only check would miss.
+    #[test]
+    fn drop_regions_removes_only_the_named_positions() {
+        let mut regions: Vec<Region> = (0..5).map(region).collect();
+        drop_regions(&mut regions, &[1, 3]);
+        assert_eq!(orders(&regions), vec![0, 2, 4]);
+    }
+
+    #[test]
+    fn drop_regions_with_no_indices_keeps_everything() {
+        let mut regions: Vec<Region> = (0..3).map(region).collect();
+        drop_regions(&mut regions, &[]);
+        assert_eq!(orders(&regions), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn drop_regions_ignores_out_of_range_indices() {
+        let mut regions: Vec<Region> = (0..2).map(region).collect();
+        drop_regions(&mut regions, &[0, 99]);
+        assert_eq!(orders(&regions), vec![1]);
+    }
 
     #[test]
     fn page_bounds_none_is_all_pages() {
@@ -637,6 +1125,32 @@ mod tests {
         let (crop, ox, oy) = crop_region(&img, &BBox::new(-10.0, 50.0, 40.0, 90.0)).unwrap();
         assert_eq!((ox, oy), (0.0, 50.0));
         assert_eq!(crop.dimensions(), (40, 40));
+    }
+
+    #[test]
+    fn rotation_maps_the_named_edge_to_the_top() {
+        use mineru_table::orientation::Rotation;
+
+        // A 2x1 image: left pixel red, right pixel blue. After a quarter turn the
+        // named edge's pixel must be the one on top. Asserting on pixels rather
+        // than on `rotate90`/`rotate270` names is the point: the direction
+        // conventions invert between libraries, and getting this backwards
+        // produces a 180°-wrong crop that OCR reads as plausible garbage.
+        let mut img = RgbImage::new(2, 1);
+        img.put_pixel(0, 0, image::Rgb([255, 0, 0])); // left
+        img.put_pixel(1, 0, image::Rgb([0, 0, 255])); // right
+
+        let left_up = rotate(&img, Rotation::LeftEdgeToTop);
+        assert_eq!(left_up.dimensions(), (1, 2));
+        assert_eq!(*left_up.get_pixel(0, 0), image::Rgb([255, 0, 0]));
+
+        let right_up = rotate(&img, Rotation::RightEdgeToTop);
+        assert_eq!(right_up.dimensions(), (1, 2));
+        assert_eq!(*right_up.get_pixel(0, 0), image::Rgb([0, 0, 255]));
+
+        let same = rotate(&img, Rotation::None);
+        assert_eq!(same.dimensions(), (2, 1));
+        assert_eq!(*same.get_pixel(0, 0), image::Rgb([255, 0, 0]));
     }
 
     #[test]

@@ -26,8 +26,13 @@ pub struct Preprocessed {
 
 /// Runs the SLANet-plus preprocessing on an RGB crop.
 ///
-/// The resize uses nearest-neighbour sampling for determinism; SLANet is robust
-/// to the interpolation choice and this keeps the pure-Rust path dependency-free.
+/// The resize is **bilinear**, matching the reference's bare
+/// `cv2.resize(img, (resize_w, resize_h))` (`table_structure_utils.py:354`),
+/// whose default interpolation is `INTER_LINEAR`. This previously sampled
+/// nearest, on the reasoning that SLANet is robust to the interpolation choice —
+/// which was an assumption, never a measurement, and the same assumption proved
+/// wrong for the sibling classifier, where nearest sampling was enough to invert
+/// its verdict on a real table (see [`crate::cls`]).
 pub fn preprocess(img: &RgbImage) -> Preprocessed {
     let (w, h) = (img.width(), img.height());
     let orig_w = w as f32;
@@ -45,19 +50,16 @@ pub fn preprocess(img: &RgbImage) -> Preprocessed {
     let mut chw = vec![0.0f32; 3 * side * side];
 
     for ry in 0..resize_h {
-        // Nearest source row.
-        let sy = ((ry as f32 + 0.5) / ratio - 0.5)
-            .round()
-            .clamp(0.0, (h - 1) as f32) as u32;
+        let sy = crate::resample::src_coord(ry, ratio);
         for rx in 0..resize_w {
-            let sx = ((rx as f32 + 0.5) / ratio - 0.5)
-                .round()
-                .clamp(0.0, (w - 1) as f32) as u32;
-            let px = img.get_pixel(sx, sy);
+            let sx = crate::resample::src_coord(rx, ratio);
             for c in 0..3 {
-                let v = (px[c] as f32 * SCALE - MEAN[c]) / STD[c];
+                let sampled = crate::resample::sample_channel(img, sx, sy, c);
+                let v = (sampled * SCALE - MEAN[c]) / STD[c];
                 let dst = c * side * side + (ry as usize) * side + (rx as usize);
-                chw[dst] = v;
+                if let Some(slot) = chw.get_mut(dst) {
+                    *slot = v;
+                }
             }
         }
     }
@@ -86,6 +88,47 @@ pub fn adapt_slanet_plus(orig_w: f32, orig_h: f32, cell_bboxes: &mut [mineru_typ
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pins bilinear resampling, matching the reference's `cv2.resize` default.
+    ///
+    /// The fixture **upscales** a small gradient. That is deliberate: when
+    /// downscaling, a destination pixel's two taps are adjacent source pixels that
+    /// usually sit on the same side of any edge, so bilinear and nearest agree
+    /// almost everywhere and the test cannot see the difference. Upscaling puts
+    /// destination pixels *between* source pixels, where bilinear must blend and
+    /// nearest can only ever echo an original value.
+    #[test]
+    fn resamples_bilinearly_not_nearest() {
+        // A horizontal ramp: each source column is a distinct value, so any blend
+        // lands on a value no source pixel has.
+        let mut img = RgbImage::new(8, 8);
+        for y in 0..8u32 {
+            for x in 0..8u32 {
+                let v = (x * 30) as u8;
+                img.put_pixel(x, y, image::Rgb([v, v, v]));
+            }
+        }
+
+        let out = preprocess(&img);
+        let side = TABLE_MAX_LEN as usize;
+        // Undo the normalization to recover 0..255 samples from the first row.
+        let sample = |x: usize| -> f32 {
+            let v = out.chw.get(x).copied().unwrap_or_default();
+            (v * STD[0] + MEAN[0]) / SCALE
+        };
+
+        // Values a nearest sampler could produce: exactly the source column values.
+        let originals: Vec<f32> = (0..8).map(|x| (x * 30) as f32).collect();
+        let is_original = |v: f32| originals.iter().any(|o| (o - v).abs() < 0.5);
+
+        let ratio = TABLE_MAX_LEN as f32 / 8.0;
+        let resize_w = ((8.0 * ratio) as usize).min(side);
+        let blended = (0..resize_w).filter(|x| !is_original(sample(*x))).count();
+        assert!(
+            blended > 0,
+            "every sample is an original source value — resize is nearest, not bilinear"
+        );
+    }
 
     #[test]
     fn output_is_correct_length_and_padded() {

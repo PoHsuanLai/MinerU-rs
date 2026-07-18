@@ -12,16 +12,16 @@
 //! generated forward, ends in a `Softmax`), so the values live in `[0, 1]`; the
 //! argmax must also agree.
 //!
-//! Measured on-disk (release, ndarray CPU forward): max-abs diff ≈ 3.1e-5, so the
+//! Measured on-disk (release, CPU forward): max-abs diff ≈ 3.1e-5, so the
 //! gate asserts `< 1e-4`. That residual is ordinary float32 accumulation drift
-//! between onnxruntime and Burn's ndarray backend across the 32-conv CNN — still
+//! between onnxruntime and Burn's CPU backend across the 32-conv CNN — still
 //! tight enough (and the argmax must agree) to catch any structural divergence in
 //! the port.
 //!
 //! The `.bin`/`.shape` dumps are gitignored (regenerate with the venv:
 //! `python tests/reference/py_ref_lcnet.py`). This test is `#[ignore]`d because
 //! it triggers a runtime weight fetch (or reuses the cache under
-//! `MINERU_MODELS_DIR`) and the ndarray CPU forward is slow. The models are
+//! `MINERU_MODELS_DIR`) and the CPU forward is slow. The models are
 //! always compiled now, so no cargo feature is needed. Run with:
 //!
 //! ```text
@@ -85,7 +85,7 @@ fn argmax(row: &[f32]) -> usize {
 }
 
 #[test]
-#[ignore = "requires the PP-LCNet model files + reference dump on disk; slow ndarray forward"]
+#[ignore = "requires the PP-LCNet model files + reference dump on disk; slow CPU forward"]
 fn lcnet_matches_onnx_reference() {
     let reference = match load_ref("lcnet_logits") {
         Some(v) => v,

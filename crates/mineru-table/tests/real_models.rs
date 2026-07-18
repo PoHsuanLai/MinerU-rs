@@ -3,7 +3,7 @@
 //!
 //! The models are always compiled in; running them triggers a runtime weight
 //! fetch (or reuses the cache under `MINERU_MODELS_DIR`). They are `#[ignore]`d
-//! because the ndarray CPU forward pass is slow. Run with:
+//! because the CPU forward pass is slow. Run with:
 //!
 //! ```text
 //! MINERU_MODELS_DIR=/Volumes/Archive/mineru/models/PDF-Extract-Kit-1.0 \
@@ -30,7 +30,7 @@ fn synthetic_table(w: u32, h: u32) -> RgbImage {
 }
 
 #[test]
-#[ignore = "requires MINERU_MODELS_DIR or network for the weight fetch; slow ndarray forward"]
+#[ignore = "requires MINERU_MODELS_DIR or network for the weight fetch; slow CPU forward"]
 fn classify_runs_real_lcnet_forward() {
     use mineru_table::cls::classify;
 
@@ -62,7 +62,7 @@ fn classify_runs_real_lcnet_forward() {
 
 /// Exercises the UNet forward pass directly and asserts a sane 3-class mask.
 #[test]
-#[ignore = "requires MINERU_MODELS_DIR or network for the weight fetch; slow ndarray forward"]
+#[ignore = "requires MINERU_MODELS_DIR or network for the weight fetch; slow CPU forward"]
 fn unet_forward_produces_mask() {
     use mineru_table::unet::model::UnetModel;
 
@@ -100,7 +100,7 @@ fn unet_forward_produces_mask() {
 /// (`adjust_lines`/`final_adjust_lines`) is what stops per-column y-jitter from
 /// over-segmenting rows (pre-fix this recovered 13 rows).
 #[test]
-#[ignore = "requires MINERU_MODELS_DIR or network for the weight fetch; slow ndarray forward"]
+#[ignore = "requires MINERU_MODELS_DIR or network for the weight fetch; slow CPU forward"]
 fn unet_segment_cells_recovers_grid_html() {
     use mineru_table::unet::model::UnetModel;
     use mineru_table::unet::{plot_html_table, recover, COL_THRESHOLD, ROW_THRESHOLD};

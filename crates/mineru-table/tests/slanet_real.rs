@@ -17,7 +17,7 @@
 //!
 //! The `.bin`/`.shape` dumps are gitignored (regenerate with the venv:
 //! `python tests/reference/py_ref_slanet.py`). This test is `#[ignore]`d because
-//! it needs the model weights on disk and the slow ndarray CPU forward.
+//! it needs the model weights on disk and the slow CPU forward.
 //!
 //! Run with:
 //!
@@ -95,7 +95,7 @@ fn argmax(row: &[f32]) -> usize {
 }
 
 #[test]
-#[ignore = "requires the SLANet-plus model files + reference dumps on disk; slow ndarray forward"]
+#[ignore = "requires the SLANet-plus model files + reference dumps on disk; slow CPU forward"]
 fn slanet_matches_onnx_reference() {
     let onnx = std::env::var("SLANET_ONNX").unwrap_or_else(|_| DEFAULT_ONNX.to_string());
 

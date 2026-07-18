@@ -189,9 +189,12 @@ impl<B: Backend> PipelineModels<B> {
             SlaNet::load(&paths.table_wireless).map_err(Into::into)
         });
 
-        // UNet has no on-disk loader yet (see mineru-table); construct the
-        // (currently model-unavailable) handle so the wiring is in place.
-        let table_wired = Some(UnetModel::new());
+        // `loaded()`, not `new()`: `new()` is an inert handle that reports
+        // `ModelUnavailable` instead of running, so the wired engine never
+        // executed and every ruled table fell back to the wireless one. The UNet's
+        // weights are fetched and cached on first use, so this stays lazy —
+        // nothing is loaded unless a table actually reaches the wired engine.
+        let table_wired = Some(UnetModel::loaded());
 
         Self {
             layout,

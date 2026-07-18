@@ -8,7 +8,7 @@
 //!     cargo test -p mineru-layout --features gpu --test wgpu_check -- --ignored --nocapture
 //! ```
 //!
-//! The test loads the *same* weights on both the CPU (`NdArray`) and GPU (`Wgpu`)
+//! The test loads the *same* weights on both the CPU (`Flex`) and GPU (`Wgpu`)
 //! backends, runs `detect` on both, and asserts the detections match: same count,
 //! same labels, same reading order, and boxes/scores within a small tolerance.
 //! This is the proof that the on-device threshold-sort/reading-order rewrites (and
@@ -94,7 +94,7 @@ fn wgpu_detect_matches_cpu() {
             c.score,
             g.score
         );
-        // Boxes are in PIXEL coordinates on a 1000x1400 page. wgpu and ndarray
+        // Boxes are in PIXEL coordinates on a 1000x1400 page. wgpu and the CPU backend
         // accumulate f32 in different orders (tiled-2D vs matrixmultiply kernels),
         // so raw coordinates differ by a fraction of a pixel — expected and not a
         // decision difference. The bar is a sane pixel tolerance (2 px ≈ 0.2% of the

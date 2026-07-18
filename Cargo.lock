@@ -720,6 +720,7 @@ version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0098bf6555c151517b4c98ca0e8ed1ab6a976e40f5f4e967c117b00eee21e192"
 dependencies = [
+ "aligned-vec",
  "burn-backend",
  "burn-ir",
  "burn-std",
@@ -727,7 +728,9 @@ dependencies = [
  "gemm",
  "half",
  "libm",
+ "macerator",
  "num-traits",
+ "rayon",
 ]
 
 [[package]]
@@ -3942,6 +3945,7 @@ dependencies = [
  "mineru-pdf",
  "mineru-table",
  "mineru-types",
+ "rayon",
  "thiserror 2.0.18",
  "tracing",
 ]
@@ -3965,6 +3969,7 @@ name = "mineru-burn-common"
 version = "0.1.0"
 dependencies = [
  "burn",
+ "burn-flex",
  "burn-store",
  "image",
  "regex",

@@ -12,9 +12,10 @@ mineru-types = { workspace = true }
 # Shared Burn harness: weight loading (safetensors/pth via burn-store) and the
 # PyTorch-layout NN primitives the hand-ported SLANet-plus model reuses.
 mineru-burn-common = { workspace = true }
-# Burn core with the ndarray CPU backend, mirroring mineru-burn-common so both
-# crates agree on the backend and no GPU toolchain is required.
-burn = { workspace = true, features = ["ndarray"] }
+# Burn core, for the `Module`/`Backend` traits the hand-ported models are generic
+# over. The concrete backend comes from `mineru-burn-common`, so enabling one
+# here would only risk the two crates disagreeing.
+burn = { workspace = true }
 image = { version = "0.25", default-features = false }
 thiserror = { workspace = true }
 tracing = { workspace = true }
@@ -39,4 +40,6 @@ default = []
 gpu = ["burn/wgpu"]
 
 [dev-dependencies]
-image = { version = "0.25", default-features = false }
+# `png` is dev-only: the diagnostic probes decode real page crops from disk.
+# The library dependency above stays decoder-free.
+image = { version = "0.25", default-features = false, features = ["png"] }

@@ -34,9 +34,13 @@
 
 pub mod cls;
 pub mod error;
+pub mod inline;
 pub mod matching;
 mod model_cache;
 pub mod ocr;
+pub mod orientation;
+pub mod resample;
+pub mod select;
 pub mod slanet;
 pub mod unet;
 pub mod weights;
@@ -49,7 +53,10 @@ mod generated;
 
 pub use cls::{classify, Classification, TableClass};
 pub use error::{Error, Result};
+pub use inline::{assign_to_tables, mask_boxes, Assignment, PageFormula, TableFormula};
 pub use matching::{decode_logic_points, LogicPoint, TableMatch};
 pub use ocr::OcrSpan;
+pub use orientation::{is_rotation_candidate, sample_boxes, select_rotation, OrientationScore, Rotation};
+pub use select::{select, Choice, WIRELESS_TRUST_THRESHOLD};
 pub use slanet::recognize_wireless;
 pub use unet::recognize_wired;

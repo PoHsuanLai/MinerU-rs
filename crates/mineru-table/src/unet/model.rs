@@ -108,24 +108,52 @@ impl<B: Backend> UnetModel<B> {
         ))
     }
 
-    /// Preprocesses an RGB image into the planar `[3, 1024, 1024]` `f32` buffer
-    /// the UNet expects: resize to `INPUT_SIDE` square, scale to `[0, 1]`, HWC →
-    /// CHW. (Mirrors the Python `cv2.resize` + `/255` pipeline.)
-    fn preprocess(img: &RgbImage) -> Vec<f32> {
-        let side = INPUT_SIDE;
-        let resized =
-            image::imageops::resize(img, side, side, image::imageops::FilterType::Triangle);
-        let sz = side as usize;
-        let mut chw = vec![0.0f32; 3 * sz * sz];
-        for y in 0..sz {
-            for x in 0..sz {
+    /// Preprocesses an RGB image into the planar `[3, H, W]` `f32` buffer the UNet
+    /// expects, returning it with its dimensions.
+    ///
+    /// Two details are load-bearing and were both wrong before, each on its own
+    /// enough to wreck the mask:
+    ///
+    /// - **Aspect ratio is preserved.** `resize_img(..., keep_ratio=True)` scales
+    ///   the image to *fit* `INPUT_SIDE` (`utils.py:205-223` → `imrescale`), so a
+    ///   708x1116 crop becomes 650x1024, not a square. Squashing it stretches the
+    ///   ruling lines off their axes, which is exactly what the class-1/class-2
+    ///   split keys on. The ONNX declares dynamic `height`/`width` and the
+    ///   generated model takes a plain rank-4 tensor, so non-square input is fine.
+    /// - **Mean/std normalization, on 0-255 values.** The reference subtracts
+    ///   `[123.675, 116.28, 103.53]` and divides by `[58.395, 57.12, 57.375]`
+    ///   (`table_structure_unet.py:29-30, :70-74`) — ImageNet statistics *not*
+    ///   rescaled to `[0, 1]`. Feeding `/255` values leaves the input in a range
+    ///   the network never saw.
+    fn preprocess(img: &RgbImage) -> (Vec<f32>, u32, u32) {
+        // Fit inside INPUT_SIDE on the long edge, as `imrescale` does.
+        let (w, h) = (img.width().max(1), img.height().max(1));
+        let scale = f64::from(INPUT_SIDE) / f64::from(w.max(h));
+        let rw = ((f64::from(w) * scale).round() as u32).max(1);
+        let rh = ((f64::from(h) * scale).round() as u32).max(1);
+
+        // `imrescale` picks area when shrinking and bicubic when growing; Triangle
+        // is the closest the `image` crate offers to both without a hand-rolled
+        // resampler, and the mask is a coarse per-pixel class map rather than a
+        // value the next stage reads numerically.
+        let resized = image::imageops::resize(img, rw, rh, image::imageops::FilterType::Triangle);
+
+        const MEAN: [f32; 3] = [123.675, 116.28, 103.53];
+        const STD: [f32; 3] = [58.395, 57.12, 57.375];
+
+        let (rw_u, rh_u) = (rw as usize, rh as usize);
+        let plane = rw_u * rh_u;
+        let mut chw = vec![0.0f32; 3 * plane];
+        for y in 0..rh_u {
+            for x in 0..rw_u {
                 let px = resized.get_pixel(x as u32, y as u32);
                 for c in 0..3 {
-                    chw[c * sz * sz + y * sz + x] = px[c] as f32 / 255.0;
+                    let v = (f32::from(px[c]) - MEAN[c]) / STD[c];
+                    chw[c * plane + y * rw_u + x] = v;
                 }
             }
         }
-        chw
+        (chw, rw, rh)
     }
 
     /// Runs the generated UNet forward pass and returns the per-pixel 3-class
@@ -134,19 +162,21 @@ impl<B: Backend> UnetModel<B> {
     /// This exercises the real neural network end-to-end (weight load is cached
     /// for the process lifetime). It is the wired half of the wired-table path.
     pub fn segment_mask(&self, img: &RgbImage) -> Result<SegMask> {
-        Self::run_mask(Self::preprocess(img))
+        let (input, w, h) = Self::preprocess(img);
+        Self::run_mask(input, w, h)
     }
 
-    /// Preprocesses `img` into the planar `[3, 1024, 1024]` `f32` buffer the UNet
-    /// consumes.
+    /// Preprocesses `img` into the planar `[3, H, W]` buffer the UNet consumes,
+    /// with its dimensions.
     ///
     /// A `#[doc(hidden)]` parity hook: the `unet_real` numeric gate dumps this
     /// exact buffer so the Python ONNX dumper can feed the *identical* input to
     /// `onnxruntime` (the `image` crate's Triangle resize is not trivially
-    /// reproducible in numpy, so both sides must consume the same bytes). Not
-    /// part of the public API.
+    /// reproducible in numpy, so both sides must consume the same bytes). The
+    /// dimensions come back because the buffer is no longer square. Not part of
+    /// the public API.
     #[doc(hidden)]
-    pub fn debug_preprocess(img: &RgbImage) -> Vec<f32> {
+    pub fn debug_preprocess(img: &RgbImage) -> (Vec<f32>, u32, u32) {
         Self::preprocess(img)
     }
 
@@ -157,8 +187,8 @@ impl<B: Backend> UnetModel<B> {
     /// resulting class mask against the committed ONNX reference. Not part of the
     /// public API.
     #[doc(hidden)]
-    pub fn debug_segment_from_input(&self, input: Vec<f32>) -> Result<SegMask> {
-        Self::run_mask(input)
+    pub fn debug_segment_from_input(&self, input: Vec<f32>, width: u32, height: u32) -> Result<SegMask> {
+        Self::run_mask(input, width, height)
     }
 
     /// Loads the generated UNet model with runtime-fetched weights, panic-free.
@@ -189,7 +219,7 @@ impl<B: Backend> UnetModel<B> {
     /// Runs the generated UNet forward over a preprocessed CHW buffer, returning
     /// the per-pixel 3-class argmax mask. The weights are cached for the process
     /// lifetime; repeated calls only pay for the forward pass.
-    fn run_mask(input: Vec<f32>) -> Result<SegMask> {
+    fn run_mask(input: Vec<f32>, width: u32, height: u32) -> Result<SegMask> {
         use burn::tensor::{Tensor, TensorData};
 
         // Cache the (weight-load-failable) model for the process lifetime, per
@@ -199,8 +229,7 @@ impl<B: Backend> UnetModel<B> {
         let model: std::sync::Arc<generated::Model<B>> =
             crate::model_cache::get_or_try_init(|| Self::load_unet(&device))?;
 
-        let sz = INPUT_SIDE as usize;
-        let data = TensorData::new(input, [1, 3, sz, sz]);
+        let data = TensorData::new(input, [1, 3, height as usize, width as usize]);
         let x = Tensor::<B, 4>::from_data(data, &device);
 
         // The generated top-level `forward` already argmaxes to an int class mask
@@ -208,10 +237,10 @@ impl<B: Backend> UnetModel<B> {
         let mask = model.forward(x);
         let dims = mask.dims();
         let (h, w) = (dims[2], dims[3]);
-        let classes: Vec<i64> = mask
-            .into_data()
-            .into_vec::<i64>()
-            .map_err(|e| Error::Decode(format!("unet mask decode: {e:?}")))?;
+        // `int_to_vec_i64` coerces the backend's storage dtype; a direct
+        // `into_vec::<i64>()` is a dtype mismatch on every backend here, since flex
+        // and wgpu both store ints as `i32`.
+        let classes: Vec<i64> = mineru_burn_common::host::int_to_vec_i64(mask);
         Ok(SegMask {
             height: h,
             width: w,
@@ -223,6 +252,71 @@ impl<B: Backend> UnetModel<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type B = mineru_burn_common::backend::Cpu;
+
+    /// The long edge lands on `INPUT_SIDE` and the aspect ratio survives —
+    /// `imrescale`'s contract. Squashing to a square stretches ruling lines off
+    /// their axes, which is what the horizontal/vertical class split reads.
+    #[test]
+    fn preprocess_fits_the_long_edge_and_keeps_the_aspect_ratio() {
+        let img = RgbImage::from_pixel(1116, 708, image::Rgb([0, 0, 0]));
+        let (buf, w, h) = UnetModel::<B>::preprocess(&img);
+
+        assert_eq!(w, INPUT_SIDE, "long edge scales to INPUT_SIDE");
+        assert_eq!(h, 650, "short edge keeps the ratio: round(708 * 1024/1116)");
+        assert_eq!(buf.len(), 3 * w as usize * h as usize, "buffer is [3,H,W]");
+    }
+
+    #[test]
+    fn preprocess_fits_a_tall_image_on_its_height() {
+        let img = RgbImage::from_pixel(708, 1116, image::Rgb([0, 0, 0]));
+        let (_, w, h) = UnetModel::<B>::preprocess(&img);
+
+        assert_eq!(h, INPUT_SIDE, "the long edge is the height here");
+        assert_eq!(w, 650);
+    }
+
+    /// Pins the exact normalization: ImageNet mean/std over **0-255** values, not
+    /// over `[0, 1]`. A plain `/255` leaves the input in a range the network never
+    /// saw, and the mask degrades without any error surfacing.
+    #[test]
+    fn preprocess_applies_mean_std_normalization_over_0_255() {
+        // Already 1024 on the long edge, so resampling cannot perturb the values.
+        let img = RgbImage::from_pixel(INPUT_SIDE, INPUT_SIDE, image::Rgb([0, 0, 0]));
+        let (buf, w, h) = UnetModel::<B>::preprocess(&img);
+        let plane = (w * h) as usize;
+
+        // Black maps to (0 - mean) / std, per channel.
+        let want = [
+            (0.0 - 123.675) / 58.395,
+            (0.0 - 116.28) / 57.12,
+            (0.0 - 103.53) / 57.375,
+        ];
+        for (c, want) in want.iter().enumerate() {
+            let got = buf.get(c * plane).copied().unwrap_or_default();
+            assert!(
+                (got - want).abs() < 1e-4,
+                "channel {c}: got {got}, want {want} — normalization must use the \
+                 reference's 0-255 statistics"
+            );
+        }
+        // A `/255` pipeline would put every value in [0,1]; these must not be.
+        assert!(
+            buf.iter().any(|v| *v < -1.0),
+            "normalized black must fall well below 0, not sit in [0,1]"
+        );
+    }
+
+    #[test]
+    fn preprocess_normalizes_white_above_zero() {
+        let img = RgbImage::from_pixel(INPUT_SIDE, INPUT_SIDE, image::Rgb([255, 255, 255]));
+        let (buf, _, _) = UnetModel::<B>::preprocess(&img);
+
+        let got = buf.first().copied().unwrap_or_default();
+        let want = (255.0 - 123.675) / 58.395;
+        assert!((got - want).abs() < 1e-4, "white: got {got}, want {want}");
+    }
 
     #[test]
     fn unweighted_reports_unavailable() {

@@ -21,7 +21,7 @@ use mineru_types::Latex;
 
 use crate::config::UniMerNetConfig;
 use crate::error::{Error, Result};
-use crate::generate::{greedy_decode, DecodeStep};
+use crate::generate::{greedy_decode, greedy_decode_batch, BatchDecodeStep, DecodeStep};
 use crate::latex_cleanup::latex_rm_whitespace;
 use crate::mbart::{DecoderCache, MBartDecoder};
 use crate::preprocess::{self, PreprocessedImage};
@@ -83,6 +83,18 @@ impl<B: Backend> UniMerNet<B> {
     ) -> Tensor<B, 2> {
         self.decoder.step(token, position, cache)
     }
+
+    /// On-device variant of [`UniMerNet::decode_step`]: token and position arrive as
+    /// device int tensors, so an incremental loop can feed the previous step's argmax
+    /// back in without a host read-back. See [`crate::mbart::MBartDecoder::step_from_tensors`].
+    pub fn decode_step_from_tensors(
+        &self,
+        token: Tensor<B, 2, Int>,
+        pos_ids: Tensor<B, 2, Int>,
+        cache: &mut DecoderCache<B>,
+    ) -> Tensor<B, 2> {
+        self.decoder.step_from_tensors(token, pos_ids, cache)
+    }
 }
 
 /// A [`DecodeStep`] that holds the encoded image plus a running decoder KV cache and
@@ -116,6 +128,47 @@ impl<B: Backend> DecodeStep for ModelStep<'_, B> {
             .first()
             .copied()
             .unwrap_or(0) as u32
+    }
+}
+
+/// The batched sibling of [`ModelStep`]: one decoder KV cache covering N lanes,
+/// advanced one token per lane per step.
+///
+/// The cache tensors carry the batch as their leading dim throughout, so a single
+/// [`DecoderCache`] holds all N lanes' state with no cross-lane interaction (see
+/// [`BatchDecodeStep`] for the independence argument).
+struct BatchModelStep<'a, B: Backend> {
+    model: &'a UniMerNet<B>,
+    cache: DecoderCache<B>,
+    device: B::Device,
+    vocab_size: usize,
+    eos_token: u32,
+}
+
+impl<B: Backend> BatchDecodeStep for BatchModelStep<'_, B> {
+    fn step_batch(&mut self, tokens: &[u32], position: usize) -> Vec<u32> {
+        let n = tokens.len();
+        let data: Vec<i64> = tokens.iter().map(|&t| t as i64).collect();
+        let input_ids: Tensor<B, 2, Int> =
+            Tensor::from_data(TensorData::new(data, [n, 1]), &self.device);
+
+        // [N, vocab] logits for every lane's next token.
+        let logits = self
+            .model
+            .decode_step(input_ids, position, &mut self.cache)
+            .reshape([n, self.vocab_size]);
+        // Argmax ON-DEVICE over the vocab, then ONE readback of N ids for the whole
+        // batch — the per-step device→host traffic stays O(N), not O(N * vocab).
+        let idx = logits.argmax(1); // [N, 1], Int
+        let host = mineru_burn_common::int_to_vec_i64(idx);
+
+        if host.len() != n {
+            // The readback disagreeing with the batch width means the lanes can no
+            // longer be trusted to line up. Return EOS so every lane terminates
+            // cleanly; a filler id (e.g. 0) would decode as garbage LaTeX instead.
+            return vec![self.eos_token; n];
+        }
+        host.into_iter().map(|v| v as u32).collect()
     }
 }
 
@@ -293,14 +346,247 @@ impl<B: Backend> FormulaRecognizer<B> {
         logits.narrow(1, t - 1, 1).reshape([1, vocab])
     }
 
+    /// Profiling hook: run the real cached decode loop for `n_steps` batch-`batch`
+    /// steps and return each step's wall-clock in milliseconds.
+    ///
+    /// This is the exact production per-token path — [`UniMerNet::init_decode_cache`]
+    /// once, then [`UniMerNet::decode_step`] with the KV cache — not the non-cached
+    /// `decoder_step_logits` re-run. Each step ends with an on-device argmax whose
+    /// host read-back drains any GPU queue, so a returned time is real device
+    /// wall-clock, not a lazily-enqueued kernel. `bos` seeds every lane's first token.
+    #[doc(hidden)]
+    pub fn cached_step_times_ms(
+        &self,
+        encoder_hidden: Tensor<B, 3>,
+        batch: usize,
+        n_steps: usize,
+        bos: u32,
+    ) -> Vec<f64> {
+        let mut cache = self.model.init_decode_cache(encoder_hidden);
+        let mut tokens = vec![bos; batch];
+        let mut times = Vec::with_capacity(n_steps);
+        for position in 0..n_steps {
+            let t = std::time::Instant::now();
+            let data: Vec<i64> = tokens.iter().map(|&x| x as i64).collect();
+            let ids: Tensor<B, 2, Int> =
+                Tensor::from_data(TensorData::new(data, [batch, 1]), &self.device);
+            let logits = self
+                .model
+                .decode_step(ids, position, &mut cache)
+                .reshape([batch, self.config.decoder.vocab_size]);
+            let idx = logits.argmax(1); // [batch, 1], Int
+            let host = mineru_burn_common::int_to_vec_i64(idx); // read-back drains queue
+            times.push(t.elapsed().as_secs_f64() * 1e3);
+            tokens = host.into_iter().map(|v| v as u32).collect();
+            if tokens.len() != batch {
+                break;
+            }
+        }
+        times
+    }
+
+    /// Profiling hook: run `n_steps` cached decode steps keeping the argmax token
+    /// ON-DEVICE (fed straight back in as a tensor), syncing to the host only every
+    /// `sync_every` steps. Returns total wall-clock in ms. Compare against the sum of
+    /// [`Self::cached_step_times_ms`] (which syncs every step) to see how much of the
+    /// per-step floor is the host read-back / pipeline stall vs real kernel work.
+    #[doc(hidden)]
+    pub fn ondevice_decode_ms(
+        &self,
+        encoder_hidden: Tensor<B, 3>,
+        batch: usize,
+        n_steps: usize,
+        bos: u32,
+        sync_every: usize,
+    ) -> f64 {
+        let mut cache = self.model.init_decode_cache(encoder_hidden);
+        // Seed token tensor [batch, 1] with BOS, on-device.
+        let mut tok: Tensor<B, 2, Int> = Tensor::from_data(
+            TensorData::new(vec![bos as i64; batch], [batch, 1]),
+            &self.device,
+        );
+        let offset = crate::config::MBartConfig::POSITION_OFFSET as i64;
+        let t = std::time::Instant::now();
+        for position in 0..n_steps {
+            let pos_ids: Tensor<B, 2, Int> =
+                Tensor::from_data(TensorData::new(vec![position as i64 + offset], [1, 1]), &self.device);
+            let logits = self
+                .model
+                .decode_step_from_tensors(tok, pos_ids, &mut cache)
+                .reshape([batch, self.config.decoder.vocab_size]);
+            // argmax stays on-device and becomes the next step's input tensor — no
+            // host round-trip. Reshape [batch] -> [batch, 1].
+            tok = logits.argmax(1).reshape([batch, 1]);
+            // Periodic sync only: drain the queue so we don't build an unbounded
+            // command backlog, and so timing reflects real progress.
+            if sync_every > 0 && (position + 1) % sync_every == 0 {
+                let _ = mineru_burn_common::int_to_vec_i64(tok.clone());
+            }
+        }
+        // Final sync so the timer captures all enqueued work.
+        let _ = mineru_burn_common::int_to_vec_i64(tok);
+        t.elapsed().as_secs_f64() * 1e3
+    }
+
     /// Turns the single normalised channel into a `[1, 3, H, W]` pixel tensor by
     /// repeating the channel three times (mirroring `pixel_values.repeat(1,3,1,1)`).
+    ///
+    /// Delegates to [`FormulaRecognizer::to_pixel_values_batch`] so there is exactly
+    /// one normalise→tensor path; a one-image batch cannot violate its uniform-size
+    /// precondition, hence the infallible signature.
     fn to_pixel_values(&self, pre: &PreprocessedImage) -> Tensor<B, 4> {
         let (h, w) = (pre.height, pre.width);
         let plane: Tensor<B, 3> =
             Tensor::from_data(TensorData::new(pre.data.clone(), [1, h, w]), &self.device);
         // [1, 1, H, W] -> repeat to [1, 3, H, W]
         plane.reshape([1, 1, h, w]).repeat_dim(1, 3)
+    }
+
+    /// Stacks N uniformly-sized preprocessed planes into one `[N, 3, H, W]` tensor.
+    ///
+    /// [`preprocess::preprocess`] pads every crop to the same [`preprocess::DEFAULT_TARGET`],
+    /// so a batch is a plain stack: no per-lane padding and no attention mask (the
+    /// Python reference likewise passes none to `generate()`).
+    ///
+    /// # Errors
+    /// Returns [`Error::Model`] if `pre` is empty or the planes disagree on `(height,
+    /// width)` — the stack would silently misinterpret the flat data otherwise.
+    fn to_pixel_values_batch(&self, pre: &[PreprocessedImage]) -> Result<Tensor<B, 4>> {
+        let first = pre
+            .first()
+            .ok_or_else(|| Error::Model("cannot build a pixel batch from zero images".into()))?;
+        let (h, w) = (first.height, first.width);
+
+        let mut flat: Vec<f32> = Vec::with_capacity(pre.len() * h * w);
+        for (i, p) in pre.iter().enumerate() {
+            if p.height != h || p.width != w {
+                return Err(Error::Model(format!(
+                    "non-uniform preprocessed sizes in batch: image 0 is {h}x{w} but image {i} is {}x{}",
+                    p.height, p.width
+                )));
+            }
+            if p.data.len() != h * w {
+                return Err(Error::Model(format!(
+                    "preprocessed image {i} has {} values, expected {}",
+                    p.data.len(),
+                    h * w
+                )));
+            }
+            flat.extend_from_slice(&p.data);
+        }
+
+        // One TensorData for the whole batch: building N tensors and `Tensor::cat`
+        // would allocate and copy N+1 times for the same bytes.
+        let planes: Tensor<B, 4> = Tensor::from_data(
+            TensorData::new(flat, [pre.len(), 1, h, w]),
+            &self.device,
+        );
+        Ok(planes.repeat_dim(1, 3))
+    }
+
+    /// Recognizes the LaTeX of many cropped formula images, decoding
+    /// [`UniMerNetConfig::batch_size`] crops at a time.
+    ///
+    /// This is the throughput path: formula recognition dominates pipeline runtime and
+    /// batching amortises the per-step decoder launch over N lanes. The generated token
+    /// ids are byte-identical to calling [`FormulaRecognizer::predict`] per image —
+    /// lanes are independent (see [`crate::generate::BatchDecodeStep`]).
+    ///
+    /// Returns one entry per input image, **in input order**. A lane is `None` when its
+    /// own crop could not be preprocessed or detokenised (e.g. an empty image after the
+    /// margin crop); one bad crop must not sink the rest of the page. `Err` is reserved
+    /// for whole-batch faults.
+    pub fn predict_batch(&self, images: &[image::RgbImage]) -> Result<Vec<Option<Latex>>> {
+        let ids = self.decode_batch(images, |lane, tok| {
+            let raw = tok.decode(&lane)?;
+            Ok(Latex(latex_rm_whitespace(&raw)))
+        })?;
+        Ok(ids)
+    }
+
+    /// Parity hook: raw generated token ids from the **batched** decode.
+    ///
+    /// Mirrors [`FormulaRecognizer::predict_token_ids`] but over a whole slice. The
+    /// batch parity gate asserts this equals the per-image sequential result exactly.
+    ///
+    /// # Errors
+    /// Returns an error only on a whole-batch fault; a crop that fails preprocessing
+    /// yields an empty token vector for its lane.
+    #[doc(hidden)]
+    pub fn predict_token_ids_batch(&self, images: &[image::RgbImage]) -> Result<Vec<Vec<u32>>> {
+        let out = self.decode_batch(images, |lane, _tok| Ok(lane))?;
+        Ok(out
+            .into_iter()
+            .map(|o| o.unwrap_or_default())
+            .collect())
+    }
+
+    /// Shared batched-decode core: preprocess, group, decode, and map results back to
+    /// input order. `finish` turns one lane's token ids into the caller's output type;
+    /// a lane whose `finish` fails becomes `None`, as does a lane that failed to
+    /// preprocess.
+    fn decode_batch<T>(
+        &self,
+        images: &[image::RgbImage],
+        finish: impl Fn(Vec<u32>, &LatexTokenizer) -> Result<T>,
+    ) -> Result<Vec<Option<T>>> {
+        let mut out: Vec<Option<T>> = (0..images.len()).map(|_| None).collect();
+        if images.is_empty() {
+            return Ok(out);
+        }
+
+        // Preprocess up front, keeping each survivor's ORIGINAL index. Everything below
+        // moves in `(index, value)` pairs so reordering can never detach a lane's
+        // tokens from the crop they came from.
+        let mut jobs: Vec<(usize, PreprocessedImage)> = Vec::with_capacity(images.len());
+        for (i, img) in images.iter().enumerate() {
+            // A crop this crate cannot preprocess is that lane's failure alone.
+            if let Ok(pre) = preprocess::preprocess(img, preprocess::DEFAULT_TARGET) {
+                jobs.push((i, pre));
+            }
+        }
+
+        // Every lane runs until the LONGEST lane in its batch hits EOS, so grouping
+        // similar-area crops keeps the done-mask exit tight. Area is a cheap proxy for
+        // formula length. Sort is stable, so equal-area crops keep input order.
+        jobs.sort_by_key(|(_, p)| p.height.saturating_mul(p.width));
+
+        let batch_size = self.config.batch_size.max(1);
+        for chunk in jobs.chunks(batch_size) {
+            let planes: Vec<PreprocessedImage> = chunk.iter().map(|(_, p)| p.clone()).collect();
+            let pixel_values = self.to_pixel_values_batch(&planes)?;
+            let encoder_hidden = self.model.encode(pixel_values);
+
+            let cache = self.model.init_decode_cache(encoder_hidden);
+            let mut step = BatchModelStep {
+                model: &self.model,
+                cache,
+                device: self.device.clone(),
+                vocab_size: self.config.decoder.vocab_size,
+                eos_token: self.config.decoder.eos_token_id as u32,
+            };
+            let decoded = greedy_decode_batch(
+                &mut step,
+                self.config.decoder.bos_token_id as u32,
+                self.config.decoder.eos_token_id as u32,
+                self.config.max_new_tokens,
+                chunk.len(),
+            );
+
+            // `greedy_decode_batch` returns lanes index-aligned to `chunk`, and
+            // `chunk[lane].0` is that lane's original input index.
+            for (lane, d) in decoded.into_iter().enumerate() {
+                let Some(&(original, _)) = chunk.get(lane) else {
+                    continue;
+                };
+                let Some(slot) = out.get_mut(original) else {
+                    continue;
+                };
+                *slot = finish(d.tokens, &self.tokenizer).ok();
+            }
+        }
+
+        Ok(out)
     }
 }
 
